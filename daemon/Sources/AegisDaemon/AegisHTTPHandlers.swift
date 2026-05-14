@@ -2,6 +2,7 @@ import Foundation
 import NIOCore
 import NIOHTTP1
 import NaturalLanguage
+import CryptoKit
 #if canImport(CoreData)
 import CoreData
 #endif
@@ -140,6 +141,18 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         case (.GET, "/v1/cmd"):
             // Suporte a GET com query param ?cmd=...
             return self.handleCmd(bodyJSON: body)
+        case (.POST, "/v1/passport/extract"):
+            return self.handlePassportExtract(bodyJSON: body)
+        case (.POST, "/v1/passport/batch-extract"):
+            return self.handlePassportBatchExtract(bodyJSON: body)
+        case (.POST, "/v1/passport/find"):
+            return self.handlePassportFind(bodyJSON: body)
+        case (.POST, "/v1/content/get"):
+            return self.handleContentGet(bodyJSON: body)
+        case (.POST, "/v1/passport/claim"):
+            return self.handlePassportClaim(bodyJSON: body)
+        case (.POST, "/v1/passport/release"):
+            return self.handlePassportRelease(bodyJSON: body)
         default:
             return Response(status: .notFound, payload: [
                 "error": "not_found",
@@ -151,7 +164,10 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                     "POST /v1/summarize", "POST /v1/enrich",
                     "POST /v1/agent", "POST /v1/prompt",
                     "POST /v1/cmd",
-                    "POST /v1/vision/classify", "POST /v1/vision/landmarks"
+                    "POST /v1/vision/classify", "POST /v1/vision/landmarks",
+                    "POST /v1/passport/extract", "POST /v1/passport/batch-extract",
+                    "POST /v1/passport/find", "POST /v1/content/get",
+                    "POST /v1/passport/claim", "POST /v1/passport/release"
                 ]
             ])
         }
@@ -204,7 +220,10 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 "POST /v1/summarize", "POST /v1/enrich",
                 "POST /v1/agent", "POST /v1/prompt",
                 "POST /v1/cmd",
-                "POST /v1/vision/classify", "POST /v1/vision/landmarks"
+                "POST /v1/vision/classify", "POST /v1/vision/landmarks",
+                "POST /v1/passport/extract", "POST /v1/passport/batch-extract",
+                "POST /v1/passport/find", "POST /v1/content/get",
+                "POST /v1/passport/claim", "POST /v1/passport/release"
             ]
         ]
     }
@@ -231,7 +250,28 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 ["name": "vision_classify", "endpoint": "POST /v1/vision/classify", "input": "path + top_n",
                  "output": "classifications [{label, confidence}]", "model": "Vision VNClassifyImageRequest"],
                 ["name": "vision_landmarks", "endpoint": "POST /v1/vision/landmarks", "input": "path",
-                 "output": "faces with landmarks + count", "model": "Vision VNDetectFaceLandmarksRequest"]
+                 "output": "faces with landmarks + count", "model": "Vision VNDetectFaceLandmarksRequest"],
+                ["name": "passport_extract", "endpoint": "POST /v1/passport/extract",
+                 "input": "path + content? + domain_options",
+                 "output": "passport (concepts, summary, domain, difficulty)", "model": "NLTagger + FoundationModels"],
+                ["name": "passport_batch_extract", "endpoint": "POST /v1/passport/batch-extract",
+                 "input": "paths[] + domain_options",
+                 "output": "passports[] + errors[]", "model": "NLTagger + FoundationModels"],
+                ["name": "passport_find", "endpoint": "POST /v1/passport/find",
+                 "input": "query + embeddings_jsonl_path + passports_jsonl_path",
+                 "output": "ranked cards (no content) with cosine + concept overlap",
+                 "model": "NLContextualEmbedding cosine"],
+                ["name": "content_get", "endpoint": "POST /v1/content/get",
+                 "input": "path + vault_root? + max_chars?",
+                 "output": "content + frontmatter", "model": "FileManager"],
+                ["name": "passport_claim", "endpoint": "POST /v1/passport/claim",
+                 "input": "note_path + vault_root + device_id + ttl_seconds",
+                 "output": "{claimed, current_holder, claimed_at, expires_at}",
+                 "model": "filesystem lock (sha256 path) — coordenação cross-device via iCloud"],
+                ["name": "passport_release", "endpoint": "POST /v1/passport/release",
+                 "input": "note_path + vault_root + device_id",
+                 "output": "{released, reason}",
+                 "model": "filesystem lock"]
             ]
         ]
     }
@@ -752,6 +792,735 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             "model": "Vision VNDetectFaceLandmarksRequest"
         ])
         #endif
+    }
+
+    // MARK: - /v1/passport/extract — Passport Index Architecture (PIA)
+
+    /// Resolve note path: absolute → as-is; relative → vaultURL base; else expand tilde.
+    private func resolveNotePath(_ path: String) -> URL {
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path)
+        } else if let base = self.vaultURL {
+            return base.appendingPathComponent(path)
+        } else {
+            return URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        }
+    }
+
+    /// Extract concepts via NLTagger (nameType entities + relevant lemmas).
+    private func extractConcepts(from text: String, maxConcepts: Int = 12) -> [String] {
+        var concepts: [String] = []
+        var seen = Set<String>()
+
+        let nameTagger = NLTagger(tagSchemes: [.nameType])
+        nameTagger.string = text
+        let nameOptions: NLTagger.Options = [.omitPunctuation, .omitWhitespace, .joinNames]
+        let interesting: Set<NLTag> = [.personalName, .placeName, .organizationName]
+        nameTagger.enumerateTags(in: text.startIndex..<text.endIndex,
+                                  unit: .word, scheme: .nameType, options: nameOptions) { tag, range in
+            if let t = tag, interesting.contains(t) {
+                let token = String(text[range])
+                let key = token.lowercased()
+                if token.count >= 2 && !seen.contains(key) {
+                    seen.insert(key)
+                    concepts.append(token)
+                }
+            }
+            return concepts.count < maxConcepts
+        }
+
+        if concepts.count < maxConcepts {
+            let patterns = [
+                "\\b[A-Z]{2,}[A-Za-z0-9]*\\b",
+                "\\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\\b"
+            ]
+            for pat in patterns {
+                if let re = try? NSRegularExpression(pattern: pat) {
+                    let nsText = text as NSString
+                    let matches = re.matches(in: text, options: [],
+                                              range: NSRange(location: 0, length: nsText.length))
+                    for m in matches {
+                        let token = nsText.substring(with: m.range)
+                        let key = token.lowercased()
+                        if !seen.contains(key) && token.count >= 2 {
+                            seen.insert(key)
+                            concepts.append(token)
+                            if concepts.count >= maxConcepts { break }
+                        }
+                    }
+                }
+                if concepts.count >= maxConcepts { break }
+            }
+        }
+
+        return concepts
+    }
+
+    /// Heuristic difficulty score 1–5 (no LLM).
+    private func computeDifficulty(text: String) -> Int {
+        var score = 1
+        let charCount = text.count
+
+        if charCount >= 500 { score += 0 } else { return 1 }
+        if charCount >= 800 { score += 1 }
+
+        if text.contains("```") { score += 1 }
+
+        if let re = try? NSRegularExpression(pattern: "\\b[A-Z]{3,}\\b|\\w+\\(\\)|@\\w+") {
+            let nsText = text as NSString
+            let matches = re.matches(in: text, options: [],
+                                      range: NSRange(location: 0, length: nsText.length))
+            if matches.count > 5 { score += 1 }
+        }
+
+        let linkPattern = "\\[\\[[^\\]]+\\]\\]|\\[[^\\]]+\\]\\([^\\)]+\\)"
+        if let re = try? NSRegularExpression(pattern: linkPattern) {
+            let nsText = text as NSString
+            let matches = re.matches(in: text, options: [],
+                                      range: NSRange(location: 0, length: nsText.length))
+            if matches.count > 3 { score += 1 }
+        }
+
+        return min(5, max(1, score))
+    }
+
+    private struct PassportResult {
+        let path: String
+        let concepts: [String]
+        let oneLineSummary: String
+        let domain: [String]
+        let difficulty: Int
+        let extractedAt: String
+        let charCount: Int
+    }
+
+    /// Core extraction: text → passport. FM gated; em iPad Air gen 4 retorna sem summary/domain.
+    private func extractPassportCore(path: String, rawContent: String,
+                                      domainOptions: [String]) -> (PassportResult?, String?) {
+        let truncated = String(rawContent.prefix(8000))
+
+        let concepts = self.extractConcepts(from: truncated)
+        let difficulty = self.computeDifficulty(text: truncated)
+
+        var oneLineSummary = ""
+        var domain: [String] = []
+
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, macOS 26.0, *) {
+            let model = SystemLanguageModel.default
+            if case .available = model.availability {
+                let sumInstructions = "Resuma em UMA frase de no máximo 25 palavras o texto a seguir. Mantenha o idioma do texto. Responda APENAS com a frase, sem prefixos como 'Resumo:'."
+                let sumSession = LanguageModelSession(instructions: sumInstructions)
+                let sumOptions = GenerationOptions(temperature: 0.0, maximumResponseTokens: 80)
+                let sumSem = DispatchSemaphore(value: 0)
+                Task {
+                    if let resp = try? await sumSession.respond(to: truncated, options: sumOptions) {
+                        oneLineSummary = resp.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    sumSem.signal()
+                }
+                _ = sumSem.wait(timeout: .now() + .seconds(30))
+
+                if !domainOptions.isEmpty {
+                    let optionsList = domainOptions.joined(separator: ", ")
+                    let clsInstructions = """
+                    Classifique o texto a seguir em UMA OU MAIS das categorias permitidas. \
+                    Categorias permitidas: \(optionsList). \
+                    Responda APENAS um array JSON de strings (subset das categorias). \
+                    Sem fences, sem comentários. Exemplo: ["Tecnologia","Pesquisa"]
+                    """
+                    let clsSession = LanguageModelSession(instructions: clsInstructions)
+                    let clsOptions = GenerationOptions(temperature: 0.0, maximumResponseTokens: 120)
+                    let clsSem = DispatchSemaphore(value: 0)
+                    var clsRaw = ""
+                    Task {
+                        if let resp = try? await clsSession.respond(to: truncated, options: clsOptions) {
+                            clsRaw = resp.content
+                        }
+                        clsSem.signal()
+                    }
+                    _ = clsSem.wait(timeout: .now() + .seconds(30))
+
+                    if let start = clsRaw.firstIndex(of: "["),
+                       let end = clsRaw.lastIndex(of: "]"), start < end {
+                        let candidate = String(clsRaw[start...end])
+                        if let data = candidate.data(using: .utf8),
+                           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                            let allowedLower = Set(domainOptions.map { $0.lowercased() })
+                            for cat in parsed {
+                                if allowedLower.contains(cat.lowercased()) {
+                                    if let canonical = domainOptions.first(where: { $0.lowercased() == cat.lowercased() }) {
+                                        if !domain.contains(canonical) {
+                                            domain.append(canonical)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #endif
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let extractedAt = formatter.string(from: Date())
+
+        let result = PassportResult(
+            path: path,
+            concepts: concepts,
+            oneLineSummary: oneLineSummary,
+            domain: domain,
+            difficulty: difficulty,
+            extractedAt: extractedAt,
+            charCount: rawContent.count
+        )
+        return (result, nil)
+    }
+
+    private func passportToDict(_ p: PassportResult, modelVersions: [String: String]) -> [String: Any] {
+        return [
+            "path": p.path,
+            "concepts": p.concepts,
+            "one_line_summary": p.oneLineSummary,
+            "domain": p.domain,
+            "difficulty": p.difficulty,
+            "extracted_at": p.extractedAt,
+            "char_count": p.charCount,
+            "model_versions": modelVersions
+        ]
+    }
+
+    private func handlePassportExtract(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"...\", \"domain_options\": [...]}"
+            ])
+        }
+        let domainOptions = (json["domain_options"] as? [String]) ?? []
+
+        var rawContent = (json["content"] as? String) ?? ""
+        if rawContent.isEmpty {
+            let resolved = self.resolveNotePath(path)
+            if let disk = try? String(contentsOf: resolved, encoding: .utf8) {
+                rawContent = disk
+            } else {
+                return Response(status: .badRequest, payload: [
+                    "error": "não foi possível ler \(resolved.path)",
+                    "path": path
+                ])
+            }
+        }
+
+        let (result, err) = self.extractPassportCore(
+            path: path, rawContent: rawContent, domainOptions: domainOptions)
+        if let err = err {
+            return Response(status: .internalServerError, payload: ["error": err, "path": path])
+        }
+        guard let p = result else {
+            return Response(status: .internalServerError, payload: ["error": "extração falhou", "path": path])
+        }
+
+        let modelVersions: [String: String] = [
+            "nl": "apple-nlcontextual-pt-BR",
+            "afm": "apple-foundationmodels-systemlanguagemodel"
+        ]
+        return Response(status: .ok, payload: self.passportToDict(p, modelVersions: modelVersions))
+    }
+
+    // MARK: - /v1/passport/batch-extract
+
+    private func handlePassportBatchExtract(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let paths = json["paths"] as? [String], !paths.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"paths\": [...], \"domain_options\": [...]}"
+            ])
+        }
+        let domainOptions = (json["domain_options"] as? [String]) ?? []
+
+        let modelVersions: [String: String] = [
+            "nl": "apple-nlcontextual-pt-BR",
+            "afm": "apple-foundationmodels-systemlanguagemodel"
+        ]
+
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        var passports: [[String: Any]] = []
+        var errors: [[String: String]] = []
+
+        for path in paths {
+            let resolved = self.resolveNotePath(path)
+            guard let raw = try? String(contentsOf: resolved, encoding: .utf8) else {
+                errors.append(["path": path, "error": "não foi possível ler \(resolved.path)"])
+                continue
+            }
+            let (result, coreErr) = self.extractPassportCore(
+                path: path, rawContent: raw, domainOptions: domainOptions)
+            if let coreErr = coreErr {
+                errors.append(["path": path, "error": coreErr])
+                continue
+            }
+            if let p = result {
+                passports.append(self.passportToDict(p, modelVersions: modelVersions))
+            } else {
+                errors.append(["path": path, "error": "extração falhou"])
+            }
+        }
+
+        let elapsedNs = DispatchTime.now().uptimeNanoseconds - startNs
+        let elapsedMs = Int(elapsedNs / 1_000_000)
+
+        return Response(status: .ok, payload: [
+            "passports": passports,
+            "errors": errors,
+            "count": passports.count,
+            "error_count": errors.count,
+            "elapsed_ms": elapsedMs
+        ])
+    }
+
+    // MARK: - /v1/passport/find — orquestra cosine + filter, retorna cards sem content
+
+    /// Embed text via NLContextualEmbedding (pooled vector). Returns nil if unavailable.
+    private func embedQuerySync(_ text: String) -> [Float]? {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            let langs: [NLLanguage] = [.portuguese, .english]
+            for lang in langs {
+                guard let emb = NLContextualEmbedding(language: lang) else { continue }
+                if !emb.hasAvailableAssets {
+                    _ = try? emb.load()
+                }
+                if let result = try? emb.embeddingResult(for: text, language: lang) {
+                    var vector: [Float] = []
+                    var tokenCount: Int = 0
+                    result.enumerateTokenVectors(in: text.startIndex..<text.endIndex) { vec, _ in
+                        if !vec.isEmpty {
+                            if vector.isEmpty {
+                                vector = vec.map { Float($0) }
+                            } else {
+                                for (i, x) in vec.enumerated() where i < vector.count {
+                                    vector[i] += Float(x)
+                                }
+                            }
+                            tokenCount += 1
+                        }
+                        return true
+                    }
+                    if !vector.isEmpty {
+                        let count = max(1, tokenCount)
+                        return vector.map { $0 / Float(count) }
+                    }
+                }
+            }
+        }
+        if let emb = NLEmbedding.sentenceEmbedding(for: .portuguese)
+            ?? NLEmbedding.sentenceEmbedding(for: .english),
+           let vec = emb.vector(for: text) {
+            return vec.map { Float($0) }
+        }
+        return nil
+    }
+
+    private static func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+        let n = min(a.count, b.count)
+        guard n > 0 else { return 0 }
+        var dot: Float = 0
+        var na: Float = 0
+        var nb: Float = 0
+        for i in 0..<n {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        let denom = (na.squareRoot()) * (nb.squareRoot())
+        return denom > 0 ? dot / denom : 0
+    }
+
+    private func handlePassportFind(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let query = json["query"] as? String, !query.isEmpty,
+              let embPath = json["embeddings_jsonl_path"] as? String,
+              let pasPath = json["passports_jsonl_path"] as? String else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer query, embeddings_jsonl_path, passports_jsonl_path"
+            ])
+        }
+        let topN = (json["top_n"] as? Int) ?? 10
+        let minScore = (json["min_score"] as? Double).map { Float($0) } ?? 0.3
+        let conceptFilter = (json["concept_filter"] as? [String]) ?? []
+
+        let embURL = URL(fileURLWithPath: (embPath as NSString).expandingTildeInPath)
+        let pasURL = URL(fileURLWithPath: (pasPath as NSString).expandingTildeInPath)
+
+        guard let embRaw = try? String(contentsOf: embURL, encoding: .utf8) else {
+            return Response(status: .badRequest, payload: ["error": "não foi possível ler embeddings em \(embPath)"])
+        }
+        guard let pasRaw = try? String(contentsOf: pasURL, encoding: .utf8) else {
+            return Response(status: .badRequest, payload: ["error": "não foi possível ler passaportes em \(pasPath)"])
+        }
+
+        var passportByPath: [String: [String: Any]] = [:]
+        for line in pasRaw.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            guard let data = trimmed.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = obj["path"] as? String else { continue }
+            passportByPath[path] = obj
+        }
+
+        guard let queryVec = self.embedQuerySync(query) else {
+            return Response(status: .internalServerError, payload: ["error": "embedding indisponível"])
+        }
+
+        struct Candidate {
+            let path: String
+            let cosine: Float
+        }
+        var candidates: [Candidate] = []
+        for line in embRaw.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            guard let data = trimmed.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = obj["path"] as? String,
+                  let vecAny = obj["vector"] as? [Any] else { continue }
+            let vec: [Float] = vecAny.compactMap { ($0 as? NSNumber).map { Float(truncating: $0) } }
+            if vec.isEmpty { continue }
+            let score = Self.cosineSimilarity(queryVec, vec)
+            if score >= minScore {
+                candidates.append(Candidate(path: path, cosine: score))
+            }
+        }
+
+        candidates.sort { $0.cosine > $1.cosine }
+        let pool = Array(candidates.prefix(topN * 2))
+
+        let filterLower = Set(conceptFilter.map { $0.lowercased() })
+        var results: [[String: Any]] = []
+        var totalBytes = 0
+        var wouldBeBytes = 0
+
+        for cand in pool {
+            guard let passport = passportByPath[cand.path] else { continue }
+            let concepts = (passport["concepts"] as? [String]) ?? []
+            let conceptsLower = Set(concepts.map { $0.lowercased() })
+
+            let overlap: [String]
+            if !filterLower.isEmpty {
+                overlap = concepts.filter { filterLower.contains($0.lowercased()) }
+                if overlap.isEmpty { continue }
+            } else {
+                let queryTokens = Set(query.lowercased().split(separator: " ").map(String.init))
+                overlap = concepts.filter { queryTokens.contains($0.lowercased()) || conceptsLower.contains($0.lowercased()) && queryTokens.contains($0.lowercased()) }
+            }
+
+            let boostedScore = cand.cosine * (1.0 + 0.2 * Float(overlap.count))
+
+            let card: [String: Any] = [
+                "path": cand.path,
+                "cosine_score": cand.cosine,
+                "score": boostedScore,
+                "concepts": concepts,
+                "one_line_summary": passport["one_line_summary"] ?? "",
+                "domain": passport["domain"] ?? [],
+                "difficulty": passport["difficulty"] ?? 0,
+                "concept_overlap": overlap
+            ]
+            results.append(card)
+
+            if let cardData = try? JSONSerialization.data(withJSONObject: card) {
+                totalBytes += cardData.count
+            }
+            if let cc = passport["char_count"] as? Int {
+                wouldBeBytes += cc
+            }
+
+            if results.count >= topN { break }
+        }
+
+        results.sort { (($0["score"] as? Float) ?? 0) > (($1["score"] as? Float) ?? 0) }
+
+        return Response(status: .ok, payload: [
+            "query": query,
+            "results": results,
+            "count": results.count,
+            "total_bytes_returned": totalBytes,
+            "would_be_bytes_full_content": wouldBeBytes,
+            "savings_ratio": wouldBeBytes > 0 ? Double(wouldBeBytes - totalBytes) / Double(wouldBeBytes) : 0.0
+        ])
+    }
+
+    // MARK: - /v1/content/get — on-demand fetcher
+
+    private func handleContentGet(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"...\", \"vault_root\"?: \"...\", \"max_chars\"?: N}"
+            ])
+        }
+        let maxChars = (json["max_chars"] as? Int) ?? 50_000
+        let vaultRootOpt = json["vault_root"] as? String
+
+        let resolved: URL
+        if path.hasPrefix("/") {
+            resolved = URL(fileURLWithPath: path)
+        } else if let vr = vaultRootOpt, !vr.isEmpty {
+            let base = URL(fileURLWithPath: (vr as NSString).expandingTildeInPath)
+            resolved = base.appendingPathComponent(path)
+        } else if let base = self.vaultURL {
+            resolved = base.appendingPathComponent(path)
+        } else {
+            resolved = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        }
+
+        guard let raw = try? String(contentsOf: resolved, encoding: .utf8) else {
+            return Response(status: .badRequest, payload: [
+                "error": "não foi possível ler \(resolved.path)",
+                "path": path
+            ])
+        }
+
+        let truncated = String(raw.prefix(maxChars))
+
+        var frontmatter: [String: Any] = [:]
+        if raw.hasPrefix("---\n") {
+            let afterFirst = raw.index(raw.startIndex, offsetBy: 4)
+            if let endRange = raw.range(of: "\n---\n", range: afterFirst..<raw.endIndex) ??
+                              raw.range(of: "\n---", range: afterFirst..<raw.endIndex) {
+                let block = String(raw[afterFirst..<endRange.lowerBound])
+                for line in block.split(separator: "\n") {
+                    let lineStr = String(line)
+                    if let colonIdx = lineStr.firstIndex(of: ":") {
+                        let key = String(lineStr[..<colonIdx]).trimmingCharacters(in: .whitespaces)
+                        let valRaw = String(lineStr[lineStr.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
+                        if valRaw.hasPrefix("[") && valRaw.hasSuffix("]") {
+                            let inner = String(valRaw.dropFirst().dropLast())
+                            let items = inner.split(separator: ",").map {
+                                $0.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+                            }
+                            frontmatter[key] = items
+                        } else if valRaw == "true" {
+                            frontmatter[key] = true
+                        } else if valRaw == "false" {
+                            frontmatter[key] = false
+                        } else if let n = Int(valRaw) {
+                            frontmatter[key] = n
+                        } else if let d = Double(valRaw) {
+                            frontmatter[key] = d
+                        } else {
+                            frontmatter[key] = valRaw.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                        }
+                    }
+                }
+            }
+        }
+
+        return Response(status: .ok, payload: [
+            "path": path,
+            "resolved_path": resolved.path,
+            "content": truncated,
+            "char_count": truncated.count,
+            "full_char_count": raw.count,
+            "truncated": raw.count > maxChars,
+            "frontmatter": frontmatter
+        ])
+    }
+
+    // MARK: - /v1/passport/claim & /v1/passport/release — coordenação cross-device via filesystem locks
+
+    /// SHA-256 hex de uma string, para gerar lock filename a partir de note_path.
+    private static func sha256Hex(_ s: String) -> String {
+        let data = Data(s.utf8)
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Resolve diretório de claims em vault_root/.obsidian/plugins/zeus/data/claims/
+    private func claimsDir(vaultRoot: String) -> URL {
+        let expanded = (vaultRoot as NSString).expandingTildeInPath
+        let base = URL(fileURLWithPath: expanded)
+        return base
+            .appendingPathComponent(".obsidian")
+            .appendingPathComponent("plugins")
+            .appendingPathComponent("zeus")
+            .appendingPathComponent("data")
+            .appendingPathComponent("claims")
+    }
+
+    /// Parse ISO-8601 com fração de segundos; retorna nil se falhar.
+    private static func parseISO8601(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        return f2.date(from: s)
+    }
+
+    private static func formatISO8601(_ d: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: d)
+    }
+
+    private func handlePassportClaim(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let notePath = json["note_path"] as? String, !notePath.isEmpty,
+              let vaultRoot = json["vault_root"] as? String, !vaultRoot.isEmpty,
+              let deviceId = json["device_id"] as? String, !deviceId.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"note_path\", \"vault_root\", \"device_id\", \"ttl_seconds\"?}"
+            ])
+        }
+        let ttl = (json["ttl_seconds"] as? Int) ?? 60
+
+        let dir = self.claimsDir(vaultRoot: vaultRoot)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            return Response(status: .internalServerError, payload: [
+                "error": "não foi possível criar dir de claims: \(error)"
+            ])
+        }
+
+        let lockName = Self.sha256Hex(notePath) + ".lock"
+        let lockURL = dir.appendingPathComponent(lockName)
+        let now = Date()
+        let expiresAt = now.addingTimeInterval(TimeInterval(ttl))
+
+        // Verifica lock existente
+        if FileManager.default.fileExists(atPath: lockURL.path),
+           let existingData = try? Data(contentsOf: lockURL),
+           let existing = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any],
+           let curHolder = existing["device_id"] as? String,
+           let expStr = existing["expires_at"] as? String,
+           let expDate = Self.parseISO8601(expStr) {
+            // Lock ainda válido?
+            if expDate > now {
+                if curHolder == deviceId {
+                    // Renova
+                    let payload: [String: Any] = [
+                        "device_id": deviceId,
+                        "note_path": notePath,
+                        "claimed_at": Self.formatISO8601(now),
+                        "expires_at": Self.formatISO8601(expiresAt)
+                    ]
+                    if !self.writeLockAtomic(lockURL: lockURL, payload: payload) {
+                        return Response(status: .internalServerError, payload: ["error": "falha ao escrever lock"])
+                    }
+                    return Response(status: .ok, payload: [
+                        "claimed": true,
+                        "current_holder": deviceId,
+                        "claimed_at": Self.formatISO8601(now),
+                        "expires_at": Self.formatISO8601(expiresAt),
+                        "renewed": true
+                    ])
+                } else {
+                    return Response(status: .ok, payload: [
+                        "claimed": false,
+                        "current_holder": curHolder,
+                        "claimed_at": existing["claimed_at"] ?? "",
+                        "expires_at": expStr,
+                        "renewed": false
+                    ])
+                }
+            }
+            // Expirado → sobrescreve abaixo
+        }
+
+        let payload: [String: Any] = [
+            "device_id": deviceId,
+            "note_path": notePath,
+            "claimed_at": Self.formatISO8601(now),
+            "expires_at": Self.formatISO8601(expiresAt)
+        ]
+        if !self.writeLockAtomic(lockURL: lockURL, payload: payload) {
+            return Response(status: .internalServerError, payload: ["error": "falha ao escrever lock"])
+        }
+        return Response(status: .ok, payload: [
+            "claimed": true,
+            "current_holder": deviceId,
+            "claimed_at": Self.formatISO8601(now),
+            "expires_at": Self.formatISO8601(expiresAt),
+            "renewed": false
+        ])
+    }
+
+    /// Atomic write: escreve em .tmp e renomeia para o destino final.
+    private func writeLockAtomic(lockURL: URL, payload: [String: Any]) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return false
+        }
+        let tmpURL = lockURL.deletingLastPathComponent()
+            .appendingPathComponent(lockURL.lastPathComponent + ".tmp.\(ProcessInfo.processInfo.processIdentifier).\(UInt32.random(in: 0...UInt32.max))")
+        do {
+            try data.write(to: tmpURL, options: .atomic)
+            if FileManager.default.fileExists(atPath: lockURL.path) {
+                _ = try? FileManager.default.removeItem(at: lockURL)
+            }
+            try FileManager.default.moveItem(at: tmpURL, to: lockURL)
+            return true
+        } catch {
+            _ = try? FileManager.default.removeItem(at: tmpURL)
+            return false
+        }
+    }
+
+    private func handlePassportRelease(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let notePath = json["note_path"] as? String, !notePath.isEmpty,
+              let vaultRoot = json["vault_root"] as? String, !vaultRoot.isEmpty,
+              let deviceId = json["device_id"] as? String, !deviceId.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"note_path\", \"vault_root\", \"device_id\"}"
+            ])
+        }
+
+        let dir = self.claimsDir(vaultRoot: vaultRoot)
+        let lockURL = dir.appendingPathComponent(Self.sha256Hex(notePath) + ".lock")
+
+        guard FileManager.default.fileExists(atPath: lockURL.path) else {
+            return Response(status: .ok, payload: [
+                "released": true,
+                "reason": "no_lock_existed"
+            ])
+        }
+
+        guard let data = try? Data(contentsOf: lockURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let holder = obj["device_id"] as? String else {
+            // Lock corrompido — limpa.
+            _ = try? FileManager.default.removeItem(at: lockURL)
+            return Response(status: .ok, payload: [
+                "released": true,
+                "reason": "corrupt_lock_removed"
+            ])
+        }
+
+        if holder != deviceId {
+            return Response(status: .ok, payload: [
+                "released": false,
+                "reason": "lock_held_by_other_device",
+                "current_holder": holder
+            ])
+        }
+
+        do {
+            try FileManager.default.removeItem(at: lockURL)
+            return Response(status: .ok, payload: [
+                "released": true,
+                "reason": "released"
+            ])
+        } catch {
+            return Response(status: .internalServerError, payload: [
+                "released": false,
+                "reason": "remove_failed: \(error)"
+            ])
+        }
     }
 
     // MARK: - FoundationModels runner (gated)

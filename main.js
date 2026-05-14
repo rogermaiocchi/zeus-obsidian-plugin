@@ -55,6 +55,8 @@ const ZeusHttpClient = require('./lib/zeus-http-client');    // v0.6: Aegis-patt
 const ImageSimilaritySearch = require('./lib/image-similarity'); // v0.7: feature-print vault image similarity
 const PassportIndex = require('./lib/passport-index');       // v0.9: Passport Index Architecture (PIA)
 const BasesGenerator = require('./lib/bases-generator');     // v0.9: Obsidian Bases UI derivative from passports.jsonl
+const DistributedCoordinator = require('./lib/distributed-coordinator'); // v0.10: cross-device claim/release via iCloud lock files
+const PassportScheduler = require('./lib/passport-scheduler');           // v0.10: background sweep for stale passports
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -114,6 +116,11 @@ const DEFAULT_SETTINGS = {
   nativeGraphTopN: 5,                       // top N neighbors per note
   nativeGraphMinScore: 0.3,                 // skip edges below this cosine score
   nativeGraphSyncOnSave: true,              // resync neighbor after file modify
+  // v0.10.0 — cross-device coordination + scheduler
+  deviceId: '',                             // persisted; generated on first run by DistributedCoordinator
+  schedulerEnabled: true,                   // default ON — background coordinator sweeps stale passports
+  schedulerIntervalMs: 15 * 60 * 1000,      // 15 min default
+  coordTtlMs: 60 * 1000,                    // 60s default; iCloud sync delay (5-30s) << TTL
 };
 
 // =========================================================================
@@ -1743,6 +1750,62 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Re-sincroniza `zeus_related:` 6s após cada modificação da nota (independente de Mac/indexOnSave).')
       .addToggle(t => t.setValue(this.plugin.settings.nativeGraphSyncOnSave).onChange(async v => { this.plugin.settings.nativeGraphSyncOnSave = v; await this.plugin.saveSettings(); }));
 
+    containerEl.createEl('h3', { text: 'Cross-device coordination (v0.10)' });
+
+    new Setting(containerEl)
+      .setName('Device ID')
+      .setDesc('Identificador estável deste device (gerado uma vez, persistido). Usado em claim/release locks para evitar dupla extração quando o vault é sincronizado via iCloud.')
+      .addText(t => {
+        t.setValue(this.plugin.settings.deviceId || (this.plugin.coordinator && this.plugin.coordinator.deviceId) || '');
+        t.setDisabled(true);
+        return t;
+      });
+
+    new Setting(containerEl)
+      .setName('Scheduler enabled (background sweep)')
+      .setDesc('Quando ON, varre o vault periodicamente e re-extrai passports de notas cujo SHA mudou. Coordena claim/release com outros devices via locks em data/claims/. Hook on-modify também usa o coordinator para re-extract pontual.')
+      .addToggle(t => t.setValue(this.plugin.settings.schedulerEnabled).onChange(async v => {
+        this.plugin.settings.schedulerEnabled = v;
+        await this.plugin.saveSettings();
+        if (this.plugin.scheduler) {
+          if (v) this.plugin.scheduler.start();
+          else this.plugin.scheduler.stop();
+        }
+      }));
+
+    new Setting(containerEl)
+      .setName('Scheduler interval (minutes)')
+      .setDesc('Intervalo entre varreduras automáticas (5 min - 60 min). Toggle o scheduler off+on para aplicar mudança.')
+      .addSlider(s => s.setLimits(5, 60, 1).setValue(Math.round((this.plugin.settings.schedulerIntervalMs || (15 * 60 * 1000)) / 60000)).setDynamicTooltip().onChange(async v => {
+        this.plugin.settings.schedulerIntervalMs = v * 60 * 1000;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('Claim TTL (seconds)')
+      .setDesc('Tempo até um lock expirar e ser auto-liberado. Default 60s — iCloud sync delay (5-30s) << TTL. Aumente se rede iCloud estiver lenta.')
+      .addSlider(s => s.setLimits(30, 300, 10).setValue(Math.round((this.plugin.settings.coordTtlMs || 60000) / 1000)).setDynamicTooltip().onChange(async v => {
+        this.plugin.settings.coordTtlMs = v * 1000;
+        await this.plugin.saveSettings();
+        if (this.plugin.coordinator) this.plugin.coordinator.ttlMs = v * 1000;
+      }));
+
+    new Setting(containerEl)
+      .setName('Coordination stats')
+      .setDesc('Snapshot dos claims ativos no momento.')
+      .addButton(b => b.setButtonText('Stats').onClick(() => {
+        const s = this.plugin.scheduler ? this.plugin.scheduler.stats() : null;
+        if (!s) { new Notice('Zeus: scheduler indisponível'); return; }
+        const c = s.coordinator || {};
+        new Notice(
+          `Zeus coord: ${c.total || 0} claims (${c.expired || 0} expired)\n` +
+          `Device: ${c.thisDeviceId}\n` +
+          `Scheduler: enabled=${s.enabled}, running=${s.running}`,
+          8000,
+        );
+        console.log('[zeus] coordination stats', s);
+      }));
+
     containerEl.createEl('h3', { text: 'Ações' });
     new Setting(containerEl)
       .setName('Reindex completo')
@@ -1800,6 +1863,24 @@ class ZeusPlugin extends Plugin {
     // v0.9.0 — Passport Index Architecture (PIA): MCP-first agent surface
     this.passport = new PassportIndex(this);
     this.basesGen = new BasesGenerator(this);
+
+    // v0.10.0 — Cross-device coordination (claim/release via iCloud-synced locks)
+    this.coordinator = new DistributedCoordinator(this, {
+      deviceId: this.settings.deviceId || undefined,
+      ttlMs: this.settings.coordTtlMs || 60_000,
+    });
+    if (!this.settings.deviceId) {
+      this.settings.deviceId = this.coordinator.deviceId;
+      await this.saveSettings();
+      console.log('[zeus] generated deviceId:', this.coordinator.deviceId);
+    }
+    // v0.10.0 — Background scheduler for stale-passport detection + claim-coordinated re-extract
+    this.scheduler = new PassportScheduler(this, {
+      intervalMs: this.settings.schedulerIntervalMs || 15 * 60 * 1000,
+    });
+    if (this.settings.schedulerEnabled) {
+      this.scheduler.start();
+    }
 
     // v0.6.1 — Adaptive daemon discovery (async, doesn't block onload)
     this.app.workspace.onLayoutReady(async () => {
@@ -2325,6 +2406,60 @@ class ZeusPlugin extends Plugin {
       },
     });
 
+    // v0.10.0 — scheduler + coordinator commands
+    this.addCommand({
+      id: 'zeus-scheduler-sweep-now',
+      name: 'Zeus: sweep agora (scheduler manual trigger)',
+      callback: async () => {
+        if (!this.scheduler) { new Notice('Zeus: scheduler indisponível'); return; }
+        const n = new Notice('Zeus sweep: rodando…', 0);
+        try {
+          const r = await this.scheduler.sweep();
+          n.hide();
+          if (r.skipped === true && r.reason) {
+            new Notice('Zeus sweep: ' + r.reason);
+          } else {
+            new Notice(`Zeus sweep: ${r.extracted} re-extracted, ${r.claimed} claimed, ${r.skipped} skipped, ${r.errors} errors (${r.elapsed}ms)`);
+          }
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus sweep falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+    this.addCommand({
+      id: 'zeus-scheduler-status',
+      name: 'Zeus: status do scheduler + claims ativos',
+      callback: () => {
+        const s = this.scheduler ? this.scheduler.stats() : null;
+        if (!s) { new Notice('Zeus: scheduler indisponível'); return; }
+        const c = s.coordinator || {};
+        const last = s.lastSweep
+          ? `· last sweep ${new Date(s.lastSweep.at).toLocaleTimeString()} (${s.lastSweep.extracted} extr / ${s.lastSweep.claimed} clm / ${s.lastSweep.skipped} skp / ${s.lastSweep.errors} err)`
+          : '· nenhum sweep ainda';
+        new Notice(
+          `Zeus scheduler: enabled=${s.enabled} running=${s.running} interval=${Math.round(s.intervalMs/60000)}min\n` +
+          `Claims ativos: ${c.total || 0} (${c.expired || 0} expired) · device ${c.thisDeviceId}\n` +
+          last,
+          10000,
+        );
+        console.log('[zeus] scheduler stats', s);
+      },
+    });
+    this.addCommand({
+      id: 'zeus-coord-clean-expired',
+      name: 'Zeus: clean expired claims',
+      callback: async () => {
+        if (!this.coordinator) { new Notice('Zeus: coordinator indisponível'); return; }
+        try {
+          const n = await this.coordinator.sweepExpired();
+          new Notice(`Zeus: ${n} expired claim(s) limpos`);
+        } catch (e) {
+          new Notice('Zeus clean falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
     this.addRibbonIcon('sparkles', 'Zeus search', () => new ZeusSearchModal(this.app, this).open());
 
     this.registerView(VIEW_TYPE_SMART, leaf => new ZeusSmartView(leaf, this));
@@ -2360,12 +2495,44 @@ class ZeusPlugin extends Plugin {
       });
     }
 
-    console.log('[zeus] loaded v0.2.0 — 100% Apple-native');
+    // v0.10.0 — debounced single-file passport re-extract via coordinator
+    // Only when scheduler is enabled (it's the orchestrator of the same flow).
+    if (this.settings.schedulerEnabled) {
+      this._passportRefreshTimers = new Map();
+      this.registerEvent(this.app.vault.on('modify', file => {
+        if (!(file instanceof TFile) || file.extension !== 'md') return;
+        const rel = file.path;
+        clearTimeout(this._passportRefreshTimers.get(rel));
+        this._passportRefreshTimers.set(rel, setTimeout(async () => {
+          this._passportRefreshTimers.delete(rel);
+          try {
+            const claim = await this.coordinator.claim(rel);
+            if (!claim.claimed) return;
+            try {
+              await this.passport.buildOne(rel);
+            } finally {
+              await this.coordinator.release(rel);
+            }
+          } catch (e) {
+            console.warn('[zeus] debounced passport refresh failed for', rel, e.message);
+          }
+        }, 4000));
+      }));
+    }
+
+    console.log('[zeus] loaded v0.10.0 — distributed coordinator + scheduler');
   }
 
   async onunload() {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_SMART);
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_STATUS);
+    if (this.scheduler) {
+      try { this.scheduler.stop(); } catch (e) { console.warn('[zeus] scheduler stop:', e.message); }
+    }
+    if (this._passportRefreshTimers) {
+      for (const t of this._passportRefreshTimers.values()) clearTimeout(t);
+      this._passportRefreshTimers.clear();
+    }
     if (this.afmDaemon) {
       try { await this.afmDaemon.stop(); } catch (e) { console.warn('[zeus] daemon stop:', e.message); }
     }

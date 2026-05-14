@@ -12,3 +12,7 @@ data/
 # Editor noise
 .vscode/
 *.swp
+
+# Swift daemon build artifacts
+daemon/.build/
+daemon/Package.resolved

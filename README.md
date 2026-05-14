@@ -63,24 +63,59 @@ Custo: +~30s de cold start por query (spawn fresh do FoundationModels). Default 
 
 Ver [INSTALL.md](INSTALL.md).
 
-## Estrutura
+## Estrutura unificada (plugin + daemon)
 
 ```
-zeus/
-├── manifest.json       Plugin manifest (Obsidian)
-├── main.js             Plain ES2020 JS, sem build chain
-├── styles.css          Claude-style minimalist, integra com Style Settings
-├── README.md           Este arquivo
-├── INSTALL.md          Setup do binary afm + ativação no Obsidian
-├── LICENSE             MIT
+zeus-obsidian-plugin/                       ← repo PIA (private GitHub)
+├── manifest.json                           ← Obsidian plugin manifest (v0.9.0)
+├── main.js                                 ← Plain ES2020, ~2165 LOC
+├── styles.css                              ← Claude-style minimalist
+├── README.md                               ← este arquivo
+├── INSTALL.md                              ← setup completo (plugin + daemon Mac + iOS)
+├── MCP.md                                  ← MCP tool surface para agent consumption
+├── LICENSE                                 ← MIT
 ├── .gitignore
-├── bin/
-│   └── .gitkeep        afm binary lives here when bundled (build via scripts/install-afm.sh)
-├── scripts/
-│   └── install-afm.sh  Compila metafm do Metassistema e copia como bin/afm
-└── data/               Runtime — embeddings.jsonl, manifest.json, av-cache/, aocr-cache/, aia-enrich-cache/
-    └── .gitignore      Ignora todo conteúdo de data/
+│
+├── lib/                                    ← TS modules (plugin client-side)
+│   ├── zeus-http-client.js                 ← HTTP transport + token metrics
+│   ├── passport-index.js                   ← PIA v0.9 — Passport extract/find
+│   ├── bases-generator.js                  ← Obsidian Bases YAML emit (derivative UI)
+│   ├── image-similarity.js                 ← VNFeaturePrint cosine cache (768-dim)
+│   ├── multi-vector.js                     ← 3×512=1536-dim effective
+│   ├── hierarchical.js                     ← NexusSum long-doc enrich
+│   └── afm-daemon.js                       ← JSON-RPC persistent daemon (legacy alt)
+│
+├── scripts/                                ← Plugin-side install
+│   └── install-afm.sh                      ← Compila metafm CLI (alternativa ao daemon)
+│
+├── daemon/                                 ← SWIFT — backend HTTP por device
+│   ├── README.md                           ← arquitetura cross-device
+│   ├── Package.swift                       ← SwiftPM (ZeusDaemonMac + AegisDaemon targets)
+│   ├── Sources/
+│   │   ├── ZeusDaemonMac/                  ← Mac standalone executable (~2400 LOC Swift)
+│   │   │   ├── main.swift                  ← NIO bootstrap, args, signals
+│   │   │   └── ZeusMacHTTPHandler.swift    ← 26 endpoints v0.5.0
+│   │   └── AegisDaemon/                    ← iOS HTTP layer dentro de MetassistemaApp-iOS
+│   │       ├── AegisHTTPServer.swift       ← SwiftNIO bind 127.0.0.1:2223
+│   │       └── AegisHTTPHandlers.swift     ← 22 endpoints v0.3.0
+│   └── scripts/
+│       ├── install-mac-daemon.sh           ← swift build + launchctl
+│       └── com.maiocchi.zeusdaemon.plist   ← LaunchAgent manifest
+│
+└── data/                                   ← runtime (gitignored)
+    ├── embeddings.jsonl                    ← NLContextualEmbedding 512-dim por nota
+    ├── passports.jsonl                     ← PIA canonical (1 passport/line)
+    ├── image-features.jsonl                ← VNFeaturePrint 768-dim por imagem
+    ├── multi-vectors.jsonl                 ← 3 vetores por doc (title/body/summary)
+    ├── manifest.json                       ← index state + sha cache
+    ├── zeus-cards.base                     ← Obsidian Bases UI derivative (regenerated)
+    ├── aocr-cache/                         ← Vision OCR text cache
+    ├── av-cache/                           ← image classify/landmarks cache
+    ├── aia-enrich-cache/                   ← FoundationModels enrich results
+    └── hyde-cache.jsonl                    ← HyDE expansions cached
 ```
+
+**Plugin + Daemon coexistem no repo unificado.** Histórico git protege ambos contra regressões.
 
 ## Versão
 

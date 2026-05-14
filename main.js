@@ -181,10 +181,40 @@ function resolveAfmBinary(plugin) {
     const candidate = path.join(pluginDir, 'bin', name);
     if (fs.existsSync(candidate)) return candidate;
   }
-  // 3. Global fallback
-  if (fs.existsSync(AFM_FALLBACK)) return AFM_FALLBACK;
+  // 3. Global fallback (Mac dev machines)
+  try {
+    if (fs.existsSync(AFM_FALLBACK)) return AFM_FALLBACK;
+  } catch {}
   // 4. Last resort: rely on PATH lookup
   return 'metafm';
+}
+
+// v0.6.1 — Adaptive daemon discovery: tries local loopback, then Tailscale mesh
+// Per device, prefers: 127.0.0.1 (same device daemon) > device-specific Tailscale (mesh peer)
+const TAILSCALE_MESH = [
+  // Order matters — closest/fastest first
+  'http://127.0.0.1:2223',                  // local daemon (any device)
+  'http://100.108.238.49:2223',             // rogers-mac-mini (Tailscale, macOS)
+  'http://100.86.123.88:2223',              // macbook-air-de-roger (Tailscale, macOS)
+  'http://100.91.107.120:2223',             // ipad-air-gen-4 (Tailscale, iOS)
+  'http://100.65.240.43:2223',              // iphone-15 (Tailscale, iOS)
+];
+
+// Probe daemon endpoints in order; return first reachable one. Cached per plugin instance.
+async function discoverDaemonUrl(plugin, candidates = null) {
+  const urls = candidates || [plugin.settings.zeusDaemonUrl, ...TAILSCALE_MESH.filter(u => u !== plugin.settings.zeusDaemonUrl)];
+  for (const url of urls) {
+    try {
+      const client = new (require('./lib/zeus-http-client'))(url);
+      const reachable = await client.isAvailable();
+      if (reachable) {
+        console.log('[zeus] adaptive daemon discovery → using', url);
+        return url;
+      }
+    } catch {}
+  }
+  console.warn('[zeus] adaptive daemon discovery → no reachable endpoint; falling back to default');
+  return plugin.settings.zeusDaemonUrl;
 }
 
 // Read Apple CoreSpotlight metadata via `mdls` — extract EXIF, GPS, dates, kind
@@ -1447,6 +1477,26 @@ class ZeusPlugin extends Plugin {
     this.multiVector = new MultiVectorEmbedder(this.afmBin, pluginDataPath);
     // v0.6.0 — ADR-018 Aegis-pattern HTTP daemon client (works on ALL devices: Mac+iOS uniform)
     this.httpClient = new ZeusHttpClient(this.settings.zeusDaemonUrl);
+
+    // v0.6.1 — Adaptive daemon discovery (async, doesn't block onload)
+    this.app.workspace.onLayoutReady(async () => {
+      try {
+        const discovered = await discoverDaemonUrl(this);
+        if (discovered !== this.settings.zeusDaemonUrl) {
+          console.log('[zeus] adapting daemon URL from', this.settings.zeusDaemonUrl, 'to', discovered);
+          this.httpClient.setBaseUrl(discovered);
+        }
+        // Probe daemon capabilities to log what's available
+        const health = await this.httpClient.health();
+        const tools = await this.httpClient.tools();
+        console.log('[zeus] daemon health:', health.status, '| platform:', health.platform, '| endpoints:', (health.endpoints || []).length, '| tools:', tools.length);
+        if (health.status === 'ok') {
+          new Notice(`Zeus: daemon ${health.platform || '?'} OK · ${(health.endpoints || []).length} endpoints`);
+        }
+      } catch (e) {
+        console.warn('[zeus] adaptive discovery skipped:', e.message);
+      }
+    });
 
     this.loadIndices();
 

@@ -1,0 +1,14 @@
+# Runtime cache — gerado por reindex
+data/
+
+# Binary bundled — opcional commitar (depende da política do repo)
+# Descomente a linha abaixo para NÃO committar o binary (cada dev compila localmente):
+# bin/afm
+# bin/metafm
+
+# macOS noise
+.DS_Store
+
+# Editor noise
+.vscode/
+*.swp

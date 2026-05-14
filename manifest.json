@@ -1,0 +1,10 @@
+{
+  "id": "zeus",
+  "name": "Zeus — Apple-native Search & Connections",
+  "version": "0.6.0",
+  "minAppVersion": "1.5.0",
+  "description": "Multi-modal Apple ecosystem-native search & connections. Substitui Omnisearch + Smart Connections com camadas afm (Foundation Models), av (Vision: classify+OCR+landmarks+EXIF), anl (NLContextualEmbedding 512-dim), aia (Intelligence: enrich+agent+graph) e HyDE query expansion. Indexação no Mac via afm CLI, leitura cross-device via iCloud.",
+  "author": "Roger Maiocchi",
+  "authorUrl": "https://maiocchi.adv.br",
+  "isDesktopOnly": false
+}

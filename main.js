@@ -55,6 +55,7 @@ const ZeusHttpClient = require('./lib/zeus-http-client');    // v0.6: Aegis-patt
 const ImageSimilaritySearch = require('./lib/image-similarity'); // v0.7: feature-print vault image similarity
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
+const VIEW_TYPE_STATUS = 'zeus-status-view';
 const DATA_DIR_NAME = 'data';
 const EMBEDDINGS_FILE = 'embeddings.jsonl';
 const MANIFEST_FILE = 'manifest.json';
@@ -106,6 +107,11 @@ const DEFAULT_SETTINGS = {
   imagesIndexFeaturePrint: false,           // se ON, comandos de indexação de imagens populam data/image-features.jsonl
   autoLanguageDetectOnSave: false,          // detecta língua na nota ativa ao salvar e adiciona ao frontmatter (`lang:`)
   spotlightQueryEnabled: false,             // permite Zeus consultar Spotlight nativo macOS via CSSearchQuery
+  // v0.8.0 — native Obsidian Graph integration
+  nativeGraphIntegration: false,            // opt-in: auto-write zeus_related: in frontmatter (modifica TODAS as notas)
+  nativeGraphTopN: 5,                       // top N neighbors per note
+  nativeGraphMinScore: 0.3,                 // skip edges below this cosine score
+  nativeGraphSyncOnSave: true,              // resync neighbor after file modify
 };
 
 // =========================================================================
@@ -952,6 +958,77 @@ class ZeusGraphModal extends obsidian.Modal {
 }
 
 // =========================================================================
+// Native Obsidian Graph integration (v0.8.0)
+// -------------------------------------------------------------------------
+// Injects Zeus's semantic cosine neighbors into the native Obsidian Graph
+// (Cmd+G) by writing `zeus_related:` array of wikilinks in each note's
+// frontmatter. Obsidian's metadataCache picks these up automatically and
+// renders them as edges alongside regular wikilinks.
+// =========================================================================
+
+class ZeusNativeGraphIntegration {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.lastSync = 0;
+    this.SYNC_DEBOUNCE_MS = 3000;
+    this.FRONTMATTER_KEY = 'zeus_related';
+  }
+
+  // Top-N neighbors da nota, injeta como frontmatter array de wikilinks
+  async syncFile(filePath, topN = 5, minScore = 0.3) {
+    if (!this.plugin.settings.nativeGraphIntegration) return;
+    const neighbors = this.plugin.searcher.neighbors(filePath, topN);
+    const filtered = neighbors.filter(n => n.score >= minScore);
+    if (filtered.length === 0) return;
+
+    const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
+    if (!file) return;
+
+    await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
+      fm[this.FRONTMATTER_KEY] = filtered.map(n => {
+        const name = n.path.replace(/\.md$/, '');
+        return `[[${name}|${name.split('/').pop()} (${(n.score * 100).toFixed(0)}%)]]`;
+      });
+      // Add metadata also
+      fm.zeus_indexed_at = new Date().toISOString();
+      fm.zeus_neighbor_count = filtered.length;
+    });
+  }
+
+  // Sync TODAS as notas com embeddings (batch operation)
+  async syncAllFiles(onProgress) {
+    if (!this.plugin.settings.nativeGraphIntegration) {
+      if (onProgress) onProgress('skip: nativeGraphIntegration off');
+      return;
+    }
+    const paths = [...this.plugin.searcher.embeddings.keys()];
+    let i = 0;
+    for (const p of paths) {
+      i++;
+      try {
+        await this.syncFile(p, this.plugin.settings.nativeGraphTopN || 5, this.plugin.settings.nativeGraphMinScore || 0.3);
+      } catch (e) {
+        console.warn('[zeus] graph sync failed for', p, e.message);
+      }
+      if (onProgress && i % 10 === 0) onProgress(`${i}/${paths.length}`);
+    }
+    if (onProgress) onProgress(`done: ${paths.length} notes synced`);
+  }
+
+  // Cleanup: remove zeus_related from all files
+  async clearAll() {
+    const files = this.plugin.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
+        delete fm[this.FRONTMATTER_KEY];
+        delete fm.zeus_indexed_at;
+        delete fm.zeus_neighbor_count;
+      });
+    }
+  }
+}
+
+// =========================================================================
 // Enricher — FoundationModels deep reasoning via `metafm enrich`
 // =========================================================================
 
@@ -1457,6 +1534,28 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Permite o comando "Zeus: buscar via Spotlight nativo" consultar o índice macOS via CSSearchQuery exposto pelo daemon. Funciona apenas no Mac.')
       .addToggle(t => t.setValue(this.plugin.settings.spotlightQueryEnabled).onChange(async v => { this.plugin.settings.spotlightQueryEnabled = v; await this.plugin.saveSettings(); }));
 
+    containerEl.createEl('h3', { text: 'v0.8 — Native Obsidian Graph integration' });
+
+    new Setting(containerEl)
+      .setName('Native graph integration (DESTRUTIVO — opt-in)')
+      .setDesc('Quando ON, comandos de sync escrevem `zeus_related:` no frontmatter de TODAS as notas com os top-N vizinhos semânticos (cosine). Obsidian Graph nativo (Cmd+G) renderiza esses como edges junto com wikilinks normais. AVISO: modifica frontmatter de todo o vault — use clear-all para reverter.')
+      .addToggle(t => t.setValue(this.plugin.settings.nativeGraphIntegration).onChange(async v => { this.plugin.settings.nativeGraphIntegration = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Top-N vizinhos por nota')
+      .setDesc('Quantos vizinhos semânticos escrever em `zeus_related:` (1-10).')
+      .addSlider(s => s.setLimits(1, 10, 1).setValue(this.plugin.settings.nativeGraphTopN).setDynamicTooltip().onChange(async v => { this.plugin.settings.nativeGraphTopN = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Score mínimo de cosine')
+      .setDesc('Edges abaixo deste score são filtrados. Mais alto = grafo mais esparso e relevante.')
+      .addSlider(s => s.setLimits(0, 1, 0.05).setValue(this.plugin.settings.nativeGraphMinScore).setDynamicTooltip().onChange(async v => { this.plugin.settings.nativeGraphMinScore = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Auto-resync on save')
+      .setDesc('Re-sincroniza `zeus_related:` 6s após cada modificação da nota (independente de Mac/indexOnSave).')
+      .addToggle(t => t.setValue(this.plugin.settings.nativeGraphSyncOnSave).onChange(async v => { this.plugin.settings.nativeGraphSyncOnSave = v; await this.plugin.saveSettings(); }));
+
     containerEl.createEl('h3', { text: 'Ações' });
     new Setting(containerEl)
       .setName('Reindex completo')
@@ -1497,6 +1596,7 @@ class ZeusPlugin extends Plugin {
     this.av = new AppleVisionIntelligence(this);
     this.hyde = new HyDEExpander(this);
     this.graphExtractor = new ZeusGraphExtractor(this);
+    this.nativeGraph = new ZeusNativeGraphIntegration(this);
 
     // v0.5.0 — modular extensions
     const pluginDataPath = path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME);
@@ -1923,6 +2023,45 @@ class ZeusPlugin extends Plugin {
       },
     });
 
+    // v0.8.0 — native Obsidian Graph integration commands
+    this.addCommand({
+      id: 'zeus-graph-sync-all',
+      name: 'Zeus: sincronizar zeus_related frontmatter em TODAS as notas (graph nativo)',
+      callback: async () => {
+        if (!this.settings.nativeGraphIntegration) {
+          new Notice('Ative "Native graph integration" em Settings → Zeus');
+          return;
+        }
+        const n = new Notice('Zeus: sincronizando frontmatter…', 0);
+        await this.nativeGraph.syncAllFiles(msg => n.setMessage('Zeus: ' + msg));
+        n.hide();
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-graph-sync-current',
+      name: 'Zeus: sincronizar zeus_related da nota atual',
+      callback: async () => {
+        const f = this.app.workspace.getActiveFile();
+        if (!f) { new Notice('Sem nota ativa'); return; }
+        await this.nativeGraph.syncFile(f.path);
+        new Notice('Zeus: zeus_related atualizado');
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-graph-clear',
+      name: 'Zeus: limpar zeus_related de TODAS as notas',
+      callback: async () => {
+        const ok = confirm('Remover zeus_related de todas as notas? Esta operação é reversível mas demora.');
+        if (!ok) return;
+        const n = new Notice('Zeus: limpando…', 0);
+        await this.nativeGraph.clearAll();
+        n.hide();
+        new Notice('Zeus: zeus_related removido de todas as notas');
+      },
+    });
+
     this.addRibbonIcon('sparkles', 'Zeus search', () => new ZeusSearchModal(this.app, this).open());
 
     this.registerView(VIEW_TYPE_SMART, leaf => new ZeusSmartView(leaf, this));
@@ -1930,6 +2069,18 @@ class ZeusPlugin extends Plugin {
     if (isMac() && this.settings.indexOnSave) {
       this.registerEvent(this.app.vault.on('modify', file => {
         if (file instanceof TFile) this.scheduleIncrementalIndex();
+      }));
+    }
+    // v0.8.0 — native graph auto-resync on save (independent of indexOnSave/Mac)
+    if (this.settings.nativeGraphSyncOnSave) {
+      this.registerEvent(this.app.vault.on('modify', file => {
+        if (file instanceof TFile && file.extension === 'md') {
+          // Debounce: re-sync after 6s (after potential reindex)
+          clearTimeout(this._graphSyncTimer);
+          this._graphSyncTimer = setTimeout(() => {
+            this.nativeGraph.syncFile(file.path).catch(e => console.warn('[zeus] graph sync', e.message));
+          }, 6000);
+        }
       }));
     }
     if (isMac() && this.settings.indexOnStartup) {

@@ -347,3 +347,23 @@
   font-size: var(--font-ui-medium);
   line-height: 1.55;
 }
+
+/* ============ Status bar ============ */
+.zeus-status-bar { cursor: pointer; font-family: var(--font-monospace); font-size: 11px; }
+.zeus-status-bar:hover { color: var(--text-accent); }
+
+/* ============ Status view ============ */
+.zeus-status-view { padding: 16px; background: var(--background-primary); overflow-y: auto; height: 100%; }
+.zeus-status-header h3 { margin: 0 0 12px; font-weight: 600; letter-spacing: -0.02em; }
+.zeus-status-section { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--background-modifier-border); }
+.zeus-status-section-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); margin-bottom: 8px; }
+.zeus-status-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
+.zeus-status-label { color: var(--text-muted); }
+.zeus-status-value { font-family: var(--font-monospace); color: var(--text-normal); }
+.zeus-status-value.zeus-status-ok { color: var(--text-success, #2c5530); }
+.zeus-status-value.zeus-status-err { color: var(--text-error, #c00); }
+.zeus-status-value.zeus-status-warn { color: var(--text-warning, #cb6); }
+.zeus-progress-wrap { background: var(--background-modifier-form-field); border-radius: 4px; height: 20px; position: relative; overflow: hidden; }
+.zeus-progress-bar { background: linear-gradient(90deg, var(--interactive-accent), var(--color-accent)); height: 100%; color: white; text-align: center; line-height: 20px; font-size: 11px; font-weight: 600; transition: width 300ms ease; }
+.zeus-status-actions { display: flex; gap: 8px; margin-top: 10px; }
+.zeus-status-actions button { flex: 1; padding: 6px 10px; font-size: 12px; }

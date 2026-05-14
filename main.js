@@ -626,6 +626,7 @@ class ZeusIndexer {
       this.saveManifest(manifest);
 
       this.plugin.loadIndices();
+      if (typeof this.plugin.updateStatusBar === 'function') this.plugin.updateStatusBar('idle', null);
       const elapsed = ((Date.now() - start) / 1000).toFixed(1);
       new Notice(`Zeus: ${docs.length} docs, ${toEmbed.length} embeddings novos, ${elapsed}s`);
       if (onProgress) onProgress(`pronto: ${docs.length} docs / ${elapsed}s`);
@@ -634,6 +635,7 @@ class ZeusIndexer {
       new Notice('Zeus index error: ' + e.message.slice(0, 120));
     } finally {
       this.indexing = false;
+      if (typeof this.plugin.updateStatusBar === 'function') this.plugin.updateStatusBar('idle', null);
     }
   }
 
@@ -1399,6 +1401,114 @@ class ZeusSmartView extends ItemView {
 }
 
 // =========================================================================
+// UI — Status View (persistent calibration pane, Smart Connections-style)
+// =========================================================================
+
+class ZeusStatusView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.interval = null;
+  }
+  getViewType() { return VIEW_TYPE_STATUS; }
+  getDisplayText() { return 'Zeus — Status'; }
+  getIcon() { return 'activity'; }
+
+  async onOpen() {
+    this.containerEl.children[1].empty();
+    this.containerEl.children[1].addClass('zeus-status-view');
+    this.refresh();
+    this.interval = setInterval(() => this.refresh(), 5000);   // refresh a cada 5s
+  }
+  async onClose() {
+    if (this.interval) clearInterval(this.interval);
+  }
+
+  async refresh() {
+    const container = this.containerEl.children[1];
+    container.empty();
+
+    const header = container.createDiv({ cls: 'zeus-status-header' });
+    header.createEl('h3', { text: 'Zeus Engine' });
+
+    // === Daemon section ===
+    const daemonSection = container.createDiv({ cls: 'zeus-status-section' });
+    daemonSection.createDiv({ cls: 'zeus-status-section-title', text: 'Daemon HTTP' });
+    try {
+      const health = await this.plugin.httpClient.health();
+      const tools = await this.plugin.httpClient.tools();
+      this._addStatusRow(daemonSection, 'URL', this.plugin.settings.zeusDaemonUrl);
+      this._addStatusRow(daemonSection, 'Status', health.status || 'unreachable', health.status === 'ok' ? 'ok' : 'err');
+      this._addStatusRow(daemonSection, 'Platform', health.platform || '?');
+      this._addStatusRow(daemonSection, 'Endpoints', String((health.endpoints || []).length));
+      this._addStatusRow(daemonSection, 'Tools', String(tools.length));
+      this._addStatusRow(daemonSection, 'NLContextualEmbedding', health.nl_available ? '✓' : '✗', health.nl_available ? 'ok' : 'err');
+      this._addStatusRow(daemonSection, 'Vision', health.vision_available ? '✓' : '✗', health.vision_available ? 'ok' : 'err');
+      this._addStatusRow(daemonSection, 'FoundationModels', health.fm_available ? '✓' : '✗', health.fm_available ? 'ok' : 'warn');
+      if (health.translation_available !== undefined) {
+        this._addStatusRow(daemonSection, 'Translation', health.translation_available ? '✓' : '✗', health.translation_available ? 'ok' : 'warn');
+      }
+    } catch (e) {
+      this._addStatusRow(daemonSection, 'Status', 'UNREACHABLE: ' + e.message.slice(0, 60), 'err');
+    }
+
+    // === Index section ===
+    const indexSection = container.createDiv({ cls: 'zeus-status-section' });
+    indexSection.createDiv({ cls: 'zeus-status-section-title', text: 'Indexação' });
+    const manifest = this.plugin.indexer.loadManifest();
+    const fileCount = Object.keys(manifest.files || {}).length;
+    const embCount = this.plugin.searcher.embeddings.size;
+    const lastIdx = manifest.indexedAt ? new Date(manifest.indexedAt).toLocaleString('pt-BR') : 'nunca';
+    this._addStatusRow(indexSection, 'Total docs', String(fileCount));
+    this._addStatusRow(indexSection, 'Embeddings cached', String(embCount));
+    this._addStatusRow(indexSection, 'Model', manifest.model || 'apple-nlcontextual-pt-BR');
+    this._addStatusRow(indexSection, 'Dim', String(manifest.dim || 512));
+    this._addStatusRow(indexSection, 'Última indexação', lastIdx);
+    this._addStatusRow(indexSection, 'Indexando agora', this.plugin.indexer.indexing ? '⚡ SIM' : 'não');
+
+    // Calibration bar — % indexed
+    const calib = container.createDiv({ cls: 'zeus-status-section' });
+    calib.createDiv({ cls: 'zeus-status-section-title', text: 'Cobertura de embeddings' });
+    const pct = fileCount > 0 ? Math.round((embCount / fileCount) * 100) : 0;
+    const barWrap = calib.createDiv({ cls: 'zeus-progress-wrap' });
+    const bar = barWrap.createDiv({ cls: 'zeus-progress-bar' });
+    bar.style.width = pct + '%';
+    bar.setText(pct + '%');
+
+    // === Settings summary ===
+    const settingsSection = container.createDiv({ cls: 'zeus-status-section' });
+    settingsSection.createDiv({ cls: 'zeus-status-section-title', text: 'Modos ativos' });
+    this._addStatusRow(settingsSection, 'HyDE', this.plugin.settings.hydeEnabled ? 'ON' : 'off');
+    this._addStatusRow(settingsSection, 'Multi-vector', this.plugin.settings.multiVectorEnabled ? 'ON' : 'off');
+    this._addStatusRow(settingsSection, 'Native graph', this.plugin.settings.nativeGraphIntegration ? 'ON' : 'off');
+    this._addStatusRow(settingsSection, 'Auto-reindex', this.plugin.settings.indexOnSave ? 'ON' : 'off');
+    this._addStatusRow(settingsSection, 'Image features', this.plugin.settings.avImageFeatures ? 'ON' : 'off');
+
+    // === Actions ===
+    const actions = container.createDiv({ cls: 'zeus-status-actions' });
+    const reindexBtn = actions.createEl('button', { text: '⟳ Reindex', cls: 'mod-cta' });
+    reindexBtn.onclick = async () => {
+      reindexBtn.disabled = true;
+      await this.plugin.indexer.runFullIndex(msg => this.plugin.updateStatusBar('indexing', msg));
+      reindexBtn.disabled = false;
+      this.refresh();
+    };
+
+    const probeBtn = actions.createEl('button', { text: '⚡ Probe daemon' });
+    probeBtn.onclick = async () => this.refresh();
+  }
+
+  _addStatusRow(parent, label, value, status = null) {
+    const row = parent.createDiv({ cls: 'zeus-status-row' });
+    row.createSpan({ cls: 'zeus-status-label', text: label });
+    const valEl = row.createSpan({ cls: 'zeus-status-value', text: String(value) });
+    if (status === 'ok') valEl.addClass('zeus-status-ok');
+    else if (status === 'err') valEl.addClass('zeus-status-err');
+    else if (status === 'warn') valEl.addClass('zeus-status-warn');
+  }
+}
+
+// =========================================================================
 // Settings tab
 // =========================================================================
 
@@ -1646,14 +1756,23 @@ class ZeusPlugin extends Plugin {
       callback: async () => {
         if (!isMac()) { new Notice('Zeus reindex: só Mac'); return; }
         const n = new Notice('Zeus: reindex…', 0);
-        await this.indexer.runFullIndex(m => n.setMessage('Zeus: ' + m));
+        await this.indexer.runFullIndex(m => {
+          n.setMessage('Zeus: ' + m);
+          this.updateStatusBar('indexing', m);
+        });
         n.hide();
+        this.updateStatusBar('idle', null);
       },
     });
     this.addCommand({
       id: 'zeus-toggle-smart-view',
       name: 'Zeus: abrir painel de conexões',
       callback: () => this.activateSmartView(),
+    });
+    this.addCommand({
+      id: 'zeus-open-status',
+      name: 'Zeus: abrir painel de status (calibração)',
+      callback: () => this.activateStatusView(),
     });
     this.addCommand({
       id: 'zeus-ask-vault',
@@ -2065,6 +2184,14 @@ class ZeusPlugin extends Plugin {
     this.addRibbonIcon('sparkles', 'Zeus search', () => new ZeusSearchModal(this.app, this).open());
 
     this.registerView(VIEW_TYPE_SMART, leaf => new ZeusSmartView(leaf, this));
+    this.registerView(VIEW_TYPE_STATUS, leaf => new ZeusStatusView(leaf, this));
+
+    // v0.8 — StatusBar persistente (clicável)
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass('zeus-status-bar');
+    this.statusBarEl.setText('Zeus: …');
+    this.statusBarEl.onclick = () => this.activateStatusView();
+    this.updateStatusBar('idle', null);
 
     if (isMac() && this.settings.indexOnSave) {
       this.registerEvent(this.app.vault.on('modify', file => {
@@ -2085,7 +2212,7 @@ class ZeusPlugin extends Plugin {
     }
     if (isMac() && this.settings.indexOnStartup) {
       this.app.workspace.onLayoutReady(() => {
-        setTimeout(() => this.indexer.runFullIndex(), 3000);
+        setTimeout(() => this.indexer.runFullIndex(msg => this.updateStatusBar('indexing', msg)), 3000);
       });
     }
 
@@ -2094,6 +2221,7 @@ class ZeusPlugin extends Plugin {
 
   async onunload() {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_SMART);
+    this.app.workspace.detachLeavesOfType(VIEW_TYPE_STATUS);
     if (this.afmDaemon) {
       try { await this.afmDaemon.stop(); } catch (e) { console.warn('[zeus] daemon stop:', e.message); }
     }
@@ -2109,7 +2237,10 @@ class ZeusPlugin extends Plugin {
 
   scheduleIncrementalIndex() {
     clearTimeout(this._idxTimer);
-    this._idxTimer = setTimeout(() => this.indexer.runFullIndex(), 5000);
+    this._idxTimer = setTimeout(
+      () => this.indexer.runFullIndex(msg => this.updateStatusBar('indexing', msg)),
+      5000,
+    );
   }
 
   async activateSmartView() {
@@ -2120,6 +2251,33 @@ class ZeusPlugin extends Plugin {
       await leaf.setViewState({ type: VIEW_TYPE_SMART, active: true });
     }
     workspace.revealLeaf(leaf);
+  }
+
+  async activateStatusView() {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(VIEW_TYPE_STATUS)[0];
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false);
+      await leaf.setViewState({ type: VIEW_TYPE_STATUS, active: true });
+    }
+    workspace.revealLeaf(leaf);
+  }
+
+  // v0.8 — persistent calibration UI (Smart Connections-style)
+  updateStatusBar(state, info) {
+    if (!this.statusBarEl) return;
+    const emb = this.searcher ? this.searcher.embeddings.size : 0;
+    let text;
+    if (state === 'indexing') {
+      text = `⚡ Zeus indexando: ${info}`;
+    } else if (state === 'embedding') {
+      text = `🧠 Zeus embedding: ${info}`;
+    } else if (state === 'daemon-down') {
+      text = `⚠️ Zeus daemon offline`;
+    } else {
+      text = `✓ Zeus: ${emb} docs`;
+    }
+    this.statusBarEl.setText(text);
   }
 
   refreshSmartView() {

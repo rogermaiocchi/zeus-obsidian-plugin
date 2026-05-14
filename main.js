@@ -1,5 +1,14 @@
 /*
  * Zeus — Apple Ecosystem-native Search & Connections for Obsidian
+ * v0.7.0 — Full Apple ecosystem coverage via Aegis daemon. Novos endpoints consumidos:
+ *           Translation (macOS 14.4+/iOS 17.4+), NLTagger lemma/sentiment/nameType,
+ *           NLLanguageRecognizer, VNGenerateImageFeaturePrintRequest (768-dim image
+ *           embeddings), VNCalculateImageAestheticsScoresRequest, VNDetectBarcodesRequest,
+ *           VNRecognizeDocumentsRequest (layout-aware), NSDataDetector (URLs/phones/dates),
+ *           CSSearchQuery (Spotlight bridge). Novo módulo `lib/image-similarity.js` — cosine
+ *           similarity sobre feature-prints cacheados em data/image-features.jsonl, permite
+ *           buscar IMAGENS semanticamente parecidas no vault inteiro. Disruptivo: Zeus
+ *           agora indexa e busca o universo visual do vault, não só texto.
  * v0.6.0 — Aegis-pattern HTTP daemon transport (ADR-018): plugin agnóstico de plataforma,
  *           mesmo código TS chama daemon Swift nativo via requestUrl em Mac/iPhone/iPad/MacBook.
  *           v0.5: modular extensions (afm-daemon, hierarchical, multi-vector).
@@ -43,6 +52,7 @@ const AfmDaemon = require('./lib/afm-daemon');             // Fix 1: JSON-RPC pe
 const HierarchicalProcessor = require('./lib/hierarchical'); // Fix 2: NexusSum-pattern long-doc enrich
 const MultiVectorEmbedder = require('./lib/multi-vector');   // Fix 4: 3×512=1536-dim effective coverage
 const ZeusHttpClient = require('./lib/zeus-http-client');    // v0.6: Aegis-pattern daemon HTTP transport (ADR-018)
+const ImageSimilaritySearch = require('./lib/image-similarity'); // v0.7: feature-print vault image similarity
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const DATA_DIR_NAME = 'data';
@@ -92,6 +102,10 @@ const DEFAULT_SETTINGS = {
   // v0.6.0 — Aegis-pattern HTTP daemon (ADR-018)
   zeusDaemonUrl: 'http://127.0.0.1:2223',   // local daemon loopback; cross-device via Tailscale: http://100.65.240.43:2223
   daemonPreferredOverSpawn: true,            // ADR-018 fase E++: HTTP-first em todos hot paths; spawn é fallback no Mac
+  // v0.7.0 — full Apple ecosystem coverage
+  imagesIndexFeaturePrint: false,           // se ON, comandos de indexação de imagens populam data/image-features.jsonl
+  autoLanguageDetectOnSave: false,          // detecta língua na nota ativa ao salvar e adiciona ao frontmatter (`lang:`)
+  spotlightQueryEnabled: false,             // permite Zeus consultar Spotlight nativo macOS via CSSearchQuery
 };
 
 // =========================================================================
@@ -1426,6 +1440,23 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Limite de loops de auto-crítica para padrão reflexion.')
       .addSlider(s => s.setLimits(1, 10, 1).setValue(this.plugin.settings.agentMaxIterations).setDynamicTooltip().onChange(async v => { this.plugin.settings.agentMaxIterations = v; await this.plugin.saveSettings(); }));
 
+    containerEl.createEl('h3', { text: 'v0.7 — full Apple ecosystem coverage' });
+
+    new Setting(containerEl)
+      .setName('Index image feature-prints (VNGenerateImageFeaturePrint)')
+      .setDesc('Quando ON, comandos de indexação populam data/image-features.jsonl com vetor 768-dim por imagem. Habilita o comando "encontrar imagens similares à atual". Requer daemon Zeus rodando (Mac).')
+      .addToggle(t => t.setValue(this.plugin.settings.imagesIndexFeaturePrint).onChange(async v => { this.plugin.settings.imagesIndexFeaturePrint = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Auto language-detect on save')
+      .setDesc('Detecta língua dominante (NLLanguageRecognizer) ao salvar e adiciona `lang:` ao frontmatter caso ausente. EXPERIMENTAL — pode modificar notas.')
+      .addToggle(t => t.setValue(this.plugin.settings.autoLanguageDetectOnSave).onChange(async v => { this.plugin.settings.autoLanguageDetectOnSave = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Spotlight query enabled (CSSearchQuery bridge)')
+      .setDesc('Permite o comando "Zeus: buscar via Spotlight nativo" consultar o índice macOS via CSSearchQuery exposto pelo daemon. Funciona apenas no Mac.')
+      .addToggle(t => t.setValue(this.plugin.settings.spotlightQueryEnabled).onChange(async v => { this.plugin.settings.spotlightQueryEnabled = v; await this.plugin.saveSettings(); }));
+
     containerEl.createEl('h3', { text: 'Ações' });
     new Setting(containerEl)
       .setName('Reindex completo')
@@ -1477,6 +1508,8 @@ class ZeusPlugin extends Plugin {
     this.multiVector = new MultiVectorEmbedder(this.afmBin, pluginDataPath);
     // v0.6.0 — ADR-018 Aegis-pattern HTTP daemon client (works on ALL devices: Mac+iOS uniform)
     this.httpClient = new ZeusHttpClient(this.settings.zeusDaemonUrl);
+    // v0.7.0 — image similarity search via feature-print cache
+    this.imageSimilarity = new ImageSimilaritySearch(this);
 
     // v0.6.1 — Adaptive daemon discovery (async, doesn't block onload)
     this.app.workspace.onLayoutReady(async () => {
@@ -1617,6 +1650,279 @@ class ZeusPlugin extends Plugin {
       },
     });
 
+    // =====================================================================
+    // v0.7.0 — full Apple ecosystem coverage commands
+    // =====================================================================
+
+    this.addCommand({
+      id: 'zeus-translate-selection',
+      name: 'Zeus: traduzir seleção (Apple Translation pt→en)',
+      editorCallback: async (editor) => {
+        const sel = editor.getSelection() || editor.getValue();
+        if (!sel || !sel.trim()) { new Notice('Sem texto selecionado'); return; }
+        const n = new Notice('Traduzindo via Apple Translation…', 0);
+        try {
+          const r = await this.httpClient.translate(sel, 'pt', 'en');
+          n.hide();
+          const out = (r && (r.translated || r.output || r.translation)) || JSON.stringify(r);
+          try { await navigator.clipboard.writeText(out); } catch {}
+          new Notice('Tradução copiada para clipboard');
+          console.log('[zeus] translate:', out);
+        } catch (e) {
+          n.hide();
+          new Notice('Translate falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-nl-sentiment',
+      name: 'Zeus: análise de sentimento (NLTagger)',
+      editorCallback: async (editor) => {
+        const sel = editor.getSelection() || editor.getValue();
+        if (!sel || !sel.trim()) { new Notice('Sem texto'); return; }
+        const n = new Notice('Computando sentimento…', 0);
+        try {
+          const r = await this.httpClient.nlSentiment(sel);
+          n.hide();
+          const score = (r && (r.sentiment ?? r.score)) ?? 'n/a';
+          new Notice(`Sentimento: ${typeof score === 'number' ? score.toFixed(3) : score}`);
+          console.log('[zeus] sentiment:', r);
+        } catch (e) {
+          n.hide();
+          new Notice('Sentiment falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-nl-language-detect',
+      name: 'Zeus: detectar língua da nota (NLLanguageRecognizer)',
+      callback: async () => {
+        const f = this.app.workspace.getActiveFile();
+        if (!f) { new Notice('Sem nota ativa'); return; }
+        const n = new Notice('Detectando língua…', 0);
+        try {
+          const content = await this.app.vault.read(f);
+          const sample = content.replace(/^---\n[\s\S]*?\n---\n/, '').slice(0, 4000);
+          const r = await this.httpClient.nlLanguageDetect(sample, 3);
+          n.hide();
+          const dominant = (r && (r.dominant || r.language)) || '?';
+          const hyps = (r && (r.hypotheses || r.candidates)) || [];
+          const detail = hyps.length
+            ? hyps.map(h => `${h.language || h.code}=${typeof h.confidence === 'number' ? h.confidence.toFixed(2) : h.confidence}`).join(', ')
+            : '';
+          new Notice(`Língua: ${dominant}${detail ? ' (' + detail + ')' : ''}`);
+          console.log('[zeus] language-detect:', r);
+        } catch (e) {
+          n.hide();
+          new Notice('Language-detect falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-nl-lemma',
+      name: 'Zeus: lematizar nota (NLTagger lemma scheme)',
+      callback: async () => {
+        const f = this.app.workspace.getActiveFile();
+        if (!f) { new Notice('Sem nota ativa'); return; }
+        const n = new Notice('Lematizando…', 0);
+        try {
+          const content = await this.app.vault.read(f);
+          const sample = content.replace(/^---\n[\s\S]*?\n---\n/, '').slice(0, 8000);
+          const r = await this.httpClient.nlTag(sample, 'lemma');
+          n.hide();
+          const tags = (r && (r.tags || r.tokens)) || [];
+          const preview = Array.isArray(tags) ? tags.slice(0, 20).map(t => (t.lemma || t.tag || t.token)).join(' ') : JSON.stringify(r).slice(0, 200);
+          try { await navigator.clipboard.writeText(JSON.stringify(r, null, 2)); } catch {}
+          new Notice(`Lemma: ${tags.length || '?'} tokens (preview no console; JSON no clipboard)`);
+          console.log('[zeus] lemma preview:', preview, 'full:', r);
+        } catch (e) {
+          n.hide();
+          new Notice('Lemma falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-data-detect',
+      name: 'Zeus: detectar entidades (URLs/telefones/datas via NSDataDetector)',
+      editorCallback: async (editor) => {
+        const sel = editor.getSelection() || editor.getValue();
+        if (!sel || !sel.trim()) { new Notice('Sem texto'); return; }
+        const n = new Notice('NSDataDetector…', 0);
+        try {
+          const r = await this.httpClient.dataDetect(sel);
+          n.hide();
+          const matches = (r && (r.matches || r.entities)) || [];
+          const counts = {};
+          for (const m of matches) { counts[m.type || 'unknown'] = (counts[m.type || 'unknown'] || 0) + 1; }
+          const summary = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' · ');
+          try { await navigator.clipboard.writeText(JSON.stringify(matches, null, 2)); } catch {}
+          new Notice(`Detectados: ${matches.length} (${summary || 'nenhum'}) — JSON no clipboard`);
+          console.log('[zeus] data-detect:', r);
+        } catch (e) {
+          n.hide();
+          new Notice('Data-detect falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-vision-document-scan',
+      name: 'Zeus: scan de documento (VNRecognizeDocumentsRequest, layout-aware)',
+      callback: async () => {
+        const f = this.app.workspace.getActiveFile();
+        let imagePath = null;
+        if (f && /\.(png|jpe?g|heic|pdf|tiff|gif|webp|bmp)$/i.test(f.path)) {
+          imagePath = path.join(this.vaultRoot, f.path);
+        } else {
+          const input = await this._zeusPromptText('Caminho absoluto da imagem/PDF para scan estruturado:');
+          if (!input) return;
+          imagePath = input;
+        }
+        const n = new Notice('Vision document scan…', 0);
+        try {
+          const r = await this.httpClient.visionDocument(imagePath);
+          n.hide();
+          const text = (r && (r.text || r.markdown || r.content)) || '';
+          const blocks = (r && (r.blocks || r.regions)) || [];
+          try { await navigator.clipboard.writeText(text || JSON.stringify(r, null, 2)); } catch {}
+          new Notice(`Document scan: ${blocks.length || 0} blocos · ${text.length} chars no clipboard`);
+          console.log('[zeus] vision-document:', r);
+        } catch (e) {
+          n.hide();
+          new Notice('Document scan falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-vision-aesthetics',
+      name: 'Zeus: aesthetics score da imagem atual (VNCalculateImageAestheticsScores)',
+      callback: async () => {
+        const f = this.app.workspace.getActiveFile();
+        let imagePath = null;
+        if (f && /\.(png|jpe?g|heic|tiff|gif|webp|bmp)$/i.test(f.path)) {
+          imagePath = path.join(this.vaultRoot, f.path);
+        } else {
+          const input = await this._zeusPromptText('Caminho absoluto da imagem para avaliar:');
+          if (!input) return;
+          imagePath = input;
+        }
+        const n = new Notice('Aesthetics scoring…', 0);
+        try {
+          const r = await this.httpClient.visionAesthetics(imagePath);
+          n.hide();
+          const overall = (r && (r.overall_score ?? r.score ?? r.aesthetics)) ?? '?';
+          const utility = (r && (r.is_utility ?? r.utility)) ?? '?';
+          new Notice(`Aesthetics: ${typeof overall === 'number' ? overall.toFixed(3) : overall} · utility: ${utility}`);
+          console.log('[zeus] aesthetics:', r);
+        } catch (e) {
+          n.hide();
+          new Notice('Aesthetics falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-spotlight-search',
+      name: 'Zeus: buscar via Spotlight nativo (CSSearchQuery)',
+      callback: async () => {
+        if (!this.settings.spotlightQueryEnabled) {
+          new Notice('Spotlight query desabilitado — habilite em Settings → Zeus');
+          return;
+        }
+        const query = await this._zeusPromptText('Query Spotlight:');
+        if (!query || !query.trim()) return;
+        const n = new Notice('Spotlight searching…', 0);
+        try {
+          const r = await this.httpClient.spotlightSearch(query, null, 50);
+          n.hide();
+          const results = (r && (r.results || r.matches || r.hits)) || [];
+          try { await navigator.clipboard.writeText(JSON.stringify(results, null, 2)); } catch {}
+          new Notice(`Spotlight: ${results.length} hits (JSON no clipboard)`);
+          console.log('[zeus] spotlight:', r);
+        } catch (e) {
+          n.hide();
+          new Notice('Spotlight falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-image-similarity-index',
+      name: 'Zeus: indexar imagens do vault (feature-print 768-dim)',
+      callback: async () => {
+        if (!isMac()) { new Notice('Image-similarity index: só Mac'); return; }
+        const n = new Notice('Zeus: feature-print indexer arrancando…', 0);
+        try {
+          this.imageSimilarity.loadCache();
+          const stats = await this.imageSimilarity.indexAllImages(p => {
+            n.setMessage(`Zeus img-sim: ${p.processed}/${p.total} (idx ${p.indexed}, skip ${p.skipped}, fail ${p.failed})`);
+          });
+          n.hide();
+          new Notice(`Zeus img-sim: ${stats.indexed} novas · ${stats.skipped} cache · ${stats.failed} falhas / ${stats.total} imagens`);
+          console.log('[zeus] image-similarity index stats:', stats);
+        } catch (e) {
+          n.hide();
+          new Notice('Image-index falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-image-similarity-find',
+      name: 'Zeus: encontrar imagens similares à atual (cosine sobre feature-print)',
+      callback: async () => {
+        if (!isMac()) { new Notice('Image-similarity: só Mac'); return; }
+        const f = this.app.workspace.getActiveFile();
+        let imagePath = null;
+        if (f && /\.(png|jpe?g|heic|tiff|gif|webp|bmp)$/i.test(f.path)) {
+          imagePath = path.join(this.vaultRoot, f.path);
+        } else {
+          // try to find an embedded image reference in active note
+          if (f) {
+            try {
+              const content = await this.app.vault.read(f);
+              const m = content.match(/!\[\[([^\]|]+\.(?:png|jpe?g|heic|tiff|gif|webp|bmp))(?:\|[^\]]*)?\]\]/i)
+                || content.match(/!\[[^\]]*\]\(([^)]+\.(?:png|jpe?g|heic|tiff|gif|webp|bmp))\)/i);
+              if (m) {
+                const ref = m[1];
+                // try to resolve via metadataCache
+                const tfile = this.app.metadataCache.getFirstLinkpathDest(ref, f.path);
+                if (tfile) imagePath = path.join(this.vaultRoot, tfile.path);
+                else if (fs.existsSync(path.join(this.vaultRoot, ref))) imagePath = path.join(this.vaultRoot, ref);
+              }
+            } catch {}
+          }
+          if (!imagePath) {
+            const input = await this._zeusPromptText('Caminho absoluto da imagem alvo:');
+            if (!input) return;
+            imagePath = input;
+          }
+        }
+        const n = new Notice('Procurando similares…', 0);
+        try {
+          this.imageSimilarity.loadCache();
+          const matches = await this.imageSimilarity.findSimilar(imagePath, 10);
+          n.hide();
+          if (matches.length === 0) {
+            new Notice('Nenhuma imagem similar encontrada (cache vazio?)');
+            return;
+          }
+          const lines = matches.map(m => `${(m.similarity * 100).toFixed(1)}% — ${m.rel}`);
+          try { await navigator.clipboard.writeText(lines.join('\n')); } catch {}
+          new Notice(`Top ${matches.length}:\n${lines.slice(0, 5).join('\n')}\n(lista completa no clipboard)`);
+          console.log('[zeus] image-similarity matches:', matches);
+        } catch (e) {
+          n.hide();
+          new Notice('Image-similarity falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
     this.addRibbonIcon('sparkles', 'Zeus search', () => new ZeusSearchModal(this.app, this).open());
 
     this.registerView(VIEW_TYPE_SMART, leaf => new ZeusSmartView(leaf, this));
@@ -1669,6 +1975,40 @@ class ZeusPlugin extends Plugin {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_SMART)) {
       if (leaf.view && typeof leaf.view.refresh === 'function') leaf.view.refresh();
     }
+  }
+
+  // v0.7.0 — small modal-prompt helper used by v0.7 commands
+  _zeusPromptText(promptText) {
+    return new Promise((resolve) => {
+      const { Modal } = obsidian;
+      const modal = new Modal(this.app);
+      modal.titleEl.setText('Zeus');
+      const p = modal.contentEl.createEl('p', { text: promptText });
+      p.style.marginBottom = '8px';
+      const input = modal.contentEl.createEl('input', { type: 'text' });
+      input.style.width = '100%';
+      input.style.padding = '6px 8px';
+      input.style.boxSizing = 'border-box';
+      const btnRow = modal.contentEl.createDiv();
+      btnRow.style.marginTop = '12px';
+      btnRow.style.display = 'flex';
+      btnRow.style.gap = '8px';
+      btnRow.style.justifyContent = 'flex-end';
+      const okBtn = btnRow.createEl('button', { text: 'OK' });
+      okBtn.classList.add('mod-cta');
+      const cancelBtn = btnRow.createEl('button', { text: 'Cancel' });
+      let done = false;
+      const finish = (v) => { if (done) return; done = true; resolve(v); modal.close(); };
+      okBtn.onclick = () => finish(input.value);
+      cancelBtn.onclick = () => finish(null);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') finish(input.value);
+        else if (e.key === 'Escape') finish(null);
+      });
+      modal.onClose = () => { if (!done) resolve(null); };
+      modal.open();
+      setTimeout(() => input.focus(), 50);
+    });
   }
 }
 

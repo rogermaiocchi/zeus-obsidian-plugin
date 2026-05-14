@@ -43,9 +43,20 @@
 
 const obsidian = require('obsidian');
 const { Plugin, PluginSettingTab, Setting, SuggestModal, ItemView, Notice, TFile } = obsidian;
-const { spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs');
+
+// v0.11 — universal Mac+iOS: Node modules wrapped in try/catch so plugin loads
+// in Capacitor sandbox (iPad/iPhone). Use `universal.X` for cross-platform ops;
+// fall through to `spawn/path/fs` only when guarded by `if (universal.IS_NODE)`.
+const universal = require('./lib/universal-fs');
+
+// v0.11 — Backward compat: legacy code in main.js references `path`/`fs` directly.
+// On iOS these are null (not undefined → não dispara ReferenceError quando avaliado
+// em expressões como `if (path && ...)`).  Code DEVE checar truthy antes de usar.
+const path = universal.nodePath;
+const fs = universal.nodeFs;
+const spawn = universal.nodeChildProcess ? universal.nodeChildProcess.spawn : null;
+const path = universal.nodePath;
+const fs = universal.nodeFs;
 
 // v0.5.0 — modular extensions (parallel-built by subagents)
 const AfmDaemon = require('./lib/afm-daemon');             // Fix 1: JSON-RPC persistent daemon
@@ -127,8 +138,15 @@ const DEFAULT_SETTINGS = {
 // Utilities
 // =========================================================================
 
+// Sync sha256 using Node crypto when available; rolling-hash fallback on iOS
+// (iOS plugin only uses sha256 for content-change keys, not crypto-strong proofs).
 function sha256(text) {
-  return require('crypto').createHash('sha256').update(text).digest('hex');
+  if (universal.nodeCrypto && typeof universal.nodeCrypto.createHash === 'function') {
+    return universal.nodeCrypto.createHash('sha256').update(text).digest('hex');
+  }
+  let h = 0;
+  for (let i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16).padStart(8, '0');
 }
 
 function cosine(a, b) {
@@ -147,6 +165,10 @@ function normalizeForMatch(s) {
 
 function execMetafm(binPath, args, stdinText, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
+    if (!spawn) {
+      reject(new Error('execMetafm: child_process unavailable on this platform (iOS sandbox)'));
+      return;
+    }
     const child = spawn(binPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('metafm timeout')); }, timeoutMs);
@@ -168,7 +190,8 @@ function execMetafm(binPath, args, stdinText, timeoutMs = 60000) {
 }
 
 function isMac() {
-  return process.platform === 'darwin';
+  // process.platform doesn't exist on iOS (Capacitor) — fallback to UA detection.
+  return universal.isMacLike();
 }
 
 // =========================================================================
@@ -199,16 +222,22 @@ async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs, spawnArgs, std
 }
 
 // Resolve afm binary path: explicit setting > bundled bin/ > global ~/.local/bin/metafm > $PATH metafm
+// On iOS (no fs/path), returns the default 'metafm' string — caller should never invoke
+// it on iOS anyway (tryDaemonOrSpawn throws when no daemon is reachable).
 function resolveAfmBinary(plugin) {
+  if (!fs || !path) return 'metafm';
   // 1. Explicit user setting
   if (plugin.settings.afmPath && fs.existsSync(plugin.settings.afmPath)) {
     return plugin.settings.afmPath;
   }
   // 2. Bundled in plugin dir: bin/afm
-  const pluginDir = path.join(plugin.vaultRoot, plugin.manifest.dir);
-  for (const name of AFM_BIN_NAMES) {
-    const candidate = path.join(pluginDir, 'bin', name);
-    if (fs.existsSync(candidate)) return candidate;
+  const vaultRoot = plugin.vaultRoot;
+  if (vaultRoot) {
+    const pluginDir = path.join(vaultRoot, plugin.manifest.dir);
+    for (const name of AFM_BIN_NAMES) {
+      const candidate = path.join(pluginDir, 'bin', name);
+      if (fs.existsSync(candidate)) return candidate;
+    }
   }
   // 3. Global fallback (Mac dev machines)
   try {
@@ -246,9 +275,11 @@ async function discoverDaemonUrl(plugin, candidates = null) {
   return plugin.settings.zeusDaemonUrl;
 }
 
-// Read Apple CoreSpotlight metadata via `mdls` — extract EXIF, GPS, dates, kind
+// Read Apple CoreSpotlight metadata via `mdls` — extract EXIF, GPS, dates, kind.
+// Mac-only — returns empty features on iOS (no child_process).
 async function acsMetadata(absPath) {
   return new Promise((resolve) => {
+    if (!spawn) { resolve({}); return; }
     const child = spawn('/usr/bin/mdls', ['-plist', '-', absPath], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', d => out += d.toString());
@@ -420,18 +451,58 @@ class ZeusIndexer {
     this.indexing = false;
   }
 
+  // v0.11 — dataPath now also exposed as vault-relative for vault.adapter consumers
   get dataPath() {
+    // Absolute path (Mac only). On iOS this returns null-prefixed garbage if vaultRoot
+    // is undefined; callers on iOS must use dataPathRel instead.
+    if (!path || !this.plugin.vaultRoot) return this.dataPathRel;
     return path.join(this.plugin.vaultRoot, this.plugin.manifest.dir, DATA_DIR_NAME);
   }
 
+  // Vault-relative — works on Mac AND iOS via vault.adapter.
+  get dataPathRel() {
+    return universal.joinPath(this.plugin.manifest.dir, DATA_DIR_NAME);
+  }
+
+  // Note: kept sync for API compat. Mac uses fs.readFileSync; iOS falls back to
+  // a cached value loaded asynchronously during onload (this.plugin._manifestCache).
+  // If cache is empty on iOS, returns default empty manifest (UI degrades gracefully).
   loadManifest() {
+    if (!fs || !path) {
+      return this.plugin._manifestCache || { version: 2, model: 'apple-nlcontextual', dim: 512, files: {} };
+    }
     const p = path.join(this.dataPath, MANIFEST_FILE);
     if (!fs.existsSync(p)) return { version: 2, model: 'apple-nlcontextual', dim: 512, files: {} };
     try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
     catch { return { version: 2, model: 'apple-nlcontextual', dim: 512, files: {} }; }
   }
 
+  // Async loader used during onload to populate the in-memory cache for iOS.
+  async loadManifestAsync() {
+    try {
+      const rel = universal.joinPath(this.dataPathRel, MANIFEST_FILE);
+      const adapter = this.plugin.app.vault.adapter;
+      if (!(await universal.adapterExists(adapter, rel))) {
+        return { version: 2, model: 'apple-nlcontextual', dim: 512, files: {} };
+      }
+      const raw = await universal.adapterRead(adapter, rel);
+      return JSON.parse(raw);
+    } catch {
+      return { version: 2, model: 'apple-nlcontextual', dim: 512, files: {} };
+    }
+  }
+
   saveManifest(m) {
+    if (!fs || !path) {
+      // iOS — write via vault.adapter, fire-and-forget. Settings tab + scheduler
+      // are the callers; they don't await save manifest.
+      const adapter = this.plugin.app.vault.adapter;
+      universal.adapterMkdir(adapter, this.dataPathRel)
+        .then(() => universal.adapterWriteAtomic(adapter, universal.joinPath(this.dataPathRel, MANIFEST_FILE), JSON.stringify(m, null, 2)))
+        .catch(e => console.warn('[zeus] saveManifest (iOS) failed:', e.message));
+      this.plugin._manifestCache = m;
+      return;
+    }
     fs.mkdirSync(this.dataPath, { recursive: true });
     fs.writeFileSync(path.join(this.dataPath, MANIFEST_FILE), JSON.stringify(m, null, 2));
   }
@@ -505,26 +576,59 @@ class ZeusIndexer {
     }
   }
 
+  // v0.11 — universal enumerator. Returns array of { abs, rel, ext } where:
+  //   - rel is always vault-relative (forward-slash, works on iOS and Mac)
+  //   - abs is absolute path on Mac, equals rel on iOS (since no fs absolute path).
+  // Caller MUST use rel + vault.adapter for cross-platform code paths.
+  // On Mac with fs available, walks via fs.readdirSync (faster than adapter).
+  // On iOS, falls back to async adapter walk (caller must await).
   enumerateFiles() {
-    const files = [];
     const exclusions = new Set(this.plugin.settings.folderExclusions);
     const exts = this.plugin.settings.fileTypes;
-    const walk = (dir) => {
-      let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        if (exclusions.has(e.name)) continue;
-        if (e.name === '.DS_Store') continue;
-        const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full);
-        else if (e.isFile()) {
-          const ext = e.name.split('.').pop().toLowerCase();
-          if (exts[ext]) files.push({ abs: full, rel: path.relative(this.plugin.vaultRoot, full), ext });
+
+    if (fs && path && this.plugin.vaultRoot) {
+      const files = [];
+      const walk = (dir) => {
+        let entries;
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const e of entries) {
+          if (exclusions.has(e.name)) continue;
+          if (e.name === '.DS_Store') continue;
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) walk(full);
+          else if (e.isFile()) {
+            const ext = e.name.split('.').pop().toLowerCase();
+            if (exts[ext]) {
+              const rel = path.relative(this.plugin.vaultRoot, full).split(path.sep).join('/');
+              files.push({ abs: full, rel, ext });
+            }
+          }
         }
+      };
+      walk(this.plugin.vaultRoot);
+      return files;
+    }
+
+    // iOS path: use Obsidian's getFiles() — already enumerates the whole vault.
+    // Filter by ext + folder exclusions. abs == rel since there's no Node fs.
+    const out = [];
+    const allFiles = this.plugin.app.vault.getFiles ? this.plugin.app.vault.getFiles() : [];
+    for (const f of allFiles) {
+      const rel = f.path;
+      // skip if any path segment is in exclusions or starts with '.'
+      const segs = rel.split('/');
+      let skip = false;
+      for (let i = 0; i < segs.length - 1; i++) {
+        const s = segs[i];
+        if (!s) continue;
+        if (exclusions.has(s) || s.startsWith('.')) { skip = true; break; }
       }
-    };
-    walk(this.plugin.vaultRoot);
-    return files;
+      if (skip) continue;
+      const ext = (f.extension || (rel.split('.').pop() || '')).toLowerCase();
+      if (!exts[ext]) continue;
+      out.push({ abs: rel, rel, ext });
+    }
+    return out;
   }
 
   parseEmbedOutput(jsonStr) {
@@ -648,9 +752,15 @@ class ZeusIndexer {
     }
   }
 
+  // Sync API kept for compat. Mac uses fs; iOS returns the cached map
+  // populated by loadEmbeddingsAsync() during onload.
   loadEmbeddings() {
-    const p = path.join(this.dataPath, EMBEDDINGS_FILE);
     const map = new Map();
+    if (!fs || !path) {
+      const cached = this.plugin._embeddingsCache;
+      return cached instanceof Map ? cached : map;
+    }
+    const p = path.join(this.dataPath, EMBEDDINGS_FILE);
     if (!fs.existsSync(p)) return map;
     const content = fs.readFileSync(p, 'utf8');
     for (const line of content.split('\n')) {
@@ -660,7 +770,35 @@ class ZeusIndexer {
     return map;
   }
 
+  async loadEmbeddingsAsync() {
+    const map = new Map();
+    try {
+      const rel = universal.joinPath(this.dataPathRel, EMBEDDINGS_FILE);
+      const adapter = this.plugin.app.vault.adapter;
+      if (!(await universal.adapterExists(adapter, rel))) return map;
+      const content = await universal.adapterRead(adapter, rel);
+      for (const line of content.split('\n')) {
+        if (!line.trim()) continue;
+        try { const obj = JSON.parse(line); map.set(obj.path, obj); } catch {}
+      }
+    } catch (e) {
+      console.warn('[zeus] loadEmbeddingsAsync failed:', e.message);
+    }
+    return map;
+  }
+
   saveEmbeddings(map) {
+    if (!fs || !path) {
+      // iOS — fire-and-forget write via adapter; also update cache.
+      const adapter = this.plugin.app.vault.adapter;
+      const lines = [];
+      for (const v of map.values()) lines.push(JSON.stringify(v));
+      universal.adapterMkdir(adapter, this.dataPathRel)
+        .then(() => universal.adapterWriteAtomic(adapter, universal.joinPath(this.dataPathRel, EMBEDDINGS_FILE), lines.join('\n')))
+        .catch(e => console.warn('[zeus] saveEmbeddings (iOS) failed:', e.message));
+      this.plugin._embeddingsCache = map;
+      return;
+    }
     fs.mkdirSync(this.dataPath, { recursive: true });
     const lines = [];
     for (const v of map.values()) lines.push(JSON.stringify(v));
@@ -682,9 +820,14 @@ class ZeusSearcher {
     this.embeddings = this.plugin.indexer.loadEmbeddings();
   }
 
-  // Lê conteúdo bruto do arquivo para o exact-match boost — só quando necessário
+  // Lê conteúdo bruto do arquivo para o exact-match boost — só quando necessário.
+  // Mac path: synchronous fs.readFileSync (fast, used in tight scoring loops).
+  // iOS path: fs is null — caller has cache; readDoc returns '' (only impacts
+  // the very rare "no qVec available" fallback, which can't happen on iOS since
+  // daemon embed must succeed for search to work).
   readDoc(filePath) {
     try {
+      if (!fs || !path) return '';
       const abs = path.join(this.plugin.vaultRoot, filePath);
       const content = fs.readFileSync(abs, 'utf8').replace(/^---\n[\s\S]*?\n---\n/, '');
       return content;
@@ -845,11 +988,10 @@ class ZeusGraphExtractor {
   }
 
   async extract(filePath) {
-    // HTTP-first: daemon graphExtract() works on iOS too.
-    // Only require Mac if BOTH daemon unreachable AND we'd need spawn.
+    // HTTP-first: daemon graphExtract() works on iOS too. v0.11 uses vault.adapter
+    // for reading (platform-agnostic) — no Node fs dependency.
     try {
-      // File read requires fs access; on iOS Obsidian gives us vault.adapter, but we keep fs path here.
-      const content = fs.readFileSync(path.join(this.plugin.vaultRoot, filePath), 'utf8');
+      const content = await this.plugin.app.vault.adapter.read(filePath);
       const stripped = content.replace(/^---\n[\s\S]*?\n---\n/, '').slice(0, 6000);
       const r = await tryDaemonOrSpawn(
         this.plugin,
@@ -1049,20 +1191,34 @@ class ZeusEnricher {
     this.inFlight = new Map();   // path → Promise
   }
 
+  // Vault-relative cache dir (no absolute path — works on iOS via vault.adapter).
   get cacheDir() {
-    return path.join(this.plugin.indexer.dataPath, ENRICH_CACHE_DIR);
+    return universal.joinPath(this.plugin.manifest.dir, DATA_DIR_NAME, ENRICH_CACHE_DIR);
   }
 
   cachePath(filePath, sha) {
-    return path.join(this.cacheDir, sha + '.json');
+    return universal.joinPath(this.cacheDir, sha + '.json');
   }
 
-  loadFromCache(filePath, sha) {
+  // Async — uses Obsidian vault.adapter (cross-platform).
+  async loadFromCache(filePath, sha) {
     try {
       const p = this.cachePath(filePath, sha);
-      if (!fs.existsSync(p)) return null;
-      return JSON.parse(fs.readFileSync(p, 'utf8'));
+      const adapter = this.plugin.app.vault.adapter;
+      if (!(await universal.adapterExists(adapter, p))) return null;
+      return JSON.parse(await universal.adapterRead(adapter, p));
     } catch { return null; }
+  }
+
+  // Async helper — write cache via vault.adapter (atomic when supported).
+  async _writeCache(filePath, sha, data) {
+    try {
+      const adapter = this.plugin.app.vault.adapter;
+      await universal.adapterMkdir(adapter, this.cacheDir);
+      await universal.adapterWriteAtomic(adapter, this.cachePath(filePath, sha), JSON.stringify(data, null, 2));
+    } catch (e) {
+      console.warn('[zeus] enrich cache write failed', e.message);
+    }
   }
 
   // Size limit: FoundationModels janela é 4096 tokens (~10K chars com safety margin).
@@ -1076,18 +1232,24 @@ class ZeusEnricher {
     const emb = this.plugin.searcher.embeddings.get(filePath);
     if (!emb) return null;
     const sha = emb.sha;
-    const cached = this.loadFromCache(filePath, sha);
+    const cached = await this.loadFromCache(filePath, sha);
     if (cached) return cached;
 
-    // Pre-flight size check — for large docs delegate to HierarchicalProcessor (NexusSum pattern)
+    // Pre-flight size check via vault.adapter (works on Mac AND iOS).
     let fileSize = 0;
-    try { fileSize = fs.statSync(path.join(this.plugin.vaultRoot, filePath)).size; } catch {}
+    try {
+      const stat = await universal.adapterStat(this.plugin.app.vault.adapter, filePath);
+      if (stat && typeof stat.size === 'number') fileSize = stat.size;
+    } catch {}
     if (fileSize > this.plugin.settings.hierarchicalThreshold) {
       console.log(`[zeus] doc ${filePath} is ${fileSize}B > ${this.plugin.settings.hierarchicalThreshold} — delegating to HierarchicalProcessor`);
       try {
+        // Hierarchical processor needs absolute fs paths (afm CLI) — Mac only.
+        if (!isMac() || !fs) {
+          throw new Error('Hierarchical processor requires Mac (afm CLI). On iOS the document exceeds the FM window — skip or split manually.');
+        }
         const result = await this.plugin.hierarchical.processLargeDoc(filePath, this.plugin.vaultRoot);
-        fs.mkdirSync(this.cacheDir, { recursive: true });
-        fs.writeFileSync(this.cachePath(filePath, sha), JSON.stringify(result, null, 2));
+        await this._writeCache(filePath, sha, result);
         return result;
       } catch (e) {
         console.warn('[zeus] hierarchical processing failed', e.message);
@@ -1096,8 +1258,7 @@ class ZeusEnricher {
           skipped: true,
           reason: `Hierarchical processor falhou: ${e.message.slice(0, 200)}. Fallback: divida a nota manualmente.`,
         };
-        fs.mkdirSync(this.cacheDir, { recursive: true });
-        fs.writeFileSync(this.cachePath(filePath, sha), JSON.stringify(result, null, 2));
+        await this._writeCache(filePath, sha, result);
         return result;
       }
     }
@@ -1108,10 +1269,10 @@ class ZeusEnricher {
     const promise = (async () => {
       try {
         const absVault = this.plugin.vaultRoot;
-        // Read note content for daemon path (daemon takes note_content directly, no temp file)
+        // Read note content for daemon path — vault.adapter works on Mac and iOS.
         let noteContent = '';
         try {
-          noteContent = fs.readFileSync(path.join(absVault, filePath), 'utf8');
+          noteContent = await universal.adapterRead(this.plugin.app.vault.adapter, filePath);
         } catch (readErr) {
           console.warn('[zeus] enrich read failed', filePath, readErr.message);
         }
@@ -1132,8 +1293,7 @@ class ZeusEnricher {
             return null;
           }
         }
-        fs.mkdirSync(this.cacheDir, { recursive: true });
-        fs.writeFileSync(this.cachePath(filePath, sha), JSON.stringify(parsed, null, 2));
+        await this._writeCache(filePath, sha, parsed);
         return parsed;
       } catch (e) {
         console.warn('[zeus] enrich failed', filePath, e.message);
@@ -1142,10 +1302,7 @@ class ZeusEnricher {
           ? 'FoundationModels janela 4096 tokens insuficiente para esta nota + vault context. Tente sub-folder menor ou nota mais curta.'
           : 'metafm enrich falhou: ' + e.message.slice(0, 200);
         const result = { suggested_links: [], suggested_tags: [], connections: [], skipped: true, reason: failReason };
-        try {
-          fs.mkdirSync(this.cacheDir, { recursive: true });
-          fs.writeFileSync(this.cachePath(filePath, sha), JSON.stringify(result, null, 2));
-        } catch {}
+        await this._writeCache(filePath, sha, result);
         return result;
       } finally {
         this.inFlight.delete(filePath);
@@ -1793,9 +1950,9 @@ class ZeusSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Coordination stats')
       .setDesc('Snapshot dos claims ativos no momento.')
-      .addButton(b => b.setButtonText('Stats').onClick(() => {
-        const s = this.plugin.scheduler ? this.plugin.scheduler.stats() : null;
-        if (!s) { new Notice('Zeus: scheduler indisponível'); return; }
+      .addButton(b => b.setButtonText('Stats').onClick(async () => {
+        if (!this.plugin.scheduler) { new Notice('Zeus: scheduler indisponível'); return; }
+        const s = await this.plugin.scheduler.stats();
         const c = s.coordinator || {};
         new Notice(
           `Zeus coord: ${c.total || 0} claims (${c.expired || 0} expired)\n` +
@@ -1836,9 +1993,14 @@ class ZeusSettingTab extends PluginSettingTab {
 class ZeusPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    this.vaultRoot = this.app.vault.adapter.basePath;
+    // vaultRoot is absolute path on Mac (Electron). On iOS Capacitor the adapter
+    // exposes only relative paths — vaultRoot is undefined, callers must use
+    // vault.adapter.* with vault-relative paths.
+    this.vaultRoot = this.app.vault.adapter && this.app.vault.adapter.basePath ? this.app.vault.adapter.basePath : null;
+    this._manifestCache = null;
+    this._embeddingsCache = null;
     this.afmBin = resolveAfmBinary(this);
-    console.log('[zeus] afm binary resolved:', this.afmBin);
+    console.log('[zeus] platform:', universal.detectPlatform(), '| afm binary:', this.afmBin, '| vaultRoot:', this.vaultRoot || '(adapter-only)');
     this.indexer = new ZeusIndexer(this);
     this.searcher = new ZeusSearcher(this);
     this.enricher = new ZeusEnricher(this);
@@ -1849,10 +2011,18 @@ class ZeusPlugin extends Plugin {
     this.nativeGraph = new ZeusNativeGraphIntegration(this);
 
     // v0.5.0 — modular extensions
-    const pluginDataPath = path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME);
+    // pluginDataPath: absolute on Mac, vault-relative on iOS (multi-vector saveAll
+    // is Mac-only anyway — gated by isMac() before invocation).
+    const pluginDataPath = (path && this.vaultRoot)
+      ? path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME)
+      : universal.joinPath(this.manifest.dir, DATA_DIR_NAME);
     if (isMac() && this.settings.afmDaemonEnabled) {
-      this.afmDaemon = new AfmDaemon(this.afmBin);
-      this.afmDaemon.start().catch(e => console.warn('[zeus] afm-daemon start failed:', e.message));
+      try {
+        this.afmDaemon = new AfmDaemon(this.afmBin);
+        this.afmDaemon.start().catch(e => console.warn('[zeus] afm-daemon start failed:', e.message));
+      } catch (e) {
+        console.warn('[zeus] afm-daemon construction skipped:', e.message);
+      }
     }
     this.hierarchical = new HierarchicalProcessor(this.afmBin, this.settings.hierarchicalThreshold);
     this.multiVector = new MultiVectorEmbedder(this.afmBin, pluginDataPath);
@@ -1903,6 +2073,9 @@ class ZeusPlugin extends Plugin {
     });
 
     this.loadIndices();
+    // v0.11 — also kick off async preload so iOS gets manifest + embeddings
+    // populated via vault.adapter (sync fs not available there).
+    this.loadIndicesAsync().catch(e => console.warn('[zeus] async preload failed:', e.message));
 
     this.addSettingTab(new ZeusSettingTab(this.app, this));
 
@@ -2156,7 +2329,7 @@ class ZeusPlugin extends Plugin {
         const f = this.app.workspace.getActiveFile();
         let imagePath = null;
         if (f && /\.(png|jpe?g|heic|pdf|tiff|gif|webp|bmp)$/i.test(f.path)) {
-          imagePath = path.join(this.vaultRoot, f.path);
+          imagePath = (path && this.vaultRoot) ? path.join(this.vaultRoot, f.path) : f.path;
         } else {
           const input = await this._zeusPromptText('Caminho absoluto da imagem/PDF para scan estruturado:');
           if (!input) return;
@@ -2185,7 +2358,7 @@ class ZeusPlugin extends Plugin {
         const f = this.app.workspace.getActiveFile();
         let imagePath = null;
         if (f && /\.(png|jpe?g|heic|tiff|gif|webp|bmp)$/i.test(f.path)) {
-          imagePath = path.join(this.vaultRoot, f.path);
+          imagePath = (path && this.vaultRoot) ? path.join(this.vaultRoot, f.path) : f.path;
         } else {
           const input = await this._zeusPromptText('Caminho absoluto da imagem para avaliar:');
           if (!input) return;
@@ -2260,7 +2433,7 @@ class ZeusPlugin extends Plugin {
         const f = this.app.workspace.getActiveFile();
         let imagePath = null;
         if (f && /\.(png|jpe?g|heic|tiff|gif|webp|bmp)$/i.test(f.path)) {
-          imagePath = path.join(this.vaultRoot, f.path);
+          imagePath = (path && this.vaultRoot) ? path.join(this.vaultRoot, f.path) : f.path;
         } else {
           // try to find an embedded image reference in active note
           if (f) {
@@ -2272,8 +2445,8 @@ class ZeusPlugin extends Plugin {
                 const ref = m[1];
                 // try to resolve via metadataCache
                 const tfile = this.app.metadataCache.getFirstLinkpathDest(ref, f.path);
-                if (tfile) imagePath = path.join(this.vaultRoot, tfile.path);
-                else if (fs.existsSync(path.join(this.vaultRoot, ref))) imagePath = path.join(this.vaultRoot, ref);
+                if (tfile) imagePath = (path && this.vaultRoot) ? path.join(this.vaultRoot, tfile.path) : tfile.path;
+                else if (fs && path && fs.existsSync(path.join(this.vaultRoot, ref))) imagePath = path.join(this.vaultRoot, ref);
               }
             } catch {}
           }
@@ -2394,7 +2567,7 @@ class ZeusPlugin extends Plugin {
       name: 'Zeus PIA: regenerar zeus-cards.base (UI derivative)',
       callback: async () => {
         try {
-          const r = this.basesGen.regenerate();
+          const r = await this.basesGen.regenerate();
           if (r.written) {
             new Notice(`Zeus: zeus-cards.base regenerado (${r.count} passports)`);
           } else {
@@ -2430,9 +2603,9 @@ class ZeusPlugin extends Plugin {
     this.addCommand({
       id: 'zeus-scheduler-status',
       name: 'Zeus: status do scheduler + claims ativos',
-      callback: () => {
-        const s = this.scheduler ? this.scheduler.stats() : null;
-        if (!s) { new Notice('Zeus: scheduler indisponível'); return; }
+      callback: async () => {
+        if (!this.scheduler) { new Notice('Zeus: scheduler indisponível'); return; }
+        const s = await this.scheduler.stats();
         const c = s.coordinator || {};
         const last = s.lastSweep
           ? `· last sweep ${new Date(s.lastSweep.at).toLocaleTimeString()} (${s.lastSweep.extracted} extr / ${s.lastSweep.claimed} clm / ${s.lastSweep.skipped} skp / ${s.lastSweep.errors} err)`
@@ -2540,6 +2713,22 @@ class ZeusPlugin extends Plugin {
 
   loadIndices() {
     this.searcher.load();
+  }
+
+  // v0.11 — async preload of manifest + embeddings via vault.adapter so iOS
+  // gets data populated. On Mac the sync load already works; this is a no-op
+  // there (sync load returned the right data already).
+  async loadIndicesAsync() {
+    try {
+      this._manifestCache = await this.indexer.loadManifestAsync();
+      this._embeddingsCache = await this.indexer.loadEmbeddingsAsync();
+      // Refresh searcher with iOS-loaded data.
+      if (!fs) {
+        this.searcher.embeddings = this._embeddingsCache;
+      }
+    } catch (e) {
+      console.warn('[zeus] loadIndicesAsync failed:', e.message);
+    }
   }
 
   async saveSettings() {

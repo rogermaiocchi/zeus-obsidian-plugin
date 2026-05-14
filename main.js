@@ -53,6 +53,8 @@ const HierarchicalProcessor = require('./lib/hierarchical'); // Fix 2: NexusSum-
 const MultiVectorEmbedder = require('./lib/multi-vector');   // Fix 4: 3×512=1536-dim effective coverage
 const ZeusHttpClient = require('./lib/zeus-http-client');    // v0.6: Aegis-pattern daemon HTTP transport (ADR-018)
 const ImageSimilaritySearch = require('./lib/image-similarity'); // v0.7: feature-print vault image similarity
+const PassportIndex = require('./lib/passport-index');       // v0.9: Passport Index Architecture (PIA)
+const BasesGenerator = require('./lib/bases-generator');     // v0.9: Obsidian Bases UI derivative from passports.jsonl
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -1231,6 +1233,81 @@ class ZeusAskVaultModal extends obsidian.Modal {
 }
 
 // =========================================================================
+// UI — Passport Find Modal (v0.9 — PIA: MCP-first agent surface)
+// =========================================================================
+
+class ZeusPassportFindModal extends obsidian.Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('zeus-passport-find-modal');
+    contentEl.createEl('h3', { text: 'Passport Find — busca por conceitos (PIA)' });
+    contentEl.createEl('p', {
+      text: 'Retorna passports (concepts + summary + domain + difficulty) sem conteúdo bruto — token-eficiente.',
+      cls: 'zeus-ask-hint',
+    });
+
+    const input = contentEl.createEl('input', { cls: 'zeus-passport-find-input', type: 'text' });
+    input.placeholder = 'Query: ex. arquitetura Aegis com Tailscale';
+
+    const status = contentEl.createDiv({ cls: 'zeus-ask-status' });
+    const results = contentEl.createDiv({ cls: 'zeus-passport-find-results' });
+
+    const submit = contentEl.createEl('button', { text: 'Buscar passports', cls: 'mod-cta' });
+    submit.onclick = async () => {
+      const q = input.value.trim();
+      if (!q) return;
+      submit.disabled = true;
+      results.empty();
+      status.setText('Buscando passports…');
+      try {
+        const hits = await this.plugin.passport.findByQuery(q, { topN: 10 });
+        status.setText(`${hits.length} resultado(s)`);
+        for (const p of hits) {
+          const card = results.createDiv({ cls: 'zeus-passport-card' });
+          const title = card.createEl('div', { cls: 'zeus-passport-card-title', text: p.path });
+          title.style.fontWeight = 'bold';
+          title.style.cursor = 'pointer';
+          title.onclick = () => {
+            this.app.workspace.openLinkText(p.path, '', false);
+            this.close();
+          };
+          if (p.one_line_summary) {
+            card.createEl('div', { cls: 'zeus-passport-card-summary', text: p.one_line_summary });
+          }
+          const meta = card.createEl('div', { cls: 'zeus-passport-card-meta' });
+          if (p.concepts && p.concepts.length) {
+            meta.createEl('span', { text: 'concepts: ' + p.concepts.slice(0, 6).join(', ') });
+          }
+          if (p.domain && p.domain.length) {
+            meta.createEl('span', { text: ' | domain: ' + p.domain.join(', ') });
+          }
+          if (p.difficulty != null) {
+            meta.createEl('span', { text: ' | difficulty: ' + p.difficulty });
+          }
+        }
+        if (!hits.length) {
+          results.createDiv({ text: 'Nenhum passport encontrado. Rode "zeus-passport-build-all" primeiro?' });
+        }
+      } catch (e) {
+        status.setText('Erro: ' + e.message.slice(0, 200));
+      } finally {
+        submit.disabled = false;
+      }
+    };
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') submit.click(); });
+    input.focus();
+  }
+
+  onClose() { this.contentEl.empty(); }
+}
+
+// =========================================================================
 // UI — Search Modal
 // =========================================================================
 
@@ -1720,6 +1797,9 @@ class ZeusPlugin extends Plugin {
     this.httpClient = new ZeusHttpClient(this.settings.zeusDaemonUrl);
     // v0.7.0 — image similarity search via feature-print cache
     this.imageSimilarity = new ImageSimilaritySearch(this);
+    // v0.9.0 — Passport Index Architecture (PIA): MCP-first agent surface
+    this.passport = new PassportIndex(this);
+    this.basesGen = new BasesGenerator(this);
 
     // v0.6.1 — Adaptive daemon discovery (async, doesn't block onload)
     this.app.workspace.onLayoutReady(async () => {
@@ -2178,6 +2258,70 @@ class ZeusPlugin extends Plugin {
         await this.nativeGraph.clearAll();
         n.hide();
         new Notice('Zeus: zeus_related removido de todas as notas');
+      },
+    });
+
+    // v0.9.0 — Passport Index Architecture (PIA) commands
+    this.addCommand({
+      id: 'zeus-passport-build-all',
+      name: 'Zeus PIA: extrair passports de TODAS as notas (batch)',
+      callback: async () => {
+        if (!isMac()) { new Notice('PIA build: requer daemon no Mac'); return; }
+        const n = new Notice('Zeus PIA: extracting passports…', 0);
+        try {
+          const result = await this.passport.buildAll(msg => {
+            n.setMessage('Zeus PIA: ' + msg);
+            this.updateStatusBar('indexing', msg);
+          });
+          n.hide();
+          this.updateStatusBar('idle', null);
+          new Notice(`Zeus PIA: ${result.succeeded} passports, ${result.failed} falhas (${result.total} notas)`);
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus PIA build falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-passport-build-current',
+      name: 'Zeus PIA: extrair passport da nota atual',
+      callback: async () => {
+        const f = this.app.workspace.getActiveFile();
+        if (!f) { new Notice('Sem nota ativa'); return; }
+        const n = new Notice('Zeus PIA: extraindo passport…', 0);
+        try {
+          const passport = await this.passport.buildOne(f.path);
+          n.hide();
+          const concepts = (passport.concepts || []).slice(0, 5).join(', ');
+          new Notice(`Zeus PIA: ${concepts || 'sem concepts'}`);
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus PIA falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-passport-find',
+      name: 'Zeus PIA: find — buscar passports por query (MCP-first)',
+      callback: () => new ZeusPassportFindModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: 'zeus-bases-regenerate',
+      name: 'Zeus PIA: regenerar zeus-cards.base (UI derivative)',
+      callback: async () => {
+        try {
+          const r = this.basesGen.regenerate();
+          if (r.written) {
+            new Notice(`Zeus: zeus-cards.base regenerado (${r.count} passports)`);
+          } else {
+            new Notice('Zeus: passports.jsonl não existe — rode "build-all" primeiro');
+          }
+        } catch (e) {
+          new Notice('Zeus bases-regenerate falhou: ' + e.message.slice(0, 200));
+        }
       },
     });
 

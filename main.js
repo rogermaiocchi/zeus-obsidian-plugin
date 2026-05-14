@@ -55,8 +55,6 @@ const universal = require('./lib/universal-fs');
 const path = universal.nodePath;
 const fs = universal.nodeFs;
 const spawn = universal.nodeChildProcess ? universal.nodeChildProcess.spawn : null;
-const path = universal.nodePath;
-const fs = universal.nodeFs;
 
 // v0.5.0 — modular extensions (parallel-built by subagents)
 const AfmDaemon = require('./lib/afm-daemon');             // Fix 1: JSON-RPC persistent daemon

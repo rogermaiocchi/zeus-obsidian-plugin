@@ -914,3 +914,145 @@ body.theme-dark .zeus-skeleton-line {
 .is-mobile .suggestion-item.zeus-result {
   padding: 12px 14px;
 }
+
+/* ============================================================================
+ * 15. v0.13 — Mini-graph SVG + chevron list (Smart Connections-inspired)
+ * ============================================================================ */
+
+/* Header com título da nota ativa */
+.zeus-smart-title-active {
+  font-family: var(--zeus-font-heading);
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-normal);
+  letter-spacing: -0.01em;
+}
+
+/* Mini-graph wrapper */
+.zeus-smart-graph-wrap {
+  margin: 8px 0 16px;
+  padding: 12px;
+  background: var(--zeus-surface-elevated);
+  border: 1px solid var(--zeus-border-subtle);
+  border-radius: var(--zeus-radius-md);
+}
+.zeus-smart-graph-svg {
+  width: 100%;
+  height: 280px;
+  display: block;
+}
+.zeus-smart-graph-edge {
+  stroke: var(--zeus-color-midgray);
+  stroke-width: 1;
+}
+.zeus-smart-graph-node {
+  fill: var(--zeus-color-midgray);
+  stroke: var(--background-primary);
+  stroke-width: 1;
+  transition: fill 120ms ease, r 120ms ease;
+}
+.zeus-smart-graph-node:hover {
+  fill: var(--zeus-color-orange);
+}
+.zeus-smart-graph-node-active {
+  fill: var(--zeus-color-orange);
+  stroke: var(--zeus-color-light);
+  stroke-width: 2;
+}
+.zeus-smart-graph-score {
+  fill: var(--text-muted);
+  font-family: var(--zeus-font-mono);
+  font-size: 9px;
+  pointer-events: none;
+}
+.zeus-smart-graph-caption {
+  margin-top: 8px;
+  font-family: var(--zeus-font-mono);
+  font-size: 10px;
+  color: var(--zeus-color-midgray);
+  text-align: center;
+}
+.zeus-smart-graph-caption-active {
+  color: var(--zeus-color-orange);
+  font-weight: 600;
+}
+
+/* Chevron list (compact format: ›  0.86 › link) */
+.zeus-smart-list-chevron {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+.zeus-smart-chevron-item {
+  display: block;
+  padding: 6px 8px;
+  font-family: var(--zeus-font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  border-radius: var(--zeus-radius-sm);
+  transition: background-color 100ms ease;
+}
+.zeus-smart-chevron-item:hover {
+  background: var(--background-modifier-hover, var(--zeus-color-lightgray));
+}
+.zeus-smart-chevron {
+  display: inline-block;
+  width: 14px;
+  color: var(--zeus-color-midgray);
+  font-family: var(--zeus-font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  text-align: center;
+}
+.zeus-smart-chevron:hover {
+  color: var(--zeus-color-orange);
+}
+.zeus-smart-chevron-score {
+  display: inline-block;
+  background: var(--zeus-color-lightgray);
+  color: var(--text-normal);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--zeus-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  margin-right: 0;
+}
+.zeus-smart-chevron-sep {
+  color: var(--zeus-color-midgray);
+  font-family: var(--zeus-font-mono);
+  font-size: 11px;
+}
+.zeus-smart-chevron-link {
+  color: var(--zeus-color-orange);
+  text-decoration: underline;
+  text-decoration-color: var(--zeus-color-orange-faded);
+  text-underline-offset: 2px;
+  cursor: pointer;
+  font-family: var(--zeus-font-heading);
+  font-weight: 500;
+}
+.zeus-smart-chevron-link:hover {
+  text-decoration-color: var(--zeus-color-orange);
+}
+.zeus-smart-chevron-detail {
+  margin: 6px 0 6px 24px;
+  padding: 8px 10px;
+  background: var(--zeus-surface-subtle);
+  border-left: 2px solid var(--zeus-color-orange);
+  border-radius: var(--zeus-radius-sm);
+}
+.zeus-smart-chevron-path {
+  font-family: var(--zeus-font-mono);
+  font-size: 10px;
+  color: var(--zeus-color-midgray);
+  margin-bottom: 4px;
+}
+.zeus-smart-chevron-excerpt {
+  font-family: var(--zeus-font-body);
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}

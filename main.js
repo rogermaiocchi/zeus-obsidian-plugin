@@ -1564,14 +1564,94 @@ class ZeusSmartView extends ItemView {
     this.refresh();
   }
 
+  /**
+   * v0.13 — Mini-graph SVG showing active note (center) + cosine neighbors (orbiting).
+   * Smart Connections-style: nodes positioned by score (higher = closer to center).
+   * Scores shown as labels (0.86 format). Click node = open that note.
+   */
+  _renderMiniGraph(container, activeFile, neighbors) {
+    const W = 320, H = 280;
+    const cx = W / 2, cy = H / 2;
+    const wrap = container.createDiv({ cls: 'zeus-smart-graph-wrap' });
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('class', 'zeus-smart-graph-svg');
+
+    // Edges (active node to each neighbor)
+    const positions = [];
+    neighbors.forEach((n, i) => {
+      const angle = (i / neighbors.length) * 2 * Math.PI - Math.PI / 2;
+      // distance: higher score → closer (40-110 range based on score 1.0-0.5)
+      const dist = 50 + (1 - Math.min(1, Math.max(0, n.score))) * 90;
+      const x = cx + dist * Math.cos(angle);
+      const y = cy + dist * Math.sin(angle);
+      positions.push({ ...n, x, y });
+    });
+
+    // Draw edges first (so circles render on top)
+    for (const p of positions) {
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', cx); line.setAttribute('y1', cy);
+      line.setAttribute('x2', p.x); line.setAttribute('y2', p.y);
+      line.setAttribute('class', 'zeus-smart-graph-edge');
+      line.setAttribute('stroke-opacity', String(0.15 + p.score * 0.4));
+      svg.appendChild(line);
+    }
+
+    // Score labels for each neighbor (positioned away from center)
+    for (const p of positions) {
+      const labelOffsetX = p.x < cx ? -10 : 10;
+      const labelAnchor = p.x < cx ? 'end' : 'start';
+      const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      label.setAttribute('x', p.x + labelOffsetX);
+      label.setAttribute('y', p.y - 8);
+      label.setAttribute('class', 'zeus-smart-graph-score');
+      label.setAttribute('text-anchor', labelAnchor);
+      label.textContent = p.score.toFixed(2);
+      svg.appendChild(label);
+    }
+
+    // Active node — central, larger, purple/orange
+    const activeCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    activeCircle.setAttribute('cx', cx); activeCircle.setAttribute('cy', cy);
+    activeCircle.setAttribute('r', 8);
+    activeCircle.setAttribute('class', 'zeus-smart-graph-node zeus-smart-graph-node-active');
+    svg.appendChild(activeCircle);
+
+    // Neighbor nodes
+    for (const p of positions) {
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('cx', p.x); circle.setAttribute('cy', p.y);
+      circle.setAttribute('r', 4);
+      circle.setAttribute('class', 'zeus-smart-graph-node');
+      const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      title.textContent = `${p.score.toFixed(2)} · ${p.path}`;
+      circle.appendChild(title);
+      circle.style.cursor = 'pointer';
+      circle.addEventListener('click', async () => {
+        const tf = this.app.vault.getAbstractFileByPath(p.path);
+        if (tf instanceof TFile) await this.app.workspace.getLeaf().openFile(tf);
+      });
+      svg.appendChild(circle);
+    }
+
+    wrap.appendChild(svg);
+
+    // Caption
+    const caption = wrap.createDiv({ cls: 'zeus-smart-graph-caption' });
+    caption.createSpan({ text: `${neighbors.length} vizinhos · ` });
+    const fileName = activeFile.basename;
+    caption.createSpan({ cls: 'zeus-smart-graph-caption-active', text: fileName });
+  }
+
   async refresh() {
     const container = this.containerEl.children[1];
     container.empty();
     const file = this.app.workspace.getActiveFile();
 
-    // =========== Layer 1: cosine fast neighbors ===========
+    // =========== Header com título da nota ativa ===========
     const headerCosine = container.createDiv({ cls: 'zeus-smart-header' });
-    headerCosine.createSpan({ cls: 'zeus-smart-title', text: 'Cosine (NLContextualEmbedding)' });
+    headerCosine.createSpan({ cls: 'zeus-smart-title-active', text: file ? file.basename : 'Conexões' });
 
     if (!file) {
       container.createDiv({ cls: 'zeus-smart-empty', text: 'Abra uma nota para ver conexões.' });
@@ -1582,14 +1662,39 @@ class ZeusSmartView extends ItemView {
     if (neighbors.length === 0) {
       container.createDiv({ cls: 'zeus-smart-empty', text: 'Sem embeddings — execute "Reindex" via Cmd+P.' });
     } else {
-      const list = container.createDiv({ cls: 'zeus-smart-list' });
+      // v0.13 — Mini-graph SVG no topo (Smart Connections style)
+      this._renderMiniGraph(container, file, neighbors);
+
+      // Lista chevron-expandable abaixo (formato 0.86 › link)
+      const list = container.createDiv({ cls: 'zeus-smart-list-chevron' });
       for (const n of neighbors) {
-        const item = list.createDiv({ cls: 'zeus-smart-item' });
-        item.createSpan({ cls: 'zeus-smart-score', text: (n.score * 100).toFixed(0) });
-        const body = item.createDiv({ cls: 'zeus-smart-item-body' });
-        body.createDiv({ cls: 'zeus-smart-item-title', text: n.path.replace(/\.md$/, '').split('/').pop() });
-        body.createDiv({ cls: 'zeus-smart-item-path', text: n.path });
-        item.onclick = async () => {
+        const item = list.createDiv({ cls: 'zeus-smart-chevron-item' });
+        const chevron = item.createSpan({ cls: 'zeus-smart-chevron', text: '›' });
+        const scoreEl = item.createSpan({ cls: 'zeus-smart-chevron-score', text: n.score.toFixed(2) });
+        item.createSpan({ cls: 'zeus-smart-chevron-sep', text: ' › ' });
+        const link = item.createSpan({ cls: 'zeus-smart-chevron-link', text: n.path.replace(/\.md$/, '').split('/').pop() });
+
+        let expanded = false;
+        let expandPanel = null;
+        const toggle = (e) => {
+          e.stopPropagation();
+          expanded = !expanded;
+          chevron.setText(expanded ? '⌄' : '›');
+          if (expanded) {
+            expandPanel = item.createDiv({ cls: 'zeus-smart-chevron-detail' });
+            expandPanel.createDiv({ cls: 'zeus-smart-chevron-path', text: n.path });
+            try {
+              const excerpt = this.plugin.searcher.excerpt(n.path, '', 180);
+              if (excerpt) expandPanel.createDiv({ cls: 'zeus-smart-chevron-excerpt', text: excerpt });
+            } catch (_) {}
+          } else if (expandPanel) {
+            expandPanel.remove();
+            expandPanel = null;
+          }
+        };
+        chevron.onclick = toggle;
+        link.onclick = async (e) => {
+          e.stopPropagation();
           const tf = this.app.vault.getAbstractFileByPath(n.path);
           if (tf instanceof TFile) await this.app.workspace.getLeaf().openFile(tf);
         };

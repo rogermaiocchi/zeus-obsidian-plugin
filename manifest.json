@@ -1,7 +1,7 @@
 {
   "id": "zeus",
   "name": "Zeus — Apple-native Search & Connections",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "minAppVersion": "1.5.0",
   "description": "Multi-modal Apple ecosystem-native search & connections. Passport Index Architecture v0.12 — token-efficient agent consumption via MCP-first surface (find_relevant_notes → get_passport → get_content). Substitui Omnisearch + Smart Connections com camadas afm (Foundation Models), av (Vision: classify+OCR+landmarks+EXIF), anl (NLContextualEmbedding 512-dim), aia (Intelligence: enrich+agent+graph) e HyDE query expansion. Indexação no Mac via afm CLI, leitura cross-device via iCloud.",
   "author": "Roger Maiocchi",

@@ -4,6 +4,59 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.3.0] — 2026-05-15 — Native Refinement & Opaque Media Unlocking
+
+Primeira release derivada do estudo NotebookLM Apple-Native (notebook `aa48f2d1`, 12 fontes Apple Developer + apple-fm-sdk GitHub + plugin READMEs). Adiciona 3 endpoints novos no daemon Swift + camada Python worker para batch jobs offline, sem alterar a superfície existente.
+
+### Added — `afm-refine` (Writing Tools nativo via FoundationModels)
+
+- **`POST /v1/afm/refine`** no `ZeusMacHTTPHandler.swift` — instructions específicas por modo, reusa o helper `runFoundationModel()` existente (mantém heurística PCC calibrada da v1.2)
+- **3 modos** via body param `mode`:
+  - `proofread` (default) — corrige gramática/ortografia/pontuação, preserva estilo
+  - `rewrite` — reescreve mantendo sentido; suporta `tone: academic|professional|casual`
+  - `simplify` — linguagem clara, frases curtas, menos jargão
+- Param opcional `language: pt|en` (auto-detect quando ausente)
+- Param opcional `max_tokens` (default 800)
+- Privacy gate intocado: respeita `X-Zeus-Allow-Pcc` da request (default `.off`)
+- Substituto on-device para Grammarly/Text Generator cloud-based em notas sensíveis
+
+### Added — `asp-transcribe` (SpeechAnalyzer macOS 26+) e `asp-vad` (pré-filtro)
+
+- **`POST /v1/asp/transcribe`** — `SpeechAnalyzer` + `SpeechTranscriber` lê arquivos `.m4a/.wav/.mp3` (qualquer formato suportado por `AVAudioFile`), retorna texto + `duration_seconds`
+- **`POST /v1/asp/vad`** — heurística rápida de duração (>= 3s → assume fala) para pular áudios muito curtos antes de chamar transcribe. Quando `SpeechDetector` estabilizar API, substituível por análise real
+- Streaming de buffers PCM ~8192 frames via `AsyncStream<AnalyzerInput>` — não carrega áudio inteiro em memória
+- Locale configurável via body param `locale` (default `Locale.current.identifier`)
+- Timeout interno de 600s para áudios longos; gated atrás de `#if canImport(Speech)` + `#available(macOS 26.0, *)`
+- Imports novos no handler: `Speech`, `AVFoundation`
+- Adicionado campo `speech_available` no `/v1/health` payload
+
+### Added — Python worker layer
+
+- **`lib/python-worker.js`** — helper `runPythonWorker(pluginDir, scriptName, payload, opts)` via `child_process.spawn`. Contract JSON-in/JSON-out, timeout configurável (default 30s), error handling completo
+- **`bin/batch_eval.py`** — stub Python que valida instalação do `apple-fm-sdk` Python (oficial Apple, Apache-2.0) e reporta ambiente. Actions: `version` (probe SDK + macOS), `probe` (cheap roundtrip)
+- Princípio arquitetural: **Swift cuida do runtime/interativo; Python cuida do batch/offline**. Workers Python rodam como processos efêmeros disparados pelo plugin TS via spawn, sem novas portas HTTP nem duplicação de responsabilidade com o daemon
+- Smoke test validado no Mac mini: `python3 bin/batch_eval.py` retorna `apple_fm_sdk_version: 0.1.x` + ambiente
+
+### Architecture notes
+
+- **Domain Boundary**: o daemon SwiftNIO permanece a autoridade única do loop HTTP de baixa latência. Camada Python é módulo *plug-and-play* em `bin/` para tarefas que ganham com numpy/pandas/MLX/Apple FM SDK ou que rodam em background sem afetar UI
+- **Reaproveitamento total**: `handleRefine` usa `runFoundationModel()` (linha ~1749) sem nova lógica de FM; `handleASPTranscribe` usa `AVAudioFile` + `AsyncStream<AnalyzerInput>` padrão do framework
+- **Endpoints totais agora**: 29 (era 26) — 3 novos `afm/refine`, `asp/transcribe`, `asp/vad` listados em `/v1/health.endpoints` e no default 404 case
+
+### Build & validation
+
+- `swift build --product ZeusDaemonMac` ✅ compilou sem erros em 45.72s no Mac mini M2 Pro
+- `echo '{"action":"version"}' | python3 bin/batch_eval.py` ✅ retorna JSON válido, `apple_fm_sdk_available: true`
+- iOS `AegisDaemon` (`AegisHTTPHandlers.swift`) inalterado nesta release — endpoints `afm/refine`, `asp/transcribe`, `asp/vad` ficam para v1.3.1+ quando Apple Speech expor mesma API no iOS Capacitor
+
+### Próximos passos (v1.4 trackeado em APPLE_NATIVE_ROADMAP.md)
+
+- `afm-embed-768` (multilingual-e5-base CoreML, +15-20% recall)
+- `mlx-classify` (cross-encoder reranker via MLX)
+- `batch-eval` real (regressão de prompts via `@generable`)
+
+---
+
 ## [1.2.0] — 2026-05-15 — PCC end-to-end (daemon Swift honra X-Zeus-Allow-Pcc)
 
 Fechamento do ciclo PCC: o daemon Swift agora lê o header de permissão, propaga até os handlers FoundationModels (`enrich`/`summarize`/`prompt`), aplica heurística calibrada para decidir quando sinalizar uso de cloud routing, e devolve o header `X-Zeus-Pcc-Used: 1`. Plugin v1.1 já estava preparado — agora o ciclo opt-in → header outgoing → daemon decide → header response → contador da sessão funciona end-to-end.

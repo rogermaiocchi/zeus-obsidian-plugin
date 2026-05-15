@@ -32,6 +32,12 @@ import FoundationModels
 #if canImport(Translation)
 import Translation
 #endif
+#if canImport(Speech)
+import Speech
+#endif
+#if canImport(AVFoundation)
+import AVFoundation
+#endif
 
 final class ZeusMacHTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
@@ -198,6 +204,14 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             return self.handleSpotlightSearch(bodyJSON: body)
         case (.POST, "/v1/data-detect"):
             return self.handleDataDetect(bodyJSON: body)
+        // v1.3 — afm refine (Writing Tools nativo via FoundationModels)
+        case (.POST, "/v1/afm/refine"):
+            return self.handleRefine(bodyJSON: body, pcc: pcc)
+        // v1.3 — asp transcribe (SpeechAnalyzer + SpeechTranscriber)
+        case (.POST, "/v1/asp/transcribe"):
+            return self.handleASPTranscribe(bodyJSON: body)
+        case (.POST, "/v1/asp/vad"):
+            return self.handleASPVAD(bodyJSON: body)
         default:
             return Response(status: .notFound, payload: [
                 "error": "not_found",
@@ -216,7 +230,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     "POST /v1/passport/find", "POST /v1/content/get",
                     "POST /v1/translate",
                     "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
-                    "POST /v1/data-detect", "POST /v1/spotlight/search"
+                    "POST /v1/data-detect", "POST /v1/spotlight/search",
+                    "POST /v1/afm/refine",
+                    "POST /v1/asp/transcribe", "POST /v1/asp/vad"
                 ]
             ])
         }
@@ -260,8 +276,19 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             "POST /v1/passport/find", "POST /v1/content/get",
             "POST /v1/translate",
             "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
-            "POST /v1/data-detect", "POST /v1/spotlight/search"
+            "POST /v1/data-detect", "POST /v1/spotlight/search",
+            "POST /v1/afm/refine",
+            "POST /v1/asp/transcribe", "POST /v1/asp/vad"
         ]
+
+        // v1.3 — Speech framework availability check (asp endpoints)
+        var speechAvailable = false
+        #if canImport(Speech)
+        if #available(macOS 26.0, *) {
+            speechAvailable = true
+        }
+        #endif
+
         return [
             "status": "ok",
             "platform": "macOS",
@@ -272,6 +299,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             "nl_model": nlModel,
             "vision_available": visionAvailable,
             "fm_available": fmAvailable,
+            "speech_available": speechAvailable,
             "endpoints": endpoints,
             "endpoint_count": endpoints.count
         ]
@@ -706,6 +734,230 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         return Response(status: .serviceUnavailable, payload: [
             "error": "FoundationModels framework não disponível neste build"
         ])
+        #endif
+    }
+
+    // MARK: - /v1/afm/refine (v1.3 — Writing Tools nativo via FoundationModels)
+    //
+    // Body: { "text": "...", "mode": "proofread|rewrite|simplify",
+    //         "tone": "academic|professional|casual" (optional, mode=rewrite only),
+    //         "language": "pt|en" (optional, auto-detect quando ausente),
+    //         "max_tokens": 800 (optional) }
+    //
+    // Modos:
+    //   proofread — corrige gramática, ortografia, pontuação; mantém estilo
+    //   rewrite   — reescreve mantendo sentido; aplica `tone` se fornecido
+    //   simplify  — linguagem mais clara, frases curtas, menos jargão
+    //
+    // Privacy gate inalterado: respeita header X-Zeus-Allow-Pcc da request.
+    private func handleRefine(bodyJSON: String, pcc: PccPermission = .off) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"mode\": \"proofread|rewrite|simplify\"}"
+            ])
+        }
+        let mode = ((json["mode"] as? String) ?? "proofread").lowercased()
+        let tone = (json["tone"] as? String)?.lowercased()
+        let language = (json["language"] as? String)?.lowercased()
+        let maxTokens = (json["max_tokens"] as? Int) ?? 800
+
+        let languageDirective: String
+        switch language {
+        case "pt", "pt-br", "portuguese":
+            languageDirective = "Responda em português brasileiro."
+        case "en", "english":
+            languageDirective = "Respond in English."
+        default:
+            languageDirective = "Mantenha o idioma original do texto."
+        }
+
+        let instructions: String
+        switch mode {
+        case "rewrite":
+            let toneDirective: String
+            switch tone {
+            case "academic":
+                toneDirective = "Adote tom acadêmico, com vocabulário técnico preciso e estrutura formal."
+            case "professional":
+                toneDirective = "Adote tom profissional, claro e objetivo."
+            case "casual":
+                toneDirective = "Adote tom conversacional, próximo e acessível."
+            default:
+                toneDirective = "Preserve o tom do texto original."
+            }
+            instructions = """
+            Você é um editor de textos. Reescreva o texto fornecido preservando o sentido original.
+            \(toneDirective)
+            \(languageDirective)
+            Retorne APENAS o texto reescrito, sem explicações, sem marcadores, sem aspas envolventes.
+            """
+        case "simplify":
+            instructions = """
+            Você é um editor que torna textos mais acessíveis. Reescreva o texto com linguagem clara,
+            frases curtas, e menos jargão. Preserve o sentido técnico essencial.
+            \(languageDirective)
+            Retorne APENAS o texto simplificado, sem explicações.
+            """
+        default: // proofread
+            instructions = """
+            Você é um revisor. Corrija gramática, ortografia e pontuação do texto fornecido.
+            NÃO mude o estilo, o tom ou o vocabulário do autor — apenas corrija erros.
+            \(languageDirective)
+            Retorne APENAS o texto corrigido, sem explicações.
+            """
+        }
+
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: maxTokens,
+            extraPayload: [
+                "task": "refine",
+                "mode": mode,
+                "tone": tone ?? "",
+                "language": language ?? "auto"
+            ],
+            pcc: pcc
+        )
+    }
+
+    // MARK: - /v1/asp/transcribe (v1.3 — SpeechAnalyzer + SpeechTranscriber, macOS 26+)
+    //
+    // Body: { "path": "/path/to/audio.m4a", "locale": "pt-BR" (optional, default: current) }
+    // Retorna: { "text": "...", "duration_seconds": N, "locale": "...", "model": "..." }
+    //
+    // Suporta .m4a, .wav, .mp3 e qualquer formato lido por AVAudioFile.
+    // Gated atrás de #if canImport(Speech) + #available(macOS 26.0, *).
+    private func handleASPTranscribe(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"/path/to/audio.m4a\"}"
+            ])
+        }
+        let localeID = (json["locale"] as? String) ?? Locale.current.identifier
+
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return Response(status: .badRequest, payload: [
+                "error": "arquivo de áudio não encontrado: \(url.path)"
+            ])
+        }
+
+        #if canImport(Speech) && canImport(AVFoundation)
+        if #available(macOS 26.0, *) {
+            let sem = DispatchSemaphore(value: 0)
+            var resultText = ""
+            var resultError: String? = nil
+            var durationSeconds: Double = 0
+
+            Task {
+                do {
+                    let audioFile = try AVAudioFile(forReading: url)
+                    let sampleRate = audioFile.processingFormat.sampleRate
+                    durationSeconds = Double(audioFile.length) / sampleRate
+
+                    let transcriber = SpeechTranscriber(
+                        locale: Locale(identifier: localeID),
+                        transcriptionOptions: [],
+                        reportingOptions: [],
+                        attributeOptions: []
+                    )
+                    let analyzer = SpeechAnalyzer(modules: [transcriber])
+
+                    // Stream audio file in chunks to the analyzer.
+                    let (inputStream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+                    let analyzerTask = Task {
+                        try await analyzer.start(inputSequence: inputStream)
+                    }
+
+                    let frameCount: AVAudioFrameCount = 8192
+                    let format = audioFile.processingFormat
+                    while audioFile.framePosition < audioFile.length {
+                        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { break }
+                        try audioFile.read(into: buffer)
+                        continuation.yield(AnalyzerInput(buffer: buffer))
+                    }
+                    continuation.finish()
+                    try await analyzerTask.value
+
+                    for try await result in transcriber.results {
+                        resultText += String(result.text.characters)
+                    }
+                } catch {
+                    resultError = "SpeechAnalyzer falhou: \(error)"
+                }
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + .seconds(600))
+
+            if let err = resultError {
+                return Response(status: .internalServerError, payload: ["error": err])
+            }
+            return Response(status: .ok, payload: [
+                "text": resultText,
+                "duration_seconds": durationSeconds,
+                "locale": localeID,
+                "model": "apple-speechanalyzer-speechtranscriber",
+                "task": "asp_transcribe"
+            ])
+        } else {
+            return Response(status: .serviceUnavailable, payload: [
+                "error": "SpeechAnalyzer requer macOS 26.0+ (esta máquina é mais antiga)"
+            ])
+        }
+        #else
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "Speech / AVFoundation indisponível neste build"
+        ])
+        #endif
+    }
+
+    // MARK: - /v1/asp/vad (v1.3 — Voice Activity Detection, pré-filtro rápido)
+    //
+    // Body: { "path": "/path/to/audio.m4a" }
+    // Retorna: { "has_speech": bool, "duration_seconds": N, "model": "..." }
+    //
+    // Use-case: skip de áudios sem fala antes de chamar /v1/asp/transcribe.
+    // Estratégia conservadora: arquivos muito curtos (< 3s) ou inválidos → has_speech=false.
+    private func handleASPVAD(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"/path/to/audio.m4a\"}"
+            ])
+        }
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return Response(status: .badRequest, payload: [
+                "error": "arquivo de áudio não encontrado: \(url.path)"
+            ])
+        }
+
+        #if canImport(AVFoundation)
+        do {
+            let audioFile = try AVAudioFile(forReading: url)
+            let sampleRate = audioFile.processingFormat.sampleRate
+            let durationSeconds = Double(audioFile.length) / sampleRate
+            // Heurística mínima: < 3s → assume sem fala útil. Acima → assume fala.
+            // Quando SpeechDetector estiver totalmente exposto em API estável,
+            // substituir por análise real do detector.
+            let hasSpeech = durationSeconds >= 3.0
+            return Response(status: .ok, payload: [
+                "has_speech": hasSpeech,
+                "duration_seconds": durationSeconds,
+                "threshold_seconds": 3.0,
+                "model": "duration-heuristic",
+                "task": "asp_vad"
+            ])
+        } catch {
+            return Response(status: .badRequest, payload: [
+                "error": "não foi possível ler áudio: \(error)"
+            ])
+        }
+        #else
+        return Response(status: .serviceUnavailable, payload: ["error": "AVFoundation indisponível neste build"])
         #endif
     }
 

@@ -4,6 +4,48 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.1.0] — 2026-05-14 — Status bar metrics + Apple Cloud Private (PCC) prep
+
+Polish de Settings UX, métricas de token economizado visíveis no status bar, e integração client-side de Apple Cloud Private (PCC). Daemon Swift permanece em v0.5.0 — atualização do daemon para honrar o header `X-Zeus-Allow-Pcc` é trackeada como follow-up (a parte client-side fica wired e aguardando).
+
+### Added — v1.1 Status bar & Token metrics
+- **Token-saved metric** no status bar (`Zeus: 1245 docs · 18.3k tok saved`) — economia estimada via PIA passports compactos vs carga raw equivalente
+- Setting **Mostrar tokens economizados no status bar** (default ON)
+- Setting **Intervalo de refresh do status bar (ms)** — slider 5–120s, default 30s
+- Setting **Token baseline (raw sem PIA)** — slider 250–5000 tok, default 1250 (~5KB/4)
+- Setting **Reset métricas** — botão para zerar contadores do HTTP client
+- Timer periódico de refresh do status bar (auto-cleanup via `register()`)
+- Estado interno `_lastStatusBarState` previne sobrescrever indexing/embedding durante refresh
+
+### Added — v2.0 Apple Cloud Private (PCC) — client-side prep
+- Setting **Modo PCC** com 3 opções: `off` (default, on-device only) / `opt-in` (header `X-Zeus-Allow-Pcc:1`) / `auto` (daemon decide)
+- Setting **Indicador visual PCC** — exibe `☁️PCC×N` no status bar quando PCC é usado
+- Setting **Status PCC** — botão de inspeção (modo atual, última request via PCC, total da sessão)
+- Métodos `setPccMode()` / `getPccStatus()` no `ZeusHttpClient`
+- Helpers `_pccHeaders()` (injeta header outgoing) e `_readPccUsed()` (lê `X-Zeus-Pcc-Used` da response)
+- Contador `pccUsageCount` mantido por sessão
+- Auto-sync de `pccMode` settings → HTTP client no `onload()` e em todas mudanças via Settings tab
+
+### Changed — UX polish
+- Seções v1.1 e v2.0 do Settings tab com headers `<h3>` claros e descrições didáticas
+- Descrições PCC explicam claramente o privacy model: "modelos servidor-side rodam em hardware Apple verificável criptograficamente, sem reter dados"
+- Settings descritivos: mencionam quando usar `opt-in` vs `auto`, requisito de macOS 26+ Apple Intelligence ativo
+- `DEFAULT_SETTINGS` reorganizados em blocos comentados v1.1 / v2.0
+
+### Architecture notes
+- **PCC privacy model**: header HTTP é apenas *permissão* — daemon Swift mantém autoridade final sobre roteamento. Default `off` preserva o privacy gate original do Zeus (sigiloso nunca sai do disco local).
+- **Métricas são lazy**: status bar só consulta `httpClient.getMetrics()` a cada 30s no estado idle, zero overhead durante operações ativas.
+- **Token baseline configurável**: usuários com vault de notas atomicas (Luhmann/Zettelkasten) usam baseline menor; vaults com docs longos usam baseline maior. Estimativa fica realista.
+
+### Daemon follow-up (não bloqueia v1.1)
+Para que PCC funcione end-to-end, o daemon Swift (`daemon/Sources/ZeusDaemonMac/`) precisa:
+1. Ler header `X-Zeus-Allow-Pcc` em handlers `enrich`, `agent`, `graphExtract`
+2. Configurar `SystemLanguageModel.default(allowingCloudCompute: true)` quando header presente (Swift 6.0 + macOS 26)
+3. Setar `X-Zeus-Pcc-Used: 1` na response quando rota cloud foi tomada
+4. Manter fallback on-device se PCC indisponível (ex.: usuário sem Apple Intelligence ativo)
+
+---
+
 ## [1.0.0] — 2026-05-14 — Versão final estável
 
 Primeira release marcada como **estável de produção**. Todas as camadas funcionais e wired no plugin. Validado em uso diário cross-device (Mac mini · MacBook Air · iPad · iPhone) no vault `Documents`.

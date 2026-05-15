@@ -158,6 +158,16 @@ const DEFAULT_SETTINGS = {
   schedulerEnabled: true,                   // default ON — background coordinator sweeps stale passports
   schedulerIntervalMs: 15 * 60 * 1000,      // 15 min default
   coordTtlMs: 60 * 1000,                    // 60s default; iCloud sync delay (5-30s) << TTL
+  // v1.1 — Status bar: token-saved metrics
+  showTokenSavedInStatusBar: true,          // exibe "k tok saved" via PIA no status bar
+  statusBarRefreshIntervalMs: 30000,        // 30s refresh para tokens metrics
+  rawTokenBaseline: 1250,                   // tokens médios sem PIA por request (~5KB/4)
+  // v2.0 — Apple Cloud Private (ACP / PCC)
+  // 'off'    = só on-device (privacy máximo, requer macOS 26+ Apple Intelligence)
+  // 'opt-in' = client envia header X-Zeus-Allow-Pcc:1; daemon decide caso a caso
+  // 'auto'   = sempre permite roteamento para PCC quando on-device excede capacidade
+  pccMode: 'off',
+  pccVisualIndicator: true,                 // exibe ☁️PCC no status bar quando daemon roteou via PCC
 };
 
 // =========================================================================
@@ -2094,6 +2104,105 @@ class ZeusSettingTab extends PluginSettingTab {
         console.log('[zeus] coordination stats', s);
       }));
 
+    // ────────────────────────────────────────────────────────────────────
+    // v1.1 — Métricas no Status Bar
+    // ────────────────────────────────────────────────────────────────────
+    containerEl.createEl('h3', { text: 'v1.1 — Status Bar & Token Metrics' });
+    const metricsDesc = containerEl.createEl('p', { cls: 'setting-item-description' });
+    metricsDesc.appendText('Status bar exibe contagem de docs indexados e, opcionalmente, tokens economizados via ');
+    metricsDesc.createEl('strong', { text: 'Passport Index Architecture (PIA)' });
+    metricsDesc.appendText(': passports compactos (~300B) substituem conteúdo bruto (~5KB) em chamadas agênticas.');
+
+    new Setting(containerEl)
+      .setName('Mostrar tokens economizados no status bar')
+      .setDesc('Exibe formato "Zeus: 1245 docs · 18.3k tok saved". Baseline configurável abaixo.')
+      .addToggle(t => t.setValue(this.plugin.settings.showTokenSavedInStatusBar).onChange(async v => {
+        this.plugin.settings.showTokenSavedInStatusBar = v;
+        await this.plugin.saveSettings();
+        this.plugin.updateStatusBar('idle', null);
+      }));
+
+    new Setting(containerEl)
+      .setName('Intervalo de refresh do status bar (ms)')
+      .setDesc('Atualiza tokens economizados periodicamente. Default 30000 (30s). Aumente para reduzir overhead, diminua para feedback mais responsivo.')
+      .addSlider(s => s.setLimits(5000, 120000, 5000).setValue(this.plugin.settings.statusBarRefreshIntervalMs).setDynamicTooltip().onChange(async v => {
+        this.plugin.settings.statusBarRefreshIntervalMs = v;
+        await this.plugin.saveSettings();
+        if (this.plugin._statusBarTimer) {
+          clearInterval(this.plugin._statusBarTimer);
+          this.plugin._statusBarTimer = setInterval(() => {
+            if (this.plugin._lastStatusBarState === 'idle' || !this.plugin._lastStatusBarState) {
+              this.plugin.updateStatusBar('idle', null);
+            }
+          }, v);
+        }
+      }));
+
+    new Setting(containerEl)
+      .setName('Token baseline (raw sem PIA)')
+      .setDesc('Tokens médios estimados por request se carga raw fosse enviada ao invés de passport. Default 1250 (~5KB/4). Ajuste se notas do vault forem tipicamente maiores/menores.')
+      .addSlider(s => s.setLimits(250, 5000, 50).setValue(this.plugin.settings.rawTokenBaseline).setDynamicTooltip().onChange(async v => {
+        this.plugin.settings.rawTokenBaseline = v;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('Reset métricas')
+      .setDesc('Zera contadores de tokens, bytes e requests do HTTP client. Útil após mudar baseline ou debugar.')
+      .addButton(b => b.setButtonText('Reset').onClick(() => {
+        if (this.plugin.httpClient) this.plugin.httpClient.resetMetrics();
+        new Notice('Zeus: métricas zeradas');
+        this.plugin.updateStatusBar('idle', null);
+      }));
+
+    // ────────────────────────────────────────────────────────────────────
+    // v2.0 — Apple Cloud Private (ACP / PCC)
+    // ────────────────────────────────────────────────────────────────────
+    containerEl.createEl('h3', { text: 'v2.0 — Apple Cloud Private (PCC)' });
+    const pccDesc = containerEl.createEl('p', { cls: 'setting-item-description' });
+    pccDesc.appendText('Private Cloud Compute (PCC) é a camada de cloud do Apple Intelligence — modelos servidor-side rodam em hardware Apple verificável criptograficamente, sem reter dados. Usa sua assinatura Apple Intelligence já ativa. ');
+    pccDesc.createEl('strong', { text: 'Apenas para queries que excedem capacidade on-device' });
+    pccDesc.appendText(' (notas grandes, agent multi-step com janela 4096 estourada). Requer macOS 26+ Apple Intelligence ativo no device do daemon.');
+
+    new Setting(containerEl)
+      .setName('Modo PCC')
+      .setDesc('off = só on-device (privacy máximo, default). opt-in = client envia header X-Zeus-Allow-Pcc:1; daemon decide caso a caso. auto = daemon roteia para PCC quando on-device excede capacidade.')
+      .addDropdown(d => d
+        .addOption('off', 'off — só on-device (default)')
+        .addOption('opt-in', 'opt-in — header X-Zeus-Allow-Pcc:1')
+        .addOption('auto', 'auto — daemon decide')
+        .setValue(this.plugin.settings.pccMode)
+        .onChange(async v => {
+          this.plugin.settings.pccMode = v;
+          await this.plugin.saveSettings();
+          if (this.plugin.httpClient) this.plugin.httpClient.setPccMode(v);
+          this.plugin.updateStatusBar('idle', null);
+        }));
+
+    new Setting(containerEl)
+      .setName('Indicador visual PCC no status bar')
+      .setDesc('Quando PCC é usado, status bar exibe "☁️PCC×N" (N = contagem de requests roteadas via PCC nesta sessão). Default ON quando pccMode ≠ off.')
+      .addToggle(t => t.setValue(this.plugin.settings.pccVisualIndicator).onChange(async v => {
+        this.plugin.settings.pccVisualIndicator = v;
+        await this.plugin.saveSettings();
+        this.plugin.updateStatusBar('idle', null);
+      }));
+
+    new Setting(containerEl)
+      .setName('Status PCC')
+      .setDesc('Inspeciona modo atual e contadores de uso PCC desde a última sessão.')
+      .addButton(b => b.setButtonText('Mostrar').onClick(() => {
+        if (!this.plugin.httpClient) { new Notice('Zeus: HTTP client indisponível'); return; }
+        const s = this.plugin.httpClient.getPccStatus();
+        new Notice(
+          `Zeus PCC\nmodo: ${s.mode}\núltima req via PCC: ${s.lastUsed ? 'sim' : 'não'}\ntotal PCC nesta sessão: ${s.totalUsageCount}`,
+          8000,
+        );
+      }));
+
+    // ────────────────────────────────────────────────────────────────────
+    // Ações finais
+    // ────────────────────────────────────────────────────────────────────
     containerEl.createEl('h3', { text: 'Ações' });
     new Setting(containerEl)
       .setName('Reindex completo')
@@ -2796,6 +2905,21 @@ class ZeusPlugin extends Plugin {
     this.statusBarEl.onclick = () => this.activateStatusView();
     this.updateStatusBar('idle', null);
 
+    // v2.0 — propaga pccMode para o HTTP client
+    if (this.httpClient && typeof this.httpClient.setPccMode === 'function') {
+      this.httpClient.setPccMode(this.settings.pccMode || 'off');
+    }
+
+    // v1.1 — refresh periódico do status bar com token-saved + PCC indicator.
+    // Só atualiza quando o último estado foi 'idle' — evita sobrescrever indexing/embedding.
+    const refreshMs = this.settings.statusBarRefreshIntervalMs || 30000;
+    this._statusBarTimer = setInterval(() => {
+      if (this._lastStatusBarState === 'idle' || !this._lastStatusBarState) {
+        this.updateStatusBar('idle', null);
+      }
+    }, refreshMs);
+    this.register(() => clearInterval(this._statusBarTimer));
+
     if (isMac() && this.settings.indexOnSave) {
       this.registerEvent(this.app.vault.on('modify', file => {
         if (file instanceof TFile) this.scheduleIncrementalIndex();
@@ -3001,8 +3125,10 @@ class ZeusPlugin extends Plugin {
   }
 
   // v0.8 — persistent calibration UI (Smart Connections-style)
+  // v1.1 — Token-saved metrics + PCC indicator (auto-injetados no estado 'idle')
   updateStatusBar(state, info) {
     if (!this.statusBarEl) return;
+    this._lastStatusBarState = state;
     const emb = this.searcher ? this.searcher.embeddings.size : 0;
     let text;
     if (state === 'indexing') {
@@ -3013,8 +3139,38 @@ class ZeusPlugin extends Plugin {
       text = `⚠️ Zeus daemon offline`;
     } else {
       text = `✓ Zeus: ${emb} docs`;
+      // v1.1 — token-saved metrics
+      if (this.settings.showTokenSavedInStatusBar && this.httpClient) {
+        const saved = this._estimateTokensSaved();
+        if (saved >= 100) text += ` · ${this._fmtTokens(saved)} saved`;
+      }
+      // v2.0 — PCC visual indicator
+      if (this.settings.pccVisualIndicator && this.httpClient) {
+        const pcc = this.httpClient.getPccStatus();
+        if (pcc.mode !== 'off' && pcc.totalUsageCount > 0) {
+          text += ` · ☁️PCC×${pcc.totalUsageCount}`;
+        }
+      }
     }
     this.statusBarEl.setText(text);
+  }
+
+  // v1.1 — Tokens economizados via PIA (Passport Index Architecture):
+  // Cada request via daemon devolve um passport compacto (~300B) ao invés do
+  // conteúdo bruto (~5KB médio). Estimativa: tokens_saved = (raw_baseline -
+  // actual_tokens) por request, somado ao longo da sessão.
+  _estimateTokensSaved() {
+    if (!this.httpClient) return 0;
+    const m = this.httpClient.getMetrics();
+    const actualTokens = m.estimatedTokens || 0;
+    const baseline = (this.settings.rawTokenBaseline || 1250) * m.requests;
+    return Math.max(0, baseline - actualTokens);
+  }
+
+  _fmtTokens(n) {
+    if (n < 1000) return `${n} tok`;
+    if (n < 1e6) return `${(n / 1000).toFixed(1)}k tok`;
+    return `${(n / 1e6).toFixed(2)}M tok`;
   }
 
   refreshSmartView() {

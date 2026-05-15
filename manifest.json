@@ -1,9 +1,9 @@
 {
   "id": "zeus",
   "name": "Zeus — Apple-native Search & Connections",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "minAppVersion": "1.5.0",
-  "description": "Multi-modal Apple ecosystem-native search & connections. Passport Index Architecture v1.1 — token-efficient agent consumption via MCP-first surface (find_relevant_notes → get_passport → get_content) com métricas de token-saved no status bar e Apple Cloud Private (PCC) opcional. Substitui Omnisearch + Smart Connections com camadas afm (Foundation Models), av (Vision: classify+OCR+landmarks+EXIF), anl (NLContextualEmbedding 512-dim), aia (Intelligence: enrich+agent+graph com chunking hierárquico NexusSum) e HyDE query expansion. Indexação no Mac via afm CLI, leitura cross-device via iCloud + Tailscale.",
+  "description": "Multi-modal Apple ecosystem-native search & connections. Passport Index Architecture v1.2 — token-efficient agent consumption via MCP-first surface (find_relevant_notes → get_passport → get_content) com métricas de token-saved no status bar e Apple Cloud Private (PCC) end-to-end (plugin opt-in + daemon Swift honra X-Zeus-Allow-Pcc com heurística calibrada). Substitui Omnisearch + Smart Connections com camadas afm (Foundation Models), av (Vision: classify+OCR+landmarks+EXIF), anl (NLContextualEmbedding 512-dim), aia (Intelligence: enrich+agent+graph com chunking hierárquico NexusSum) e HyDE query expansion. Indexação no Mac via afm CLI, leitura cross-device via iCloud + Tailscale.",
   "author": "Roger Maiocchi",
   "authorUrl": "https://maiocchi.adv.br",
   "isDesktopOnly": false

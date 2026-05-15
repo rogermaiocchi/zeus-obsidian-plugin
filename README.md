@@ -2,7 +2,7 @@
 
 > Substitui Omnisearch + Smart Connections com pipeline 100% Apple-native: Foundation Models, Vision, NaturalLanguage, CoreSpotlight. Indexação no Mac, leitura cross-device via iCloud + Tailscale.
 
-**Status:** `v1.1.0` — estável, em produção diária cross-device (Mac mini · MacBook Air · iPad · iPhone). Status bar com métricas de tokens economizados e integração Apple Cloud Private (PCC) prep. Ver [CHANGELOG](CHANGELOG.md).
+**Status:** `v1.2.0` — estável, em produção diária cross-device (Mac mini · MacBook Air · iPad · iPhone). Status bar com métricas de tokens economizados e **Apple Cloud Private (PCC) end-to-end**: plugin opt-in → daemon Swift honra `X-Zeus-Allow-Pcc` com heurística calibrada → response devolve `X-Zeus-Pcc-Used: 1`. Ver [CHANGELOG](CHANGELOG.md).
 
 ## Convenção ecumênica de prefixos
 

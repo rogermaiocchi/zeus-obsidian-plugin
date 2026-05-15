@@ -88,14 +88,21 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        // v1.2 — PCC permission: extrair header X-Zeus-Allow-Pcc da request.
+        // Client envia "1" (opt-in per request) ou "auto" (sempre que daemon
+        // achar necessário). Default "off" preserva privacy gate on-device.
+        let pccHeaderValue = head.headers.first(name: "X-Zeus-Allow-Pcc")
+            ?? head.headers.first(name: "x-zeus-allow-pcc")
+        let pccPermission = PccPermission.fromHeader(pccHeaderValue)
+
         // Off the event loop: NL / Vision / FoundationModels podem bloquear.
         let capturedContext = context
         let capturedSelf = self
         Thread.detachNewThread {
-            let result = capturedSelf.route(method: method, path: path, body: bodyString)
+            let result = capturedSelf.route(method: method, path: path, body: bodyString, pcc: pccPermission)
             capturedContext.eventLoop.execute {
                 guard capturedContext.channel.isActive else { return }
-                capturedSelf.writeJSON(context: capturedContext, status: result.status, dict: result.payload)
+                capturedSelf.writeJSON(context: capturedContext, status: result.status, dict: result.payload, pccUsed: result.pccUsed)
             }
         }
     }
@@ -105,9 +112,38 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
     private struct Response {
         let status: HTTPResponseStatus
         let payload: [String: Any]
+        // v1.2 — Apple Cloud Private (PCC) telemetry
+        // Quando true, response inclui header X-Zeus-Pcc-Used:1.
+        // Atualmente é heurística (FoundationModels SDK ainda não expõe API
+        // explícita de cloud-routing; macOS roteia internamente). Quando a
+        // Apple expuser API pública, esta flag passa a refletir routing real.
+        let pccUsed: Bool
+
+        init(status: HTTPResponseStatus, payload: [String: Any], pccUsed: Bool = false) {
+            self.status = status
+            self.payload = payload
+            self.pccUsed = pccUsed
+        }
     }
 
-    private func route(method: HTTPMethod, path: String, body: String) -> Response {
+    // v1.2 — PCC permission modes derived from request header `X-Zeus-Allow-Pcc`.
+    //   nil/missing | "0" | "off"  → .off
+    //   "1" | "true" | "opt-in"    → .optIn
+    //   "auto"                     → .auto
+    private enum PccPermission {
+        case off
+        case optIn
+        case auto
+
+        static func fromHeader(_ value: String?) -> PccPermission {
+            guard let v = value?.lowercased() else { return .off }
+            if v == "1" || v == "true" || v == "opt-in" || v == "optin" { return .optIn }
+            if v == "auto" { return .auto }
+            return .off
+        }
+    }
+
+    private func route(method: HTTPMethod, path: String, body: String, pcc: PccPermission = .off) -> Response {
         switch (method, path) {
         case (.GET, "/v1/health"):
             return Response(status: .ok, payload: self.handleHealth())
@@ -120,11 +156,11 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         case (.POST, "/v1/ocr"):
             return self.handleOCR(bodyJSON: body)
         case (.POST, "/v1/summarize"):
-            return self.handleSummarize(bodyJSON: body)
+            return self.handleSummarize(bodyJSON: body, pcc: pcc)
         case (.POST, "/v1/enrich"):
-            return self.handleEnrich(bodyJSON: body)
+            return self.handleEnrich(bodyJSON: body, pcc: pcc)
         case (.POST, "/v1/prompt"):
-            return self.handlePrompt(bodyJSON: body)
+            return self.handlePrompt(bodyJSON: body, pcc: pcc)
         case (.POST, "/v1/vision/classify"):
             return self.handleVisionClassify(bodyJSON: body)
         case (.POST, "/v1/vision/landmarks"):
@@ -492,7 +528,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
 
     // MARK: - /v1/summarize (FoundationModels)
 
-    private func handleSummarize(bodyJSON: String) -> Response {
+    private func handleSummarize(bodyJSON: String, pcc: PccPermission = .off) -> Response {
         guard let json = Self.parseJSON(bodyJSON),
               let text = json["text"] as? String, !text.isEmpty else {
             return Response(status: .badRequest, payload: ["error": "body inválido: requer {\"text\": \"...\"}"])
@@ -505,13 +541,14 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             instructions: instructions,
             prompt: text,
             maxTokens: maxTokens,
-            extraPayload: ["task": "summarize"]
+            extraPayload: ["task": "summarize"],
+            pcc: pcc
         )
     }
 
     // MARK: - /v1/enrich (FoundationModels + vault file)
 
-    private func handleEnrich(bodyJSON: String) -> Response {
+    private func handleEnrich(bodyJSON: String, pcc: PccPermission = .off) -> Response {
         guard let json = Self.parseJSON(bodyJSON) else {
             return Response(status: .badRequest, payload: [
                 "error": "body inválido: requer {\"note_content\": \"...\", \"note_path\": \"...\"}"
@@ -571,7 +608,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             instructions: instructions,
             prompt: prompt,
             maxTokens: 800,
-            extraPayload: ["task": "enrich", "note_path": notePath]
+            extraPayload: ["task": "enrich", "note_path": notePath],
+            pcc: pcc
         )
 
         // Se a FM respondeu, tentar extrair JSON estruturado.
@@ -580,7 +618,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 var merged = parsed
                 merged["note_path"] = notePath
                 merged["model"] = res.payload["model"] ?? "FoundationModels"
-                return Response(status: .ok, payload: merged)
+                merged["pcc_used"] = res.pccUsed
+                return Response(status: .ok, payload: merged, pccUsed: res.pccUsed)
             }
             return Response(status: .ok, payload: [
                 "suggested_links": [],
@@ -588,15 +627,16 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 "connections": [],
                 "raw": raw,
                 "note_path": notePath,
-                "model": res.payload["model"] ?? "FoundationModels"
-            ])
+                "model": res.payload["model"] ?? "FoundationModels",
+                "pcc_used": res.pccUsed
+            ], pccUsed: res.pccUsed)
         }
         return res
     }
 
     // MARK: - /v1/prompt (FoundationModels, free-form generation)
 
-    private func handlePrompt(bodyJSON: String) -> Response {
+    private func handlePrompt(bodyJSON: String, pcc: PccPermission = .off) -> Response {
         guard let json = Self.parseJSON(bodyJSON),
               let instruction = json["instruction"] as? String, !instruction.isEmpty else {
             return Response(status: .badRequest, payload: [
@@ -606,6 +646,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let maxTokens = (json["max_tokens"] as? Int) ?? 300
         let deterministic = (json["deterministic"] as? Bool) ?? true
         let _ = (json["prewarm"] as? Bool) ?? false // accepted but no-op (session prewarm is internal)
+
+        // v1.2 — PCC heurística (mesma lógica do runFoundationModel)
+        let pccUsed = self.shouldFlagPccUsed(pcc: pcc, promptChars: instruction.count, instructionsChars: 0, maxTokens: maxTokens)
 
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
@@ -641,8 +684,10 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     "output": resultText,
                     "model": "apple-foundationmodels-systemlanguagemodel",
                     "deterministic": deterministic,
-                    "max_tokens": maxTokens
-                ])
+                    "max_tokens": maxTokens,
+                    "pcc_permission": "\(pcc)",
+                    "pcc_used": pccUsed
+                ], pccUsed: pccUsed)
             case .unavailable(let reason):
                 return Response(status: .serviceUnavailable, payload: [
                     "error": "FoundationModels indisponível: \(reason)"
@@ -1682,12 +1727,39 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
 
     // MARK: - FoundationModels runner (gated)
 
+    // v1.2 — Heurística PCC routing.
+    // FoundationModels SDK (macOS 26 atual) NÃO expõe API pública para forçar
+    // ou inspecionar cloud routing — Apple decide internamente via privacy
+    // gates + capacity. Nossa heurística marca pccUsed=true quando:
+    //   1. Client enviou permissão (pcc != .off), E
+    //   2. Carga é grande o suficiente para plausivelmente exceder on-device:
+    //      • prompt + instructions > 6000 chars (~1500 tokens), OU
+    //      • maxTokens > 1000, OU
+    //      • modo .auto (daemon decide sempre sinalizar quando há permissão)
+    // Quando Apple expuser API explícita (esperado em SDK futuro), esta heurística
+    // é substituída pela API real (ex.: GenerationOptions.allowsCloudCompute).
+    private func shouldFlagPccUsed(pcc: PccPermission, promptChars: Int, instructionsChars: Int, maxTokens: Int) -> Bool {
+        guard pcc != .off else { return false }
+        if pcc == .auto { return true }
+        // opt-in: somente sinaliza quando heurística sugere routing cloud
+        let totalChars = promptChars + instructionsChars
+        return totalChars > 6000 || maxTokens > 1000
+    }
+
     private func runFoundationModel(
         instructions: String,
         prompt: String,
         maxTokens: Int,
-        extraPayload: [String: Any]
+        extraPayload: [String: Any],
+        pcc: PccPermission = .off
     ) -> Response {
+        let pccUsed = self.shouldFlagPccUsed(
+            pcc: pcc,
+            promptChars: prompt.count,
+            instructionsChars: instructions.count,
+            maxTokens: maxTokens
+        )
+
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
             let model = SystemLanguageModel.default
@@ -1715,10 +1787,12 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 }
                 var payload: [String: Any] = [
                     "text": resultText,
-                    "model": "apple-foundationmodels-systemlanguagemodel"
+                    "model": "apple-foundationmodels-systemlanguagemodel",
+                    "pcc_permission": "\(pcc)",
+                    "pcc_used": pccUsed
                 ]
                 for (k, v) in extraPayload { payload[k] = v }
-                return Response(status: .ok, payload: payload)
+                return Response(status: .ok, payload: payload, pccUsed: pccUsed)
             case .unavailable(let reason):
                 return Response(status: .serviceUnavailable, payload: [
                     "error": "FoundationModels indisponível: \(reason)"
@@ -2225,12 +2299,18 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         return parseJSON(candidate)
     }
 
-    private func writeJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, dict: [String: Any]) {
+    private func writeJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, dict: [String: Any], pccUsed: Bool = false) {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "application/json; charset=utf-8")
         headers.add(name: "Access-Control-Allow-Origin", value: "*")
         headers.add(name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS")
-        headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type")
+        headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type, X-Zeus-Allow-Pcc")
+        headers.add(name: "Access-Control-Expose-Headers", value: "X-Zeus-Pcc-Used")
+        // v1.2 — PCC telemetry: sinaliza ao client que esta response foi
+        // (heurística) roteada via Private Cloud Compute.
+        if pccUsed {
+            headers.add(name: "X-Zeus-Pcc-Used", value: "1")
+        }
         let body: ByteBuffer?
         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.fragmentsAllowed]) {
             var buf = context.channel.allocator.buffer(capacity: data.count)

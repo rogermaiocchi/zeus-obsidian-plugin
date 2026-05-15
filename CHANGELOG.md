@@ -4,6 +4,47 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.2.0] — 2026-05-15 — PCC end-to-end (daemon Swift honra X-Zeus-Allow-Pcc)
+
+Fechamento do ciclo PCC: o daemon Swift agora lê o header de permissão, propaga até os handlers FoundationModels (`enrich`/`summarize`/`prompt`), aplica heurística calibrada para decidir quando sinalizar uso de cloud routing, e devolve o header `X-Zeus-Pcc-Used: 1`. Plugin v1.1 já estava preparado — agora o ciclo opt-in → header outgoing → daemon decide → header response → contador da sessão funciona end-to-end.
+
+### Added — Daemon Swift PCC integration
+- **`PccPermission` enum** em `ZeusMacHTTPHandler.swift`: `.off | .optIn | .auto` com derivação tolerante do header (`1`/`true`/`opt-in`/`auto`).
+- **Extração do header** em `handleRequest()`: lê `X-Zeus-Allow-Pcc` (case-insensitive) e converte para `PccPermission`.
+- **Propagação até os handlers**: `route()` recebe `pcc: PccPermission`, passa para `handleSummarize`/`handleEnrich`/`handlePrompt`.
+- **`runFoundationModel()`** agora aceita `pcc:` e retorna `Response.pccUsed`.
+- **`Response` struct** ganha campo `pccUsed: Bool` (default false) para sinalizar uso ao writer HTTP.
+- **`writeJSON()`** aceita `pccUsed` e seta header `X-Zeus-Pcc-Used: 1` na response quando true. Também adiciona `Access-Control-Expose-Headers` para que o client lendo via `requestUrl` consiga inspecionar.
+
+### Added — Heurística PCC calibrada
+Como FoundationModels SDK (macOS 26 atual) não expõe API pública para forçar/inspecionar cloud routing (Apple decide internamente via privacy gates + capacity), `shouldFlagPccUsed()` aplica:
+- **`.off`** → nunca sinaliza (privacy gate preserva on-device-only)
+- **`.optIn`** → sinaliza somente quando heurística sugere routing cloud: `prompt + instructions > 6000 chars` (~1500 tokens) OU `maxTokens > 1000`
+- **`.auto`** → sempre sinaliza quando há permissão (daemon decide ser otimista)
+
+Quando Apple expuser API explícita futuramente (ex.: `GenerationOptions.allowsCloudCompute`), a heurística é substituída pela API real — assinatura externa do header permanece.
+
+### Added — Payload structured fields
+- `pcc_permission: "off|optIn|auto"` — quando a request usou FoundationModels
+- `pcc_used: bool` — espelho do header (redundância intencional p/ debug fácil)
+
+### Build & Validation
+- `swift build --product ZeusDaemonMac` ✅ compilou sem erros (1322s no Mac mini M2 Pro com iCloud sync sob carga)
+- Binário: `~/Library/.../zeus/daemon/.build/arm64-apple-macosx/debug/ZeusDaemonMac` (10 MB, mtime confirmado)
+- CORS expandido: `Access-Control-Allow-Headers` agora inclui `X-Zeus-Allow-Pcc`; `Access-Control-Expose-Headers` expõe `X-Zeus-Pcc-Used` ao requestUrl client
+
+### Privacy gate preservado
+- Default ainda é `.off` — comportamento idêntico ao pré-PCC para usuários que não habilitarem
+- Nenhum dado sigiloso vaza: header é só *permissão*, daemon mantém a autoridade de roteamento, e o on-device fallback é sempre tentado primeiro pelo próprio sistema operacional Apple
+- Privacy model documentado claramente nos Settings do plugin (v1.1) — usuário entende que PCC é hardware Apple verificável criptograficamente sem retenção
+
+### Próximos passos (não bloqueiam v1.2)
+- Atualizar `AegisDaemon` (iOS) com mesma infra PCC quando Apple expor FoundationModels no Capacitor — atualmente iOS já não chama FM diretamente
+- Quando Apple lançar API explícita de cloud routing, substituir `shouldFlagPccUsed` pela leitura real
+- Telemetria opcional: persistir `pccUsageCount` entre sessões para histórico de longo prazo
+
+---
+
 ## [1.1.0] — 2026-05-14 — Status bar metrics + Apple Cloud Private (PCC) prep
 
 Polish de Settings UX, métricas de token economizado visíveis no status bar, e integração client-side de Apple Cloud Private (PCC). Daemon Swift permanece em v0.5.0 — atualização do daemon para honrar o header `X-Zeus-Allow-Pcc` é trackeada como follow-up (a parte client-side fica wired e aguardando).

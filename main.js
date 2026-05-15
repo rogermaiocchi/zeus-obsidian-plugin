@@ -2817,6 +2817,17 @@ class ZeusPlugin extends Plugin {
       });
     }
 
+    // v0.13.1 — Auto-open Smart View pane on plugin load (Smart Connections-style)
+    // Only opens if no zeus-smart-view leaf already exists (respect user's preference)
+    this.app.workspace.onLayoutReady(() => {
+      setTimeout(() => {
+        const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_SMART);
+        if (existing.length === 0) {
+          this.activateSmartView().catch(e => console.warn('[zeus] auto-open smart view failed:', e.message));
+        }
+      }, 1500);
+    });
+
     // v0.10.0 — debounced single-file passport re-extract via coordinator
     // Only when scheduler is enabled (it's the orchestrator of the same flow).
     if (this.settings.schedulerEnabled) {

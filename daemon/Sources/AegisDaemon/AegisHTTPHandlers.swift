@@ -18,6 +18,12 @@ import ImageIO
 #if canImport(FoundationModels)
 import FoundationModels
 #endif
+#if canImport(Speech)
+import Speech
+#endif
+#if canImport(AVFoundation)
+import AVFoundation
+#endif
 
 // Handlers HTTP do AegisHTTPServer. Roteia para:
 //   GET  /v1/health           → status + disponibilidade NL/Vision/FoundationModels
@@ -153,6 +159,14 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             return self.handlePassportClaim(bodyJSON: body)
         case (.POST, "/v1/passport/release"):
             return self.handlePassportRelease(bodyJSON: body)
+        // v1.3 — afm refine (Writing Tools nativo via FoundationModels)
+        case (.POST, "/v1/afm/refine"):
+            return self.handleRefine(bodyJSON: body)
+        // v1.3 — asp transcribe (dual-engine SA + SF fallback)
+        case (.POST, "/v1/asp/transcribe"):
+            return self.handleASPTranscribe(bodyJSON: body)
+        case (.POST, "/v1/asp/vad"):
+            return self.handleASPVAD(bodyJSON: body)
         default:
             return Response(status: .notFound, payload: [
                 "error": "not_found",
@@ -167,7 +181,9 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                     "POST /v1/vision/classify", "POST /v1/vision/landmarks",
                     "POST /v1/passport/extract", "POST /v1/passport/batch-extract",
                     "POST /v1/passport/find", "POST /v1/content/get",
-                    "POST /v1/passport/claim", "POST /v1/passport/release"
+                    "POST /v1/passport/claim", "POST /v1/passport/release",
+                    "POST /v1/afm/refine",
+                    "POST /v1/asp/transcribe", "POST /v1/asp/vad"
                 ]
             ])
         }
@@ -198,6 +214,11 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         }
         #endif
 
+        var speechAvailable = false
+        #if canImport(Speech)
+        speechAvailable = true
+        #endif
+
         #if os(iOS)
         let platform = "iOS"
         #elseif os(macOS)
@@ -206,25 +227,30 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         let platform = "unknown"
         #endif
 
+        let endpoints = [
+            "GET /v1/health", "GET /v1/tools",
+            "POST /v1/embed", "POST /v1/ocr",
+            "POST /v1/summarize", "POST /v1/enrich",
+            "POST /v1/agent", "POST /v1/prompt",
+            "POST /v1/cmd",
+            "POST /v1/vision/classify", "POST /v1/vision/landmarks",
+            "POST /v1/passport/extract", "POST /v1/passport/batch-extract",
+            "POST /v1/passport/find", "POST /v1/content/get",
+            "POST /v1/passport/claim", "POST /v1/passport/release",
+            "POST /v1/afm/refine",
+            "POST /v1/asp/transcribe", "POST /v1/asp/vad"
+        ]
         return [
             "status": "ok",
             "fm_available": fmAvailable,
             "nl_available": nlAvailable,
             "vision_available": visionAvailable,
+            "speech_available": speechAvailable,
             "model": modelName,
-            "version": "0.2.0",
+            "version": "0.3.0",
             "platform": platform,
-            "endpoints": [
-                "GET /v1/health", "GET /v1/tools",
-                "POST /v1/embed", "POST /v1/ocr",
-                "POST /v1/summarize", "POST /v1/enrich",
-                "POST /v1/agent", "POST /v1/prompt",
-                "POST /v1/cmd",
-                "POST /v1/vision/classify", "POST /v1/vision/landmarks",
-                "POST /v1/passport/extract", "POST /v1/passport/batch-extract",
-                "POST /v1/passport/find", "POST /v1/content/get",
-                "POST /v1/passport/claim", "POST /v1/passport/release"
-            ]
+            "endpoints": endpoints,
+            "endpoint_count": endpoints.count
         ]
     }
 
@@ -1521,6 +1547,352 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 "reason": "remove_failed: \(error)"
             ])
         }
+    }
+
+    // MARK: - /v1/afm/refine (v1.3 — Writing Tools nativo via FoundationModels)
+
+    private func handleRefine(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"mode\": \"proofread|rewrite|simplify\"}"
+            ])
+        }
+        let mode = ((json["mode"] as? String) ?? "proofread").lowercased()
+        let tone = (json["tone"] as? String)?.lowercased()
+        let language = (json["language"] as? String)?.lowercased()
+        let maxTokens = (json["max_tokens"] as? Int) ?? 800
+
+        let languageDirective: String
+        switch language {
+        case "pt", "pt-br", "portuguese":
+            languageDirective = "Responda em português brasileiro."
+        case "en", "english":
+            languageDirective = "Respond in English."
+        default:
+            languageDirective = "Mantenha o idioma original do texto."
+        }
+
+        let instructions: String
+        switch mode {
+        case "rewrite":
+            let toneDirective: String
+            switch tone {
+            case "academic":
+                toneDirective = "Adote tom acadêmico, vocabulário técnico, estrutura formal."
+            case "professional":
+                toneDirective = "Adote tom profissional, claro e objetivo."
+            case "casual":
+                toneDirective = "Adote tom conversacional e acessível."
+            default:
+                toneDirective = "Preserve o tom do texto original."
+            }
+            instructions = """
+            Você é um editor. Reescreva o texto preservando o sentido.
+            \(toneDirective) \(languageDirective)
+            Retorne APENAS o texto reescrito, sem explicações.
+            """
+        case "simplify":
+            instructions = """
+            Você é um editor que torna textos acessíveis. Reescreva com linguagem clara,
+            frases curtas, menos jargão. Preserve sentido técnico essencial.
+            \(languageDirective) Retorne APENAS o texto simplificado.
+            """
+        default: // proofread
+            instructions = """
+            Você é um revisor. Corrija gramática, ortografia, pontuação.
+            NÃO mude estilo, tom ou vocabulário — apenas corrija erros.
+            \(languageDirective) Retorne APENAS o texto corrigido.
+            """
+        }
+
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: maxTokens,
+            extraPayload: [
+                "task": "refine",
+                "mode": mode,
+                "tone": tone ?? "",
+                "language": language ?? "auto"
+            ]
+        )
+    }
+
+    // MARK: - /v1/asp/transcribe (v1.3 — dual-engine: SA + SF fallback)
+
+    private func handleASPTranscribe(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"/path/to/audio.m4a\"}"
+            ])
+        }
+        let localeID = (json["locale"] as? String) ?? Locale.current.identifier
+        let engineRequested = ((json["engine"] as? String) ?? "auto").lowercased()
+
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return Response(status: .badRequest, payload: [
+                "error": "arquivo de áudio não encontrado: \(url.path)"
+            ])
+        }
+
+        #if canImport(Speech) && canImport(AVFoundation)
+        let asset = AVURLAsset(url: url)
+        let durationSeconds = CMTimeGetSeconds(asset.duration)
+
+        // Engine SA (SpeechAnalyzer iOS 26+/macOS 26+) — tenta primeiro em "auto" ou "sa"
+        if #available(iOS 26.0, macOS 26.0, *), engineRequested != "sf" {
+            if let saResult = self.transcribeWithSpeechAnalyzer(url: url, localeID: localeID, durationSeconds: durationSeconds) {
+                return saResult
+            }
+            if engineRequested == "sa" {
+                return Response(status: .internalServerError, payload: [
+                    "error": "SpeechAnalyzer falhou (asset missing ou unsupported locale)"
+                ])
+            }
+            // auto: fallback SF
+        }
+
+        // Engine SF (SFSpeechRecognizer) — estável iOS 10+ / macOS 10.15+
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeID)) else {
+            return Response(status: .serviceUnavailable, payload: [
+                "error": "SFSpeechRecognizer indisponível para locale \(localeID)"
+            ])
+        }
+        guard recognizer.isAvailable else {
+            return Response(status: .serviceUnavailable, payload: [
+                "error": "SFSpeechRecognizer isAvailable=false para \(localeID)"
+            ])
+        }
+
+        let request = SFSpeechURLRecognitionRequest(url: url)
+        request.shouldReportPartialResults = false
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+
+        let sem = DispatchSemaphore(value: 0)
+        var resultText = ""
+        var resultError: String? = nil
+
+        let task = recognizer.recognitionTask(with: request) { (result, error) in
+            if let err = error as NSError? {
+                if err.domain == "kAFAssistantErrorDomain" && err.code == 1700 {
+                    resultText = ""
+                } else {
+                    resultError = "SFSpeechRecognizer falhou: \(err.localizedDescription) [\(err.domain) \(err.code)]"
+                }
+                sem.signal()
+                return
+            }
+            guard let result = result else { return }
+            if result.isFinal {
+                resultText = result.bestTranscription.formattedString
+                sem.signal()
+            }
+        }
+
+        let timeoutSec = max(30.0, min(600.0, durationSeconds * 3 + 30))
+        let waitResult = sem.wait(timeout: .now() + .seconds(Int(timeoutSec)))
+        if waitResult == .timedOut {
+            task.cancel()
+            return Response(status: .gatewayTimeout, payload: [
+                "error": "SFSpeechRecognizer timeout (\(Int(timeoutSec))s)"
+            ])
+        }
+
+        if let err = resultError {
+            return Response(status: .internalServerError, payload: ["error": err])
+        }
+        return Response(status: .ok, payload: [
+            "text": resultText,
+            "duration_seconds": durationSeconds,
+            "locale": localeID,
+            "on_device": recognizer.supportsOnDeviceRecognition,
+            "engine_used": "sf",
+            "model": "apple-sfspeechrecognizer",
+            "task": "asp_transcribe"
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "Speech / AVFoundation indisponível neste build"
+        ])
+        #endif
+    }
+
+    // Engine SA: SpeechAnalyzer (iOS 26+/macOS 26+) — async paralelo + asset prefetch
+    #if canImport(Speech) && canImport(AVFoundation)
+    @available(iOS 26.0, macOS 26.0, *)
+    private func transcribeWithSpeechAnalyzer(
+        url: URL,
+        localeID: String,
+        durationSeconds: Double
+    ) -> Response? {
+        let sem = DispatchSemaphore(value: 0)
+        var resultText = ""
+        var resultError: String? = nil
+        var assetInstalled = false
+
+        Task {
+            do {
+                let locale = Locale(identifier: localeID)
+                let bcp47 = locale.identifier(.bcp47)
+
+                guard SpeechTranscriber.isAvailable else {
+                    resultError = "SpeechTranscriber.isAvailable=false"
+                    sem.signal()
+                    return
+                }
+                let supportedLocales = await SpeechTranscriber.supportedLocales
+                guard supportedLocales.contains(where: { $0.identifier(.bcp47) == bcp47 }) else {
+                    resultError = "locale \(bcp47) não suportado"
+                    sem.signal()
+                    return
+                }
+
+                let installedLocales = await SpeechTranscriber.installedLocales
+                let needsInstall = !installedLocales.contains(where: { $0.identifier(.bcp47) == bcp47 })
+
+                let transcriber = SpeechTranscriber(
+                    locale: locale,
+                    transcriptionOptions: [],
+                    reportingOptions: [],
+                    attributeOptions: []
+                )
+                let modules: [any SpeechModule] = [transcriber]
+
+                if needsInstall {
+                    if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
+                        try await request.downloadAndInstall()
+                        assetInstalled = true
+                    } else {
+                        resultError = "asset não disponível para download (\(bcp47))"
+                        sem.signal()
+                        return
+                    }
+                }
+                try await AssetInventory.reserve(locale: locale)
+
+                let analyzer = SpeechAnalyzer(modules: modules)
+                let (inputStream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+                try await analyzer.start(inputSequence: inputStream)
+
+                let reader = Task<String, Error> {
+                    var transcript = ""
+                    for try await result in transcriber.results {
+                        transcript += String(result.text.characters)
+                    }
+                    return transcript
+                }
+
+                let audioFile = try AVAudioFile(forReading: url)
+                let sourceFormat = audioFile.processingFormat
+                let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) ?? sourceFormat
+
+                let totalFrames = AVAudioFrameCount(audioFile.length)
+                guard let fullInput = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: totalFrames) else {
+                    resultError = "falha alocando AVAudioPCMBuffer"
+                    sem.signal()
+                    return
+                }
+                try audioFile.read(into: fullInput)
+
+                let bufferToSend: AVAudioPCMBuffer
+                if sourceFormat != targetFormat, let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) {
+                    let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
+                    let outFrames = AVAudioFrameCount(Double(fullInput.frameLength) * ratio) + 4096
+                    guard let fullOutput = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else {
+                        resultError = "falha alocando output PCM buffer"
+                        sem.signal()
+                        return
+                    }
+                    var fed = false
+                    var convErr: NSError?
+                    converter.convert(to: fullOutput, error: &convErr) { _, statusPtr in
+                        if fed { statusPtr.pointee = .endOfStream; return nil }
+                        fed = true
+                        statusPtr.pointee = .haveData
+                        return fullInput
+                    }
+                    if let convErr = convErr { throw convErr }
+                    bufferToSend = fullOutput
+                } else {
+                    bufferToSend = fullInput
+                }
+
+                continuation.yield(AnalyzerInput(buffer: bufferToSend))
+                continuation.finish()
+
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+                resultText = try await reader.value
+            } catch {
+                resultError = "SpeechAnalyzer falhou: \(error)"
+            }
+            sem.signal()
+        }
+
+        let timeoutSec = max(60.0, min(900.0, durationSeconds * 4 + 60))
+        let waitResult = sem.wait(timeout: .now() + .seconds(Int(timeoutSec)))
+        if waitResult == .timedOut {
+            return Response(status: .gatewayTimeout, payload: [
+                "error": "SpeechAnalyzer timeout (\(Int(timeoutSec))s — possível asset download em curso)"
+            ])
+        }
+        if resultError != nil {
+            FileHandle.standardError.write(Data("[AegisDaemon] SA fallback: \(resultError ?? "")\n".utf8))
+            return nil
+        }
+        return Response(status: .ok, payload: [
+            "text": resultText,
+            "duration_seconds": durationSeconds,
+            "locale": localeID,
+            "on_device": true,
+            "engine_used": "sa",
+            "asset_just_installed": assetInstalled,
+            "model": "apple-speechanalyzer-speechtranscriber",
+            "task": "asp_transcribe"
+        ])
+    }
+    #endif
+
+    // MARK: - /v1/asp/vad (v1.3 — Voice Activity Detection, pré-filtro)
+
+    private func handleASPVAD(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"/path/to/audio.m4a\"}"
+            ])
+        }
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return Response(status: .badRequest, payload: [
+                "error": "arquivo de áudio não encontrado: \(url.path)"
+            ])
+        }
+        #if canImport(AVFoundation)
+        do {
+            let audioFile = try AVAudioFile(forReading: url)
+            let sampleRate = audioFile.processingFormat.sampleRate
+            let durationSeconds = Double(audioFile.length) / sampleRate
+            let hasSpeech = durationSeconds >= 3.0
+            return Response(status: .ok, payload: [
+                "has_speech": hasSpeech,
+                "duration_seconds": durationSeconds,
+                "threshold_seconds": 3.0,
+                "model": "duration-heuristic",
+                "task": "asp_vad"
+            ])
+        } catch {
+            return Response(status: .badRequest, payload: [
+                "error": "não foi possível ler áudio: \(error)"
+            ])
+        }
+        #else
+        return Response(status: .serviceUnavailable, payload: ["error": "AVFoundation indisponível"])
+        #endif
     }
 
     // MARK: - FoundationModels runner (gated)

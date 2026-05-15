@@ -29,7 +29,8 @@
  *                     av landmarks (contagem faces) + acs/mdls (EXIF, GPS, data)
  *                   → todo combinado → anl embed
  *
- * Camadas de reasoning (opcionais, EXPERIMENTAL — janela 4096 tokens):
+ * Camadas de reasoning (opcionais, default OFF — janela 4096 tokens com
+ *  chunking hierárquico NexusSum para docs >10KB via HierarchicalProcessor):
  *   aia enrich     → links sugeridos + conexões explicadas
  *   aia agent      → Q&A multi-turn (react/plan-execute/reflexion)
  *   aia graph      → knowledge graph schema-validated
@@ -119,8 +120,9 @@ const DEFAULT_SETTINGS = {
   smartNeighborsCount: 8,
   excerptLength: 220,
   minDocChars: 30,
-  // FoundationModels reasoning layer (EXPERIMENTAL — janela 4096 tokens limita docs ≤~2KB)
-  enrichOnOpen: false,            // default off — habilite manualmente quando confortável com limitação
+  // FoundationModels reasoning layer (janela 4096 tokens; chunking hierárquico NexusSum
+  // ativa automaticamente para docs >10KB via hierarchicalThreshold)
+  enrichOnOpen: false,            // default off — opt-in via Settings
   enrichDebounceMs: 1500,
   enrichTimeoutMs: 60000,
   agentPattern: 'auto',

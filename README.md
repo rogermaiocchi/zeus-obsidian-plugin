@@ -1,6 +1,8 @@
 # Zeus — Apple Ecosystem-native Search & Connections for Obsidian
 
-> Substitui Omnisearch + Smart Connections com pipeline 100% Apple-native: Foundation Models, Vision, NaturalLanguage, CoreSpotlight. Indexação no Mac, leitura cross-device via iCloud.
+> Substitui Omnisearch + Smart Connections com pipeline 100% Apple-native: Foundation Models, Vision, NaturalLanguage, CoreSpotlight. Indexação no Mac, leitura cross-device via iCloud + Tailscale.
+
+**Status:** `v1.0.0` — estável, em produção diária cross-device (Mac mini · MacBook Air · iPad · iPhone). Ver [CHANGELOG](CHANGELOG.md).
 
 ## Convenção ecumênica de prefixos
 
@@ -49,9 +51,9 @@ Custo: +~30s de cold start por query (spawn fresh do FoundationModels). Default 
 - `Zeus: buscar (Apple NLContextualEmbedding)`
 - `Zeus: reindexar vault completo`
 - `Zeus: abrir painel de conexões`
-- `Zeus: enrich nota atual (FoundationModels)` ⚠️ exp
-- `Zeus: knowledge graph da nota atual (FoundationModels)` ⚠️ exp
-- `Zeus: perguntar ao vault (FoundationModels agent)` ⚠️ exp
+- `Zeus: enrich nota atual (FoundationModels)` — chunking hierárquico NexusSum para notas >10KB
+- `Zeus: knowledge graph da nota atual (FoundationModels)`
+- `Zeus: perguntar ao vault (FoundationModels agent)` — patterns react/plan-execute/reflexion
 - `Zeus: alternar HyDE query expansion`
 
 ## Cross-device (iCloud)

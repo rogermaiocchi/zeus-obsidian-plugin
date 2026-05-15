@@ -4,6 +4,49 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.0.0] — 2026-05-14 — Versão final estável
+
+Primeira release marcada como **estável de produção**. Todas as camadas funcionais e wired no plugin. Validado em uso diário cross-device (Mac mini · MacBook Air · iPad · iPhone) no vault `Documents`.
+
+### Promoted to stable
+- **`aia enrich`** — links sugeridos + conexões explicadas. Auto-fallback para `HierarchicalProcessor` (NexusSum pattern, ACL 2025 arXiv:2505.24575) em notas >10KB, resolvendo a limitação da janela 4096 tokens do FoundationModels.
+- **`aia agent`** — Q&A multi-turn com patterns `react | plan-execute | reflexion` via `ZeusAskVaultModal`.
+- **`aia graph-extract`** — knowledge graph schema-validated com render SVG modal.
+
+### Architecture (PIA v1.0)
+- 3 camadas: código (`afm` embeddings) → keywords/Feynman → resumos conectados/Luhmann
+- MCP-first surface: `find_relevant_notes` → `get_passport` → `get_content`
+- **81,5% de redução** em consumo de tokens agêntico vs carga raw
+- Real-time indexing ~20–50 ms/nota (paridade Apple Notes)
+- Daemon HTTP: 26 endpoints (Mac, SwiftNIO) + 22+ endpoints (AegisDaemon iOS)
+- Cross-device coordination via iCloud-synced lock files
+- Privacy gate: frontmatter `sigiloso` nunca sai do disco local
+
+### Pipeline multi-modal
+- `.md` → `anl embed` 512-dim
+- `.pdf` → `aocr --structured` (macOS 26+ layout-aware) → `anl embed`
+- imagens → `aocr` + `av classify` + `av landmarks` + `acs/mdls` → `anl embed`
+
+### Changed
+- Removidos labels `⚠️ exp` das camadas `aia` no README e nos comentários em `main.js`
+- README atualizado com seção de chunking hierárquico no comando `enrich`
+- `manifest.json` bumpado para v1.0.0; descrição menciona NexusSum + Tailscale
+
+### Stable feature set (locked for 1.x)
+- Busca semântica via NLContextualEmbedding 512-dim
+- HyDE query expansion (toggle Settings)
+- Smart View lateral com mini-graph SVG + chevron list
+- 7 comandos no Command Palette
+- Reindex incremental por SHA + mtime
+- Cross-device read-only no iOS via embeddings.jsonl
+
+### Roadmap pós-1.0 (não bloqueia release)
+- **v1.1** — Settings UX polish + métricas de token saved em status bar
+- **v2.0** — Apple Cloud Private (`acp`) — Private Cloud Compute para queries que excedem capacidade on-device
+- **v2.x** — Distribuição via Obsidian Community Plugins (atualmente repo privado)
+
+---
+
 ## [0.13.2] — 2026-05-14 — Marco MVP de produção
 
 Plugin estável em uso diário cross-device (Mac mini · MacBook Air · iPad · iPhone). Substitui Omnisearch + Smart Connections em produção no vault `Documents`.

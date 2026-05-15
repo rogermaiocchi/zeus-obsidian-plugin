@@ -2828,30 +2828,97 @@ class ZeusPlugin extends Plugin {
       }, 1500);
     });
 
-    // v0.10.0 — debounced single-file passport re-extract via coordinator
-    // Only when scheduler is enabled (it's the orchestrator of the same flow).
-    if (this.settings.schedulerEnabled) {
-      this._passportRefreshTimers = new Map();
-      this.registerEvent(this.app.vault.on('modify', file => {
-        if (!(file instanceof TFile) || file.extension !== 'md') return;
-        const rel = file.path;
-        clearTimeout(this._passportRefreshTimers.get(rel));
-        this._passportRefreshTimers.set(rel, setTimeout(async () => {
-          this._passportRefreshTimers.delete(rel);
-          try {
-            const claim = await this.coordinator.claim(rel);
-            if (!claim.claimed) return;
-            try {
-              await this.passport.buildOne(rel);
-            } finally {
-              await this.coordinator.release(rel);
-            }
-          } catch (e) {
-            console.warn('[zeus] debounced passport refresh failed for', rel, e.message);
+    // v0.13.2 — REAL-TIME indexação (Apple Notes-style)
+    // NLContextualEmbedding via ANE: ~15ms por nota. Daemon overhead: ~5ms.
+    // Total ~20-50ms imperceptível ao usuário.
+    //
+    // Pipeline em 2 estágios temporais:
+    //   T+500ms (fast): embed via /v1/embed (instant cosine update)
+    //   T+8s   (deep):  passport via afm enrich (FoundationModels reasoning)
+    //
+    // Eventos cobertos: modify, create, delete, rename (full coverage)
+    this._embedTimers = new Map();
+    this._passportTimers = new Map();
+
+    const scheduleEmbed = (rel, file) => {
+      clearTimeout(this._embedTimers.get(rel));
+      this._embedTimers.set(rel, setTimeout(async () => {
+        this._embedTimers.delete(rel);
+        try {
+          // Re-embed single file: read content, call daemon /v1/embed, update searcher.embeddings
+          const content = await this.app.vault.read(file);
+          const reachable = await this.httpClient.isAvailable();
+          if (!reachable) return;
+          const resp = await this.httpClient.embed(content.slice(0, 4000));
+          if (resp && resp.vectors && resp.vectors[0]) {
+            // Update in-memory + on-disk
+            const sha = await universal.sha256Hex(content);
+            const entry = { path: rel, sha, mtime: Date.now(), title: file.basename, vec: resp.vectors[0] };
+            this.searcher.embeddings.set(rel, entry);
+            this.indexer.saveEmbeddings(this.searcher.embeddings);
+            this.refreshSmartView();
+            console.log('[zeus] real-time embed:', rel, `dim=${resp.dim}`);
           }
-        }, 4000));
-      }));
-    }
+        } catch (e) {
+          console.warn('[zeus] real-time embed failed for', rel, e.message);
+        }
+      }, 500));   // 500ms debounce — Apple Notes-style instant
+    };
+
+    const schedulePassport = (rel) => {
+      if (!this.settings.schedulerEnabled) return;
+      clearTimeout(this._passportTimers.get(rel));
+      this._passportTimers.set(rel, setTimeout(async () => {
+        this._passportTimers.delete(rel);
+        try {
+          const claim = await this.coordinator.claim(rel);
+          if (!claim.claimed) return;
+          try {
+            await this.passport.buildOne(rel);
+          } finally {
+            await this.coordinator.release(rel);
+          }
+        } catch (e) {
+          console.warn('[zeus] passport refresh failed for', rel, e.message);
+        }
+      }, 8000));   // 8s — deferred deep reasoning
+    };
+
+    // Event: modify (note edited)
+    this.registerEvent(this.app.vault.on('modify', file => {
+      if (!(file instanceof TFile) || file.extension !== 'md') return;
+      scheduleEmbed(file.path, file);
+      schedulePassport(file.path);
+    }));
+
+    // Event: create (new note)
+    this.registerEvent(this.app.vault.on('create', file => {
+      if (!(file instanceof TFile) || file.extension !== 'md') return;
+      scheduleEmbed(file.path, file);
+      schedulePassport(file.path);
+    }));
+
+    // Event: delete (purge entry)
+    this.registerEvent(this.app.vault.on('delete', file => {
+      if (!(file instanceof TFile)) return;
+      this.searcher.embeddings.delete(file.path);
+      this.indexer.saveEmbeddings(this.searcher.embeddings);
+      this.refreshSmartView();
+      console.log('[zeus] real-time delete:', file.path);
+    }));
+
+    // Event: rename (update path)
+    this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      if (!(file instanceof TFile)) return;
+      const entry = this.searcher.embeddings.get(oldPath);
+      if (entry) {
+        this.searcher.embeddings.delete(oldPath);
+        entry.path = file.path;
+        this.searcher.embeddings.set(file.path, entry);
+        this.indexer.saveEmbeddings(this.searcher.embeddings);
+        console.log('[zeus] real-time rename:', oldPath, '→', file.path);
+      }
+    }));
 
     console.log('[zeus] loaded v0.11.2 — distributed coordinator + scheduler');
     trace('onload.complete');

@@ -4,6 +4,95 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.3.2] — 2026-05-15 — SpeechAnalyzer dual-engine (resolve deadlock async + asset prefetch)
+
+Resolve o bug de runtime do `SpeechAnalyzer` que motivou o pivote para `SFSpeechRecognizer` na v1.3.1. Padrão correto derivado de leitura dos repos production de CLIs de speech do GitHub: [`finnvoor/yap`](https://github.com/finnvoor/yap) (dictation CLI) e [`mrinalwadhwa/freeflow`](https://github.com/mrinalwadhwa/freeflow) (`SpeechAnalyzerStreamingProvider`).
+
+### Diagnóstico do bug original (v1.3.0)
+
+Causas cumulativas:
+
+1. **Deadlock async** — chamava `try await analyzerTask.value` ANTES de iterar `transcriber.results`. Pattern correto: `analyzer.start(inputSequence:)` retorna rápido (apenas inicia o pipeline); o reader que itera results precisa rodar EM PARALELO com push de buffers ao continuation. Sem reader paralelo, buffers não são consumidos → deadlock.
+2. **Asset prefetch ausente** — `SpeechTranscriber` exige modelo do locale instalado. Pattern correto: chamar `SpeechTranscriber.installedLocales` para verificar; se ausente, `AssetInventory.assetInstallationRequest(supporting: modules)` + `request.downloadAndInstall()` baixa o pacote (pt-BR ~200-500MB primeira vez, instantâneo nas seguintes).
+3. **Sample-rate conversion** — `AVAudioConverter.convertToBuffer:fromBuffer:` (Swift `convert(to:from:)`) **não suporta resample**. Para 44.1kHz→16kHz precisa do callback API `convertToBuffer:error:withInputFromBlock:` com lifecycle correto.
+
+### Added — Dual-engine via param `engine`
+
+- **`engine: "sa"`** — força `SpeechAnalyzer` (macOS 26+); erro 500 se asset missing ou unsupported
+- **`engine: "sf"`** — força `SFSpeechRecognizer` (estável macOS 10.15+)
+- **`engine: "auto"`** (default) — tenta SA primeiro, fallback gracioso para SF se SA falhar em runtime
+- Payload da response inclui `engine_used: "sa|sf"` para tracking
+- Payload da SA inclui `asset_just_installed: bool` quando primeira execução baixou modelo
+
+### Implementação correta da engine SA
+
+```swift
+// 1. Asset prefetch
+let installed = await SpeechTranscriber.installedLocales
+if !installed.contains(where: { $0.identifier(.bcp47) == bcp47 }) {
+    if let req = try await AssetInventory.assetInstallationRequest(supporting: modules) {
+        try await req.downloadAndInstall()
+    }
+}
+try await AssetInventory.reserve(locale: locale)
+
+// 2. Start analyzer (non-blocking)
+let analyzer = SpeechAnalyzer(modules: [transcriber])
+let (inputStream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+try await analyzer.start(inputSequence: inputStream)
+
+// 3. Reader Task em PARALELO (crítico — sem isso há deadlock)
+let reader = Task<String, Error> {
+    var transcript = ""
+    for try await result in transcriber.results {
+        transcript += String(result.text.characters)
+    }
+    return transcript
+}
+
+// 4. Single-buffer push (resolve resample via AVAudioConverter callback)
+//    AVAudioFile inteiro lido em UM buffer, convertido para targetFormat, 1× yield
+let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules)
+// ... callback de convert com fed=true após 1ª chamada, endOfStream depois
+continuation.yield(AnalyzerInput(buffer: fullOutput))
+continuation.finish()
+
+// 5. Finalize + collect
+try await analyzer.finalizeAndFinishThroughEndOfInput()
+resultText = try await reader.value
+```
+
+### Smoke tests validados
+
+| Cenário | Engine | Resultado | Latência |
+|---|---|---|---|
+| en-US `/tmp/test_en.wav` (5.36s) | `sa` | "Hello, this is a test of voice transcription using Apple Speech recognition on the Zeus Demon." (1 fonema: "Demon"/"daemon") | <1s |
+| pt-BR `/tmp/test.wav` (6.16s) | `sa` | "Olá, este é um teste de transcrição de voz usando os Pet Analiser da Apple Diamondseus." (fonéticos para nomes próprios) | 0.41s |
+| en-US `/tmp/test_en.wav` | `sf` (fallback) | (texto similar via SFSpeechRecognizer) | <1s |
+| `engine: "auto"` | tenta sa → cai sf se falhar | gracioso | — |
+
+### Pré-requisitos no Mac do usuário
+
+- macOS 26+ para engine `sa`. Engine `sf` funciona em macOS 10.15+
+- Para pt-BR via `sa`: asset precisa estar instalado. Se Siri/Live Transcription pt-BR já foram usados, o asset está disponível silenciosamente. Caso contrário, primeira chamada baixa (~200-500MB)
+- Privacy gate preservado: `on_device: true` em ambos os engines
+
+### Build & validation
+
+- `swift build --product ZeusDaemonMac` ✅ 5.84s (incremental)
+- 3 ciclos de install/restart até single-buffer mode estabilizar
+- 1 crash diagnosticado via stack trace (`AVAudioConverter.convertToBuffer:fromBuffer:` ObjC exception em sample-rate-conv)
+- Fontes consultadas: `finnvoor/yap` + `mrinalwadhwa/freeflow` (production CLIs de speech open-source)
+
+### Próximos passos (v1.4 ou v1.3.3)
+
+- Chunked streaming para áudios > 10min (single-buffer limit)
+- Endpoint `/v1/asp/install-locale` explícito para pré-download de assets
+- Métricas no plugin TS: contador `🎙️ N memos transcribed` no status bar
+- AegisDaemon iOS quando Speech estabilizar em Capacitor
+
+---
+
 ## [1.3.1] — 2026-05-15 — SFSpeechRecognizer pivot + main.js python-worker wire
 
 Patch release com 2 correções derivadas dos smoke tests pós-deploy da v1.3.0:

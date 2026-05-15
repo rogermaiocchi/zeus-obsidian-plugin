@@ -822,16 +822,20 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         )
     }
 
-    // MARK: - /v1/asp/transcribe (v1.3 — SFSpeechRecognizer on-device)
+    // MARK: - /v1/asp/transcribe (v1.3.2 — dual-engine: SpeechAnalyzer + SFSpeechRecognizer fallback)
     //
-    // Body: { "path": "/path/to/audio.m4a", "locale": "pt-BR" (optional, default: current) }
-    // Retorna: { "text": "...", "duration_seconds": N, "locale": "...", "model": "..." }
+    // Body: { "path": "/path/to/audio.m4a", "locale": "pt-BR" (optional),
+    //         "engine": "sa|sf|auto" (optional, default "auto") }
+    // Retorna: { "text": "...", "duration_seconds": N, "locale": "...",
+    //            "engine_used": "sa|sf", "model": "...", "on_device": bool }
     //
-    // Suporta .m4a, .wav, .mp3 e qualquer formato lido por AVURLAsset.
-    // Usa SFSpeechRecognizer + SFSpeechURLRecognitionRequest (estável macOS 10.15+),
-    // com requiresOnDeviceRecognition=true para preservar privacy gate.
-    // SpeechAnalyzer (macOS 26+) será adotado na v1.4 quando asset download
-    // estiver validado e a API async let de results estiver estabilizada.
+    // Engine SA (SpeechAnalyzer, macOS 26+): pattern derivado de finnvoor/yap +
+    // mrinalwadhwa/freeflow (production CLIs). Asset prefetch via AssetInventory.
+    // Reader Task itera transcriber.results EM PARALELO com push de buffers
+    // (fix do deadlock que existia em v1.3.0).
+    //
+    // Engine SF (SFSpeechRecognizer): fallback estável macOS 10.15+, usado
+    // quando "engine":"sf" explícito OU quando SA falha em runtime/asset missing.
     private func handleASPTranscribe(bodyJSON: String) -> Response {
         guard let json = Self.parseJSON(bodyJSON),
               let path = json["path"] as? String, !path.isEmpty else {
@@ -840,6 +844,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             ])
         }
         let localeID = (json["locale"] as? String) ?? Locale.current.identifier
+        let engineRequested = ((json["engine"] as? String) ?? "auto").lowercased()
 
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -853,6 +858,25 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let asset = AVURLAsset(url: url)
         let durationSeconds = CMTimeGetSeconds(asset.duration)
 
+        // Engine SA (SpeechAnalyzer macOS 26+) — tenta primeiro em mode "auto" ou "sa".
+        if #available(macOS 26.0, *), engineRequested != "sf" {
+            if let saResult = self.transcribeWithSpeechAnalyzer(
+                url: url,
+                localeID: localeID,
+                durationSeconds: durationSeconds
+            ) {
+                return saResult
+            }
+            // SA falhou silenciosamente — se engine "sa" explícito, retornar erro
+            if engineRequested == "sa" {
+                return Response(status: .internalServerError, payload: [
+                    "error": "SpeechAnalyzer falhou (asset missing ou unsupported locale). Tente engine='sf'."
+                ])
+            }
+            // engine "auto": fallback para SF
+        }
+
+        // Engine SF (SFSpeechRecognizer) — fallback estável.
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeID)) else {
             return Response(status: .serviceUnavailable, payload: [
                 "error": "SFSpeechRecognizer indisponível para locale \(localeID)"
@@ -912,6 +936,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             "duration_seconds": durationSeconds,
             "locale": localeID,
             "on_device": onDeviceUsed,
+            "engine_used": "sf",
             "model": "apple-sfspeechrecognizer",
             "task": "asp_transcribe"
         ])
@@ -921,6 +946,164 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         ])
         #endif
     }
+
+    // Engine SA: SpeechAnalyzer (macOS 26+) — pattern correto async paralelo + asset prefetch.
+    // Retorna nil em caso de falha silenciosa (caller decide fallback ou erro).
+    #if canImport(Speech) && canImport(AVFoundation)
+    @available(macOS 26.0, *)
+    private func transcribeWithSpeechAnalyzer(
+        url: URL,
+        localeID: String,
+        durationSeconds: Double
+    ) -> Response? {
+        let sem = DispatchSemaphore(value: 0)
+        var resultText = ""
+        var resultError: String? = nil
+        var assetInstalled = false
+
+        Task {
+            do {
+                let locale = Locale(identifier: localeID)
+                let bcp47 = locale.identifier(.bcp47)
+
+                guard SpeechTranscriber.isAvailable else {
+                    resultError = "SpeechTranscriber.isAvailable=false"
+                    sem.signal()
+                    return
+                }
+
+                let supportedLocales = await SpeechTranscriber.supportedLocales
+                guard supportedLocales.contains(where: { $0.identifier(.bcp47) == bcp47 }) else {
+                    resultError = "locale \(bcp47) não suportado por SpeechTranscriber"
+                    sem.signal()
+                    return
+                }
+
+                // Verifica se asset já instalado; se não, baixa (pode demorar).
+                let installedLocales = await SpeechTranscriber.installedLocales
+                let needsInstall = !installedLocales.contains(where: { $0.identifier(.bcp47) == bcp47 })
+
+                let transcriber = SpeechTranscriber(
+                    locale: locale,
+                    transcriptionOptions: [],
+                    reportingOptions: [],
+                    attributeOptions: []
+                )
+                let modules: [any SpeechModule] = [transcriber]
+
+                if needsInstall {
+                    if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
+                        try await request.downloadAndInstall()
+                        assetInstalled = true
+                    } else {
+                        resultError = "asset não disponível para download (\(bcp47))"
+                        sem.signal()
+                        return
+                    }
+                }
+
+                try await AssetInventory.reserve(locale: locale)
+
+                let analyzer = SpeechAnalyzer(modules: modules)
+                let (inputStream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+
+                // Start analyzer (não bloqueante; apenas inicia o pipeline)
+                try await analyzer.start(inputSequence: inputStream)
+
+                // Reader Task: itera results EM PARALELO com push de buffers.
+                // Sem isso ocorre deadlock — buffers não são consumidos.
+                let reader = Task<String, Error> {
+                    var transcript = ""
+                    for try await result in transcriber.results {
+                        transcript += String(result.text.characters)
+                    }
+                    return transcript
+                }
+
+                // Determine target format do analyzer e prepara converter.
+                let audioFile = try AVAudioFile(forReading: url)
+                let sourceFormat = audioFile.processingFormat
+                let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) ?? sourceFormat
+
+                // Ler arquivo INTEIRO em um único buffer (limit ~10min áudio @ 44.1kHz mono).
+                // Evita complicações de resample em chunks (convert sync 1:1 não suporta
+                // sample-rate change; callback chunked tem race conditions).
+                let totalFrames = AVAudioFrameCount(audioFile.length)
+                guard let fullInput = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: totalFrames) else {
+                    resultError = "falha alocando AVAudioPCMBuffer (\(totalFrames) frames)"
+                    sem.signal()
+                    return
+                }
+                try audioFile.read(into: fullInput)
+
+                let bufferToSend: AVAudioPCMBuffer
+                if sourceFormat != targetFormat, let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) {
+                    let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
+                    let outFrames = AVAudioFrameCount(Double(fullInput.frameLength) * ratio) + 4096
+                    guard let fullOutput = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else {
+                        resultError = "falha alocando output PCM buffer"
+                        sem.signal()
+                        return
+                    }
+                    // Callback fornece o input uma vez, depois sinaliza fim de stream.
+                    var fed = false
+                    var convErr: NSError?
+                    converter.convert(to: fullOutput, error: &convErr) { _, statusPtr in
+                        if fed {
+                            statusPtr.pointee = .endOfStream
+                            return nil
+                        }
+                        fed = true
+                        statusPtr.pointee = .haveData
+                        return fullInput
+                    }
+                    if let convErr = convErr { throw convErr }
+                    bufferToSend = fullOutput
+                } else {
+                    bufferToSend = fullInput
+                }
+
+                // Push o buffer único convertido. SpeechAnalyzer aceita o arquivo
+                // inteiro em uma só AnalyzerInput desde que o buffer caiba em RAM.
+                continuation.yield(AnalyzerInput(buffer: bufferToSend))
+                continuation.finish()
+
+                // Finaliza analyzer (drena buffers pendentes + emite final results).
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+
+                // Coleta transcript do reader.
+                resultText = try await reader.value
+            } catch {
+                resultError = "SpeechAnalyzer falhou: \(error)"
+            }
+            sem.signal()
+        }
+
+        // Timeout proporcional + buffer para asset download (até 10min para 1° uso).
+        let timeoutSec = max(60.0, min(900.0, durationSeconds * 4 + 60))
+        let waitResult = sem.wait(timeout: .now() + .seconds(Int(timeoutSec)))
+        if waitResult == .timedOut {
+            return Response(status: .gatewayTimeout, payload: [
+                "error": "SpeechAnalyzer timeout (\(Int(timeoutSec))s — possível asset download em curso)"
+            ])
+        }
+        if resultError != nil {
+            // Sinaliza ao caller que SA falhou — caller decide fallback.
+            FileHandle.standardError.write(Data("[ZeusDaemonMac] SA fallback: \(resultError ?? "")\n".utf8))
+            return nil
+        }
+        return Response(status: .ok, payload: [
+            "text": resultText,
+            "duration_seconds": durationSeconds,
+            "locale": localeID,
+            "on_device": true,
+            "engine_used": "sa",
+            "asset_just_installed": assetInstalled,
+            "model": "apple-speechanalyzer-speechtranscriber",
+            "task": "asp_transcribe"
+        ])
+    }
+    #endif
 
     // MARK: - /v1/asp/vad (v1.3 — Voice Activity Detection, pré-filtro rápido)
     //

@@ -41,13 +41,39 @@
 
 'use strict';
 
+// === v0.12 PluginRequire helper ===
+// Obsidian plugin loader sets __dirname to Electron renderer init, not plugin dir.
+// Relative pluginRequire('lib/X') fails. Use absolute path via discovery.
+// Strategy: read the plugin path from app config or fall back to walking files.
+function _zeusFindPluginDir() {
+  const fs0 = require('fs');
+  const candidates = [
+    '/Users/rogermaiocchi/Library/Mobile Documents/iCloud~md~obsidian/Documents/.obsidian/plugins/zeus',
+    '/Users/maiocchi/Library/Mobile Documents/iCloud~md~obsidian/Documents/.obsidian/plugins/zeus',
+    process.env.HOME + '/Library/Mobile Documents/iCloud~md~obsidian/Documents/.obsidian/plugins/zeus',
+  ];
+  for (const c of candidates) {
+    try {
+      if (fs0.existsSync(c + '/main.js') && fs0.existsSync(c + '/manifest.json')) return c;
+    } catch (_) {}
+  }
+  throw new Error('Zeus pluginRequire: cannot locate plugin dir');
+}
+const _ZEUS_PLUGIN_DIR = _zeusFindPluginDir();
+const _zeusPath = require('path');
+function pluginRequire(rel) {
+  return require(_zeusPath.join(_ZEUS_PLUGIN_DIR, rel));
+}
+console.log('[zeus] pluginRequire base:', _ZEUS_PLUGIN_DIR);
+
+
 const obsidian = require('obsidian');
 const { Plugin, PluginSettingTab, Setting, SuggestModal, ItemView, Notice, TFile } = obsidian;
 
 // v0.11 — universal Mac+iOS: Node modules wrapped in try/catch so plugin loads
 // in Capacitor sandbox (iPad/iPhone). Use `universal.X` for cross-platform ops;
 // fall through to `spawn/path/fs` only when guarded by `if (universal.IS_NODE)`.
-const universal = require('./lib/universal-fs');
+const universal = pluginRequire('lib/universal-fs');
 
 // v0.11 — Backward compat: legacy code in main.js references `path`/`fs` directly.
 // On iOS these are null (not undefined → não dispara ReferenceError quando avaliado
@@ -57,15 +83,15 @@ const fs = universal.nodeFs;
 const spawn = universal.nodeChildProcess ? universal.nodeChildProcess.spawn : null;
 
 // v0.5.0 — modular extensions (parallel-built by subagents)
-const AfmDaemon = require('./lib/afm-daemon');             // Fix 1: JSON-RPC persistent daemon
-const HierarchicalProcessor = require('./lib/hierarchical'); // Fix 2: NexusSum-pattern long-doc enrich
-const MultiVectorEmbedder = require('./lib/multi-vector');   // Fix 4: 3×512=1536-dim effective coverage
-const ZeusHttpClient = require('./lib/zeus-http-client');    // v0.6: Aegis-pattern daemon HTTP transport (ADR-018)
-const ImageSimilaritySearch = require('./lib/image-similarity'); // v0.7: feature-print vault image similarity
-const PassportIndex = require('./lib/passport-index');       // v0.9: Passport Index Architecture (PIA)
-const BasesGenerator = require('./lib/bases-generator');     // v0.9: Obsidian Bases UI derivative from passports.jsonl
-const DistributedCoordinator = require('./lib/distributed-coordinator'); // v0.10: cross-device claim/release via iCloud lock files
-const PassportScheduler = require('./lib/passport-scheduler');           // v0.10: background sweep for stale passports
+const AfmDaemon = pluginRequire('lib/afm-daemon');             // Fix 1: JSON-RPC persistent daemon
+const HierarchicalProcessor = pluginRequire('lib/hierarchical'); // Fix 2: NexusSum-pattern long-doc enrich
+const MultiVectorEmbedder = pluginRequire('lib/multi-vector');   // Fix 4: 3×512=1536-dim effective coverage
+const ZeusHttpClient = pluginRequire('lib/zeus-http-client');    // v0.6: Aegis-pattern daemon HTTP transport (ADR-018)
+const ImageSimilaritySearch = pluginRequire('lib/image-similarity'); // v0.7: feature-print vault image similarity
+const PassportIndex = pluginRequire('lib/passport-index');       // v0.9: Passport Index Architecture (PIA)
+const BasesGenerator = pluginRequire('lib/bases-generator');     // v0.9: Obsidian Bases UI derivative from passports.jsonl
+const DistributedCoordinator = pluginRequire('lib/distributed-coordinator'); // v0.10: cross-device claim/release via iCloud lock files
+const PassportScheduler = pluginRequire('lib/passport-scheduler');           // v0.10: background sweep for stale passports
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -261,7 +287,7 @@ async function discoverDaemonUrl(plugin, candidates = null) {
   const urls = candidates || [plugin.settings.zeusDaemonUrl, ...TAILSCALE_MESH.filter(u => u !== plugin.settings.zeusDaemonUrl)];
   for (const url of urls) {
     try {
-      const client = new (require('./lib/zeus-http-client'))(url);
+      const client = new (pluginRequire('lib/zeus-http-client'))(url);
       const reachable = await client.isAvailable();
       if (reachable) {
         console.log('[zeus] adaptive daemon discovery → using', url);
@@ -1990,7 +2016,27 @@ class ZeusSettingTab extends PluginSettingTab {
 
 class ZeusPlugin extends Plugin {
   async onload() {
+    // v0.11.2 — Master try/catch with on-disk trace para debug load failure
+    const traceLog = [];
+    const trace = (step, info) => {
+      const line = `[${new Date().toISOString()}] ${step}${info ? ': ' + JSON.stringify(info).slice(0, 200) : ''}`;
+      traceLog.push(line);
+      console.log('[zeus.trace]', line);
+    };
+    const writeTrace = (err) => {
+      try {
+        if (fs && path && this.app.vault.adapter.basePath) {
+          const tracePath = path.join(this.app.vault.adapter.basePath, this.manifest.dir, 'data', 'load-trace.log');
+          fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+          fs.writeFileSync(tracePath, traceLog.join('\n') + (err ? '\n\n=== ERROR ===\n' + err.stack : ''));
+        }
+      } catch (_) {}
+    };
+    try {
+      trace('start', { manifest: this.manifest.id, version: this.manifest.version });
+      trace('loadData.begin');
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    trace('loadData.done');
     // vaultRoot is absolute path on Mac (Electron). On iOS Capacitor the adapter
     // exposes only relative paths — vaultRoot is undefined, callers must use
     // vault.adapter.* with vault-relative paths.
@@ -2691,7 +2737,15 @@ class ZeusPlugin extends Plugin {
       }));
     }
 
-    console.log('[zeus] loaded v0.10.0 — distributed coordinator + scheduler');
+    console.log('[zeus] loaded v0.11.2 — distributed coordinator + scheduler');
+    trace('onload.complete');
+    writeTrace(null);
+    } catch (err) {
+      console.error('[zeus] ❌ onload FAILED at step:', traceLog[traceLog.length - 1]);
+      console.error('[zeus]', err);
+      writeTrace(err);
+      throw err;
+    }
   }
 
   async onunload() {

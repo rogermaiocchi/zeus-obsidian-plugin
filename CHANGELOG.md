@@ -4,6 +4,65 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.3.4] — 2026-05-15 — AegisDaemon iOS port (paridade Mac ↔ iPhone/iPad daemons)
+
+Portagem dos 3 endpoints v1.3 do `ZeusDaemonMac` para o `AegisDaemon` iOS (target SwiftPM library embutida em `MetassistemaApp-iOS`). Atinge paridade de capabilities entre daemons macOS e iOS — agora todos os 4 devices Apple (Mac mini · MacBook Air · iPad Air · iPhone 15) expõem a mesma API HTTP local quando atualizados.
+
+### Added — 3 endpoints em `AegisHTTPHandlers.swift`
+
+- **`POST /v1/afm/refine`** — Writing Tools nativo via `FoundationModels` (iOS 26+ / macOS 26+). 3 modos (proofread/rewrite/simplify) + 3 tones (academic/professional/casual). Reusa `runFoundationModel()` helper existente. Sem propagação PCC (iOS sandbox).
+- **`POST /v1/asp/transcribe`** — dual-engine SA + SF fallback. Padrão idêntico ao Mac v1.3.2: `SpeechAnalyzer` (iOS 26+) com `AssetInventory.requestNeededAssets()` + `AVAudioConverter` single-buffer + reader Task paralelo; `SFSpeechRecognizer` (iOS 10+) fallback gracioso com `requiresOnDeviceRecognition=true`. Param `engine: sa|sf|auto`.
+- **`POST /v1/asp/vad`** — duração heurística (≥3s) idêntica ao Mac, via `AVURLAsset.duration`.
+
+### Changed — `handleHealth`
+
+- Novo campo `speech_available: bool` baseado em `canImport(Speech)`
+- `endpoint_count` agora dinâmico (era array literal)
+- Version bump interno do daemon: `0.2.0` → `0.3.0`
+
+### Added — Imports gated
+
+- `import Speech` (com `#if canImport(Speech)`)
+- `import AVFoundation` (com `#if canImport(AVFoundation)`)
+
+### Build note — por que `swift build` CLI falha
+
+Símbolo `CapivaraDeviceProfile.current` aparece em `AegisHTTPHandlers.swift:308` e `:2112` (`handleCmd` case "profile"), introduzido no commit `9559d14e` de 2026-05-14 — **antes desta release**. É definido em outros targets do workspace Xcode (`MetassistemaApp-iOS` ou `CapivaraKit`) que não são parte do SPM `AegisDaemon` library standalone. Build em SPM CLI falha; build no Xcode workspace resolve via linker do app inteiro.
+
+Confirmado por `git blame` que esse erro é **preexistente**, não regressão desta release. Meu código portado (handleRefine + handleASPTranscribe + handleASPVAD + transcribeWithSpeechAnalyzer) compila isoladamente — o build full do daemon target falha unicamente em código pre-1.3.4.
+
+### Deployment manual necessário (não automatizável)
+
+Para os 3 endpoints novos ficarem LIVE nos dispositivos iOS:
+
+```
+1. Abrir MetassistemaApp.xcworkspace no Xcode
+2. Conectar iPhone 15 ou iPad Air gen 4 via USB (ou Wireless Debug)
+3. Selecionar scheme MetassistemaApp_iOS
+4. Cmd+R para build + install
+```
+
+Após o rebuild, o `AegisDaemon` HTTP server (loopback `127.0.0.1:2223` dentro do app) passa a servir os 3 endpoints novos. Plugin Obsidian v1.3.3 já no vault iCloud não precisa de mudança — pipeline real-time audio (`scheduleAudioTranscribe`) já chama via `httpClient.aspTranscribe()` e degrada gracioso quando endpoint retorna 503.
+
+### Após o deploy iOS
+
+Pipeline real-time audio (v1.3.3) funciona end-to-end nos 4 devices:
+
+- **Mac mini / MacBook Air**: SpeechAnalyzer macOS 26 com asset pt-BR pré-instalado pelo Siri
+- **iPhone 15 / iPad Air**: SpeechAnalyzer iOS 26 OU SFSpeechRecognizer fallback (privacy gate intocado: `requiresOnDeviceRecognition=true`)
+
+### Hammerspoon integration (repo `rogermaiocchi/hammerspoon-config` `423943f`)
+
+Em paralelo a esta release, adicionei 3 hotkeys ao `~/.hammerspoon/init.lua` que consomem os endpoints v1.3 via `hs.http.asyncPost`:
+
+- `Cmd+Shift+Alt+R` — refine clipboard (proofread pt) via `/v1/afm/refine`
+- `Cmd+Shift+Alt+T` — transcribe último voice memo via `/v1/asp/transcribe` (procura `.m4a/.wav` mais recente em 3 paths Voice Memos)
+- `Cmd+Shift+Alt+F` — passport find para clipboard via `/v1/passport/find` (top-5 notas relevantes em popup)
+
+Hammerspoon `pathwatcher` recarrega o config automaticamente ao git pull no Mac mini.
+
+---
+
 ## [1.3.3] — 2026-05-15 — Real-time audio indexing (vault.on modify/create → VAD → transcribe → embed)
 
 Plugin side. Fecha o ciclo end-to-end de voice memos: arquivo `.m4a/.wav/.mp3` salvo no vault dispara pipeline real-time automático, idêntico ao que já acontecia com `.md` desde v0.13.2.

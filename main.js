@@ -93,6 +93,7 @@ const PassportIndex = pluginRequire('lib/passport-index');       // v0.9: Passpo
 const BasesGenerator = pluginRequire('lib/bases-generator');     // v0.9: Obsidian Bases UI derivative from passports.jsonl
 const DistributedCoordinator = pluginRequire('lib/distributed-coordinator'); // v0.10: cross-device claim/release via iCloud lock files
 const PassportScheduler = pluginRequire('lib/passport-scheduler');           // v0.10: background sweep for stale passports
+const PythonWorker = pluginRequire('lib/python-worker');                     // v1.3: Python worker layer (apple-fm-sdk via child_process.spawn)
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -2889,6 +2890,46 @@ class ZeusPlugin extends Plugin {
           new Notice(`Zeus: ${n} expired claim(s) limpos`);
         } catch (e) {
           new Notice('Zeus clean falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    // v1.3 — Python worker layer probe (apple-fm-sdk via child_process.spawn)
+    this.addCommand({
+      id: 'zeus-python-worker-probe',
+      name: 'Zeus: probe Python worker (apple-fm-sdk)',
+      callback: async () => {
+        try {
+          const nodePath = require('path');
+          const adapter = this.app.vault.adapter;
+          const basePath = typeof adapter.getBasePath === 'function'
+            ? adapter.getBasePath()
+            : (adapter.basePath || '');
+          const pluginDir = this.manifest && this.manifest.dir
+            ? nodePath.join(basePath, this.manifest.dir)
+            : null;
+          if (!pluginDir) {
+            new Notice('Zeus Python: plugin dir indisponível');
+            return;
+          }
+          const out = await PythonWorker.runPythonWorker(
+            pluginDir,
+            'batch_eval',
+            { action: 'version' },
+            { timeoutMs: 10000 },
+          );
+          if (out && out.ok && out.result) {
+            const r = out.result;
+            const sdkLabel = r.apple_fm_sdk_available
+              ? `apple-fm-sdk v${r.apple_fm_sdk_version}`
+              : 'apple-fm-sdk NOT INSTALLED';
+            const fmLabel = r.fm_on_device_available ? 'FM on-device ON' : 'FM on-device off';
+            new Notice(`Zeus Python: ${r.python} · ${sdkLabel} · ${fmLabel}`, 8000);
+          } else {
+            new Notice('Zeus Python: ' + ((out && out.error) || 'erro desconhecido'), 6000);
+          }
+        } catch (e) {
+          new Notice('Zeus Python falhou: ' + (e.message || String(e)).slice(0, 200), 6000);
         }
       },
     });

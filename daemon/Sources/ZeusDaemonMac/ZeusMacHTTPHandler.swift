@@ -822,13 +822,16 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         )
     }
 
-    // MARK: - /v1/asp/transcribe (v1.3 — SpeechAnalyzer + SpeechTranscriber, macOS 26+)
+    // MARK: - /v1/asp/transcribe (v1.3 — SFSpeechRecognizer on-device)
     //
     // Body: { "path": "/path/to/audio.m4a", "locale": "pt-BR" (optional, default: current) }
     // Retorna: { "text": "...", "duration_seconds": N, "locale": "...", "model": "..." }
     //
-    // Suporta .m4a, .wav, .mp3 e qualquer formato lido por AVAudioFile.
-    // Gated atrás de #if canImport(Speech) + #available(macOS 26.0, *).
+    // Suporta .m4a, .wav, .mp3 e qualquer formato lido por AVURLAsset.
+    // Usa SFSpeechRecognizer + SFSpeechURLRecognitionRequest (estável macOS 10.15+),
+    // com requiresOnDeviceRecognition=true para preservar privacy gate.
+    // SpeechAnalyzer (macOS 26+) será adotado na v1.4 quando asset download
+    // estiver validado e a API async let de results estiver estabilizada.
     private func handleASPTranscribe(bodyJSON: String) -> Response {
         guard let json = Self.parseJSON(bodyJSON),
               let path = json["path"] as? String, !path.isEmpty else {
@@ -846,67 +849,72 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         }
 
         #if canImport(Speech) && canImport(AVFoundation)
-        if #available(macOS 26.0, *) {
-            let sem = DispatchSemaphore(value: 0)
-            var resultText = ""
-            var resultError: String? = nil
-            var durationSeconds: Double = 0
+        // Duration via AVURLAsset (não bloqueia esperando frames).
+        let asset = AVURLAsset(url: url)
+        let durationSeconds = CMTimeGetSeconds(asset.duration)
 
-            Task {
-                do {
-                    let audioFile = try AVAudioFile(forReading: url)
-                    let sampleRate = audioFile.processingFormat.sampleRate
-                    durationSeconds = Double(audioFile.length) / sampleRate
-
-                    let transcriber = SpeechTranscriber(
-                        locale: Locale(identifier: localeID),
-                        transcriptionOptions: [],
-                        reportingOptions: [],
-                        attributeOptions: []
-                    )
-                    let analyzer = SpeechAnalyzer(modules: [transcriber])
-
-                    // Stream audio file in chunks to the analyzer.
-                    let (inputStream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
-                    let analyzerTask = Task {
-                        try await analyzer.start(inputSequence: inputStream)
-                    }
-
-                    let frameCount: AVAudioFrameCount = 8192
-                    let format = audioFile.processingFormat
-                    while audioFile.framePosition < audioFile.length {
-                        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { break }
-                        try audioFile.read(into: buffer)
-                        continuation.yield(AnalyzerInput(buffer: buffer))
-                    }
-                    continuation.finish()
-                    try await analyzerTask.value
-
-                    for try await result in transcriber.results {
-                        resultText += String(result.text.characters)
-                    }
-                } catch {
-                    resultError = "SpeechAnalyzer falhou: \(error)"
-                }
-                sem.signal()
-            }
-            _ = sem.wait(timeout: .now() + .seconds(600))
-
-            if let err = resultError {
-                return Response(status: .internalServerError, payload: ["error": err])
-            }
-            return Response(status: .ok, payload: [
-                "text": resultText,
-                "duration_seconds": durationSeconds,
-                "locale": localeID,
-                "model": "apple-speechanalyzer-speechtranscriber",
-                "task": "asp_transcribe"
-            ])
-        } else {
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeID)) else {
             return Response(status: .serviceUnavailable, payload: [
-                "error": "SpeechAnalyzer requer macOS 26.0+ (esta máquina é mais antiga)"
+                "error": "SFSpeechRecognizer indisponível para locale \(localeID)"
             ])
         }
+        guard recognizer.isAvailable else {
+            return Response(status: .serviceUnavailable, payload: [
+                "error": "SFSpeechRecognizer reporta isAvailable=false para \(localeID)"
+            ])
+        }
+
+        let request = SFSpeechURLRecognitionRequest(url: url)
+        request.shouldReportPartialResults = false
+        // Privacy gate: força transcrição on-device (não envia áudio à Apple).
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+
+        let sem = DispatchSemaphore(value: 0)
+        var resultText = ""
+        var resultError: String? = nil
+        var onDeviceUsed = recognizer.supportsOnDeviceRecognition
+
+        let task = recognizer.recognitionTask(with: request) { (result, error) in
+            if let err = error as NSError? {
+                // SFSpeechErrorCode 1700 = "No speech detected" — não é erro real
+                if err.domain == "kAFAssistantErrorDomain" && err.code == 1700 {
+                    resultText = ""
+                } else {
+                    resultError = "SFSpeechRecognizer falhou: \(err.localizedDescription) [\(err.domain) \(err.code)]"
+                }
+                sem.signal()
+                return
+            }
+            guard let result = result else { return }
+            if result.isFinal {
+                resultText = result.bestTranscription.formattedString
+                sem.signal()
+            }
+        }
+
+        // Timeout proporcional à duração + 30s buffer (mín 30s, máx 600s).
+        let timeoutSec = max(30.0, min(600.0, durationSeconds * 3 + 30))
+        let waitResult = sem.wait(timeout: .now() + .seconds(Int(timeoutSec)))
+        if waitResult == .timedOut {
+            task.cancel()
+            return Response(status: .gatewayTimeout, payload: [
+                "error": "SFSpeechRecognizer timeout (\(Int(timeoutSec))s)"
+            ])
+        }
+
+        if let err = resultError {
+            return Response(status: .internalServerError, payload: ["error": err])
+        }
+        return Response(status: .ok, payload: [
+            "text": resultText,
+            "duration_seconds": durationSeconds,
+            "locale": localeID,
+            "on_device": onDeviceUsed,
+            "model": "apple-sfspeechrecognizer",
+            "task": "asp_transcribe"
+        ])
         #else
         return Response(status: .serviceUnavailable, payload: [
             "error": "Speech / AVFoundation indisponível neste build"

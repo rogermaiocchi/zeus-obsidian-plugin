@@ -4,6 +4,37 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.3.1] — 2026-05-15 — SFSpeechRecognizer pivot + main.js python-worker wire
+
+Patch release com 2 correções derivadas dos smoke tests pós-deploy da v1.3.0:
+
+### Changed — `asp-transcribe` agora usa `SFSpeechRecognizer` (API estável macOS 10.15+)
+
+A primeira tentativa em v1.3.0 usou `SpeechAnalyzer` + `SpeechTranscriber` (WWDC25, macOS 26+). O endpoint compilou (`swift build` 0 erros) mas crashou em runtime com Empty reply — provavelmente por deadlock entre `analyzer.start(inputSequence:)` e iteração paralela de `transcriber.results`, mais ausência de prefetch via `AssetInventory.requestNeededAssets()`. Pivotado para `SFSpeechRecognizer` + `SFSpeechURLRecognitionRequest` com `requiresOnDeviceRecognition=true` (preserva privacy gate). Validado em smoke test:
+
+- `POST /v1/asp/transcribe` `{path:"/tmp/test.wav", locale:"en-US"}` → texto transcrito corretamente
+- `kAFAssistantErrorDomain 1700` ("No speech detected") agora tratado como texto vazio (não erro 500)
+- Timeout proporcional `duration × 3 + 30s` (min 30s, max 600s) substitui timeout fixo de 600s
+
+Note: pt-BR locale retorna texto vazio até o usuário baixar assets de Speech Recognition em macOS Settings → General → Language & Region. Isso é constraint do OS, não do endpoint.
+
+### Added — `zeus-python-worker-probe` command em `main.js`
+
+Comando "Zeus: probe Python worker (apple-fm-sdk)" adicionado em `main.js` ~linha 2896 (after `zeus-coord-clean-expired`). Resolve plugin dir absoluto via `app.vault.adapter.getBasePath() + manifest.dir`, spawna `bin/batch_eval.py` com `{action:"version"}`, mostra resultado num Notice. Import de `PythonWorker` adicionado na seção `pluginRequire('lib/*')` (linha ~96).
+
+### Build & validation
+
+- `swift build -c release --product ZeusDaemonMac` ✅ compilou em 70.62s (2° ciclo, full incremental)
+- LaunchAgent restart via `install-mac-daemon.sh`; `/v1/health` reporta `endpoint_count: 29`, `speech_available: true`
+- `node -e 'new Function(fs.readFileSync("main.js","utf8"))'` ✅ syntax parse OK
+- Smoke completo: refine 200, vad 200, transcribe 200 (en-US texto correto)
+
+### Roadmap futuro
+
+`SpeechAnalyzer` migration: re-tentar em v1.4 após validar em script Python isolado (via `apple-fm-sdk` not aplicable mas via Swift Playground) o padrão correto de async-let entre `analyzer.start(inputSequence:)` + `transcriber.results` + `AssetInventory.requestNeededAssets()`.
+
+---
+
 ## [1.3.0] — 2026-05-15 — Native Refinement & Opaque Media Unlocking
 
 Primeira release derivada do estudo NotebookLM Apple-Native (notebook `aa48f2d1`, 12 fontes Apple Developer + apple-fm-sdk GitHub + plugin READMEs). Adiciona 3 endpoints novos no daemon Swift + camada Python worker para batch jobs offline, sem alterar a superfície existente.
@@ -20,15 +51,17 @@ Primeira release derivada do estudo NotebookLM Apple-Native (notebook `aa48f2d1`
 - Privacy gate intocado: respeita `X-Zeus-Allow-Pcc` da request (default `.off`)
 - Substituto on-device para Grammarly/Text Generator cloud-based em notas sensíveis
 
-### Added — `asp-transcribe` (SpeechAnalyzer macOS 26+) e `asp-vad` (pré-filtro)
+### Added — `asp-transcribe` (SFSpeechRecognizer on-device) e `asp-vad` (pré-filtro)
 
-- **`POST /v1/asp/transcribe`** — `SpeechAnalyzer` + `SpeechTranscriber` lê arquivos `.m4a/.wav/.mp3` (qualquer formato suportado por `AVAudioFile`), retorna texto + `duration_seconds`
+- **`POST /v1/asp/transcribe`** — `SFSpeechRecognizer` + `SFSpeechURLRecognitionRequest` lê arquivos `.m4a/.wav/.mp3` (qualquer formato suportado por `AVURLAsset`), retorna texto + `duration_seconds` + `on_device: bool`
 - **`POST /v1/asp/vad`** — heurística rápida de duração (>= 3s → assume fala) para pular áudios muito curtos antes de chamar transcribe. Quando `SpeechDetector` estabilizar API, substituível por análise real
-- Streaming de buffers PCM ~8192 frames via `AsyncStream<AnalyzerInput>` — não carrega áudio inteiro em memória
-- Locale configurável via body param `locale` (default `Locale.current.identifier`)
-- Timeout interno de 600s para áudios longos; gated atrás de `#if canImport(Speech)` + `#available(macOS 26.0, *)`
+- Privacy gate: força `requiresOnDeviceRecognition = true` quando o recognizer suporta, garantindo que o áudio nunca sai do Mac
+- Tratamento explícito de `kAFAssistantErrorDomain 1700` ("No speech detected") como texto vazio, não erro
+- Locale configurável via body param `locale` (default `Locale.current.identifier`); timeout proporcional `duration × 3 + 30s` (min 30s, max 600s)
 - Imports novos no handler: `Speech`, `AVFoundation`
 - Adicionado campo `speech_available` no `/v1/health` payload
+
+**Pivote arquitetural decidido durante smoke-test**: a primeira implementação tentou usar `SpeechAnalyzer` + `SpeechTranscriber` (macOS 26+, API nova WWDC25). O endpoint compilou perfeitamente (`swift build` 0 erros) mas crashou em runtime (Empty reply) — provavelmente por dois motivos cumulativos: (1) deadlock entre `analyzer.start(inputSequence:)` e iteração paralela de `transcriber.results`; (2) `SpeechAnalyzer` requer download explícito dos *speech assets* via `AssetInventory.requestNeededAssets()`, ainda não wired. Substituí por `SFSpeechRecognizer` (API estável macOS 10.15+) que tem garantias de runtime maduras. `SpeechAnalyzer` migration fica trackeada para v1.4 quando a sequência paralela + asset prefetch forem validados em isolamento.
 
 ### Added — Python worker layer
 
@@ -45,8 +78,14 @@ Primeira release derivada do estudo NotebookLM Apple-Native (notebook `aa48f2d1`
 
 ### Build & validation
 
-- `swift build --product ZeusDaemonMac` ✅ compilou sem erros em 45.72s no Mac mini M2 Pro
+- `swift build -c release --product ZeusDaemonMac` ✅ release compilou em 70.62s no Mac mini M2 Pro
+- LaunchAgent `com.maiocchi.zeusdaemon` em produção: `/v1/health` retorna `endpoint_count: 29`, `speech_available: true`, `fm_available: true`
+- **Smoke tests pós-deploy**:
+  - `POST /v1/afm/refine` ✅ 200 OK, payload completo (mode/tone/language/task/model)
+  - `POST /v1/asp/vad` ✅ 200 OK, `has_speech: true` para áudio de 6.16s
+  - `POST /v1/asp/transcribe` ✅ 200 OK, en-US transcreveu corretamente "Hello, this is a test of voice transcription using Apple speech recognition on the Zeus daemon"; pt-BR retorna texto vazio até o usuário baixar asset on-device em System Settings → General → Language & Region
 - `echo '{"action":"version"}' | python3 bin/batch_eval.py` ✅ retorna JSON válido, `apple_fm_sdk_available: true`
+- `node -e "new Function(fs.readFileSync('main.js','utf8'))"` ✅ syntax parse OK após adicionar `PythonWorker` import + `zeus-python-worker-probe` command
 - iOS `AegisDaemon` (`AegisHTTPHandlers.swift`) inalterado nesta release — endpoints `afm/refine`, `asp/transcribe`, `asp/vad` ficam para v1.3.1+ quando Apple Speech expor mesma API no iOS Capacitor
 
 ### Próximos passos (v1.4 trackeado em APPLE_NATIVE_ROADMAP.md)

@@ -108,13 +108,21 @@ const ENRICH_CACHE_DIR = 'aia-enrich-cache';   // ex-enrich-cache (AIA = Apple I
 const AFM_BIN_NAMES = ['afm', 'metafm'];
 const AFM_FALLBACK = '/Users/rogermaiocchi/.local/bin/metafm';
 
+// v1.3.3 — real-time audio indexing
+// Extensões processadas via /v1/asp/vad → /v1/asp/transcribe → /v1/embed
+const AUDIO_EXTENSIONS = new Set(['m4a', 'wav', 'mp3']);
+
 const DEFAULT_SETTINGS = {
   afmPath: '',                    // '' = auto-detect (bundled bin/afm > ~/.local/bin/metafm > metafm in PATH)
   indexOnStartup: true,
   indexOnSave: true,
   ocrEnabled: true,
   embedBackend: 'apple',          // apple = NLContextualEmbedding (dim 512); e5 = multilingual (dim 384)
-  fileTypes: { md: true, pdf: true, png: true, jpg: true, jpeg: true, heic: true },
+  fileTypes: { md: true, pdf: true, png: true, jpg: true, jpeg: true, heic: true, m4a: true, wav: true, mp3: true },
+  // v1.3.3 — audio indexing
+  audioLocale: 'pt-BR',                  // BCP47 default para SpeechAnalyzer/SFSpeechRecognizer
+  audioEngine: 'auto',                   // sa|sf|auto — daemon escolhe melhor disponível
+  audioVadEnabled: true,                 // pre-filter via /v1/asp/vad antes de transcribe
   folderExclusions: ['.trash', '.obsidian', '.smart-env', 'node_modules', 'Attachments'],
   exactMatchBoost: 0.5,
   maxResults: 30,
@@ -3006,6 +3014,7 @@ class ZeusPlugin extends Plugin {
     // Eventos cobertos: modify, create, delete, rename (full coverage)
     this._embedTimers = new Map();
     this._passportTimers = new Map();
+    this._audioTimers = new Map();   // v1.3.3 — real-time audio transcription
 
     const scheduleEmbed = (rel, file) => {
       clearTimeout(this._embedTimers.get(rel));
@@ -3032,6 +3041,75 @@ class ZeusPlugin extends Plugin {
       }, 500));   // 500ms debounce — Apple Notes-style instant
     };
 
+    // v1.3.3 — real-time audio: VAD pre-filter → transcribe → embed
+    // Debounce 2s (audio writes às vezes não são atômicos)
+    const scheduleAudioTranscribe = (rel, file) => {
+      if (!this.settings.indexOnSave) return;
+      if (!this.settings.fileTypes || !this.settings.fileTypes[file.extension]) return;
+      clearTimeout(this._audioTimers.get(rel));
+      this._audioTimers.set(rel, setTimeout(async () => {
+        this._audioTimers.delete(rel);
+        try {
+          const reachable = await this.httpClient.isAvailable();
+          if (!reachable) return;
+
+          // Resolver path absoluto (daemon precisa de path absoluto)
+          const nodePath = require('path');
+          const adapter = this.app.vault.adapter;
+          const basePath = typeof adapter.getBasePath === 'function'
+            ? adapter.getBasePath()
+            : (adapter.basePath || '');
+          const absPath = nodePath.join(basePath, rel);
+
+          // VAD pre-filter (rápido — só duração)
+          if (this.settings.audioVadEnabled) {
+            const vad = await this.httpClient.aspVad(absPath);
+            if (!vad || !vad.has_speech) {
+              console.log('[zeus] audio skip (no speech):', rel,
+                vad ? `${vad.duration_seconds.toFixed(1)}s < threshold` : 'vad failed');
+              return;
+            }
+          }
+
+          // Transcribe
+          const locale = this.settings.audioLocale || 'pt-BR';
+          const engine = this.settings.audioEngine || 'auto';
+          const tr = await this.httpClient.aspTranscribe(absPath, locale, engine);
+          if (!tr || !tr.text || tr.text.trim().length === 0) {
+            console.log('[zeus] audio no transcript:', rel,
+              tr ? `engine=${tr.engine_used}` : 'transcribe failed');
+            return;
+          }
+
+          // Embed transcript
+          const resp = await this.httpClient.embed(tr.text.slice(0, 4000));
+          if (resp && resp.vectors && resp.vectors[0]) {
+            const sha = await universal.sha256Hex(tr.text);
+            const entry = {
+              path: rel,
+              sha,
+              mtime: Date.now(),
+              title: file.basename,
+              vec: resp.vectors[0],
+              // Audio-specific metadata (preserved no JSONL para Smart View)
+              kind: 'audio',
+              transcript: tr.text.slice(0, 1000),
+              duration_seconds: tr.duration_seconds,
+              audio_locale: tr.locale,
+              audio_engine: tr.engine_used,
+            };
+            this.searcher.embeddings.set(rel, entry);
+            this.indexer.saveEmbeddings(this.searcher.embeddings);
+            this.refreshSmartView();
+            console.log('[zeus] real-time audio:', rel,
+              `${tr.duration_seconds.toFixed(1)}s · ${tr.text.length}ch · ${tr.engine_used}`);
+          }
+        } catch (e) {
+          console.warn('[zeus] real-time audio failed for', rel, e.message);
+        }
+      }, 2000));  // 2s — audio writes podem não ser atômicos
+    };
+
     const schedulePassport = (rel) => {
       if (!this.settings.schedulerEnabled) return;
       clearTimeout(this._passportTimers.get(rel));
@@ -3053,16 +3131,24 @@ class ZeusPlugin extends Plugin {
 
     // Event: modify (note edited)
     this.registerEvent(this.app.vault.on('modify', file => {
-      if (!(file instanceof TFile) || file.extension !== 'md') return;
-      scheduleEmbed(file.path, file);
-      schedulePassport(file.path);
+      if (!(file instanceof TFile)) return;
+      if (file.extension === 'md') {
+        scheduleEmbed(file.path, file);
+        schedulePassport(file.path);
+      } else if (AUDIO_EXTENSIONS.has(file.extension)) {
+        scheduleAudioTranscribe(file.path, file);
+      }
     }));
 
     // Event: create (new note)
     this.registerEvent(this.app.vault.on('create', file => {
-      if (!(file instanceof TFile) || file.extension !== 'md') return;
-      scheduleEmbed(file.path, file);
-      schedulePassport(file.path);
+      if (!(file instanceof TFile)) return;
+      if (file.extension === 'md') {
+        scheduleEmbed(file.path, file);
+        schedulePassport(file.path);
+      } else if (AUDIO_EXTENSIONS.has(file.extension)) {
+        scheduleAudioTranscribe(file.path, file);
+      }
     }));
 
     // Event: delete (purge entry)

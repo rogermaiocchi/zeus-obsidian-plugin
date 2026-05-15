@@ -4,6 +4,72 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.3.3] — 2026-05-15 — Real-time audio indexing (vault.on modify/create → VAD → transcribe → embed)
+
+Plugin side. Fecha o ciclo end-to-end de voice memos: arquivo `.m4a/.wav/.mp3` salvo no vault dispara pipeline real-time automático, idêntico ao que já acontecia com `.md` desde v0.13.2.
+
+### Diagnóstico — gap mapeado por subagente Explore
+
+Plugin já tinha real-time `.md` (linhas 3055-3088 main.js): `vault.on('modify'|'create'|'delete'|'rename')` com debounce 500ms para embed e 8s para passport. **Audio não chegava ao pipeline real-time** — só seria indexado por full reindex manual ou PassportScheduler (que filtra `ext === 'md'` no `lib/passport-scheduler.js:99`).
+
+### Added — Pipeline real-time audio (`scheduleAudioTranscribe`)
+
+- **`AUDIO_EXTENSIONS = new Set(['m4a', 'wav', 'mp3'])`** const no topo de `main.js`
+- **`DEFAULT_SETTINGS.fileTypes`** estendido: `{md, pdf, png, jpg, jpeg, heic, m4a, wav, mp3}`
+- **3 settings novos**:
+  - `audioLocale: 'pt-BR'` — BCP47 para SpeechAnalyzer/SFSpeechRecognizer
+  - `audioEngine: 'auto'` — `sa|sf|auto`, default delega para daemon
+  - `audioVadEnabled: true` — pré-filtro VAD antes de transcribe (skip < 3s)
+- **`this._audioTimers = new Map()`** com debounce 2s (audio writes nem sempre atômicos)
+- **`scheduleAudioTranscribe(rel, file)`** — pipeline 4-step:
+  1. `httpClient.isAvailable()` — graceful se daemon down
+  2. Resolve path absoluto via `adapter.getBasePath() + rel`
+  3. `httpClient.aspVad(absPath)` — skip se `has_speech: false`
+  4. `httpClient.aspTranscribe(absPath, locale, engine)` — texto
+  5. `httpClient.embed(text)` — embed 512-dim
+  6. Persistir entrada com `kind: 'audio'` + `transcript` + `duration_seconds` + `audio_locale` + `audio_engine` no `embeddings.jsonl`
+- **`vault.on('modify' | 'create')`** estendidos: switch por ext (`md` → embed+passport; `audio` → audio pipeline)
+- **`vault.on('delete' | 'rename')`** já funcionavam (purgam por path, agnósticos a ext)
+
+### Added — `ZeusHttpClient` v1.3.0 endpoints
+
+3 methods novos em `lib/zeus-http-client.js`:
+
+- `refine(text, mode, options)` — `POST /v1/afm/refine` (Writing Tools), timeout 90s
+- `aspTranscribe(absPath, locale, engine)` — `POST /v1/asp/transcribe`, timeout **10min** (asset download primeira vez pode levar minutos)
+- `aspVad(absPath)` — `POST /v1/asp/vad`, timeout 15s
+
+### Architecture notes
+
+- **Device-adaptive automático**: daemon `/v1/health` reporta `speech_available: bool` e `endpoints[]`. Quando ausente (iOS Capacitor atual), `aspTranscribe` retorna 503 e helper apenas loga warn — sem crash do plugin. Em iPhone/iPad o pipeline audio degrada graciosamente até v1.4 implementar Speech em AegisDaemon.
+- **Privacy gate intocado**: daemon usa `requiresOnDeviceRecognition=true` + `AssetInventory.reserve(locale:)` — áudio nunca sai do Mac
+- **Pipeline mesmo padrão `.md`**: `embeddings.jsonl` ganha entries `kind: 'audio'` mas estrutura compatível — Smart View renderiza automaticamente (campos vec, sha, mtime, path, title presentes)
+- **Debounce 2s** ≠ 500ms `.md` porque audio writes (especialmente .m4a via Voice Memos) podem demorar a finalizar arquivo
+
+### Validation pipeline (smoke real)
+
+```
+POST /v1/asp/vad      {path: /tmp/test.wav}            → has_speech: true (6.16s)
+POST /v1/asp/transcribe {path: ..., locale: pt-BR}     → engine=sa, text 80ch
+POST /v1/embed        {text: <transcript>}             → dim 512, model apple-nlcontextual-pt-BR
+```
+
+Latência total: ~1.5s para áudio de 6s. Disparado em background via debounce, imperceptível ao usuário do Obsidian.
+
+### Sintax validation
+
+- `node -e 'new Function(fs.readFileSync("main.js","utf8"))'` ✅ parse OK
+- `node -e 'new Function(fs.readFileSync("lib/zeus-http-client.js","utf8"))'` ✅ parse OK
+- Daemon Swift inalterado nesta release — endpoints `asp/*` já existem desde v1.3.2
+
+### Next (v1.4)
+
+- Real-time pipeline para `.pdf` (aocr) e imagens (av classify + landmarks + EXIF) — atualmente só via `runFullIndex`
+- AegisDaemon iOS com Speech framework — desbloquear audio em iPhone/iPad
+- `audioEngineUsedCount` no status bar (`🎙️ N memos · M via SA · K via SF`)
+
+---
+
 ## [1.3.2] — 2026-05-15 — SpeechAnalyzer dual-engine (resolve deadlock async + asset prefetch)
 
 Resolve o bug de runtime do `SpeechAnalyzer` que motivou o pivote para `SFSpeechRecognizer` na v1.3.1. Padrão correto derivado de leitura dos repos production de CLIs de speech do GitHub: [`finnvoor/yap`](https://github.com/finnvoor/yap) (dictation CLI) e [`mrinalwadhwa/freeflow`](https://github.com/mrinalwadhwa/freeflow) (`SpeechAnalyzerStreamingProvider`).

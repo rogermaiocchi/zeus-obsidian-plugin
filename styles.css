@@ -1,71 +1,179 @@
 /*
- * Zeus plugin — Claude-style minimalist UI
- * Usa variáveis CSS do Obsidian + style-settings, integra com snippets 02-typography, 06-callouts.
+ * Zeus plugin — UI redesign v0.12.1
+ * ============================================================================
+ * Design tokens: Anthropic brand (cores main + accent + typography)
+ * Inspirações UX: Smart Connections (cards), Omnisearch (modal search),
+ *                 Strange New Worlds (badges sutis)
+ * ============================================================================
+ * Organização:
+ *   1. Tokens (:root --zeus-*)              — paleta + tipografia + radii + shadows
+ *   2. Search modal (.zeus-result*)         — Omnisearch-style com keyboard hints
+ *   3. Smart View pane (.zeus-smart-*)      — Smart Connections card layout
+ *   4. FoundationModels section             — sub-cards com border-left accent
+ *   5. Ask Vault Modal (.zeus-ask-*)        — textarea + answer card
+ *   6. Knowledge Graph Modal (.zeus-graph-*)— SVG canvas + Orange nodes
+ *   7. Settings tab (.zeus-settings)        — typography refinada
+ *   8. Status bar + Status view             — sections + progress + actions
+ *   9. NOVO: Token economics widget         — live metrics card
+ *  10. NOVO: Empty states                   — centered iconography + hint
+ *  11. NOVO: Loading skeleton               — shimmer Light Gray
+ *  12. NOVO: Passport card (PIA results)    — header + meta + concept tags
+ *  13. Dark mode overrides (body.theme-dark)
+ *  14. Mobile overrides (.is-mobile)
+ * ============================================================================
+ * Princípio: tokens Zeus ADITIVOS aos do Obsidian — nunca substituem.
+ * Performance: zero animation além de transition: 80–200ms em hover/focus.
  */
 
-/* ============ Search modal ============ */
+/* ============================================================================
+ * 1. TOKENS — Anthropic brand
+ * ============================================================================ */
+:root {
+  /* Cores main */
+  --zeus-color-dark: #141413;
+  --zeus-color-light: #faf9f5;
+  --zeus-color-midgray: #b0aea5;
+  --zeus-color-lightgray: #e8e6dc;
+
+  /* Cores accent */
+  --zeus-color-orange: #d97757;
+  --zeus-color-orange-soft: rgba(217, 119, 87, 0.12);
+  --zeus-color-orange-faded: rgba(217, 119, 87, 0.4);
+  --zeus-color-blue: #6a9bcc;
+  --zeus-color-blue-soft: rgba(106, 155, 204, 0.12);
+  --zeus-color-green: #788c5d;
+  --zeus-color-green-soft: rgba(120, 140, 93, 0.14);
+  --zeus-color-red: #c45;
+  --zeus-color-red-soft: rgba(204, 68, 85, 0.12);
+
+  /* Typography */
+  --zeus-font-heading: 'Poppins', 'Inter', -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+  --zeus-font-body: 'Lora', Georgia, serif;
+  --zeus-font-mono: var(--font-monospace, ui-monospace, 'SF Mono', Menlo, monospace);
+
+  /* Radii */
+  --zeus-radius-sm: 4px;
+  --zeus-radius-md: 8px;
+  --zeus-radius-lg: 12px;
+
+  /* Shadows (Anthropic-soft) */
+  --zeus-shadow-card: 0 1px 3px rgba(20, 20, 19, 0.06), 0 2px 8px rgba(20, 20, 19, 0.04);
+  --zeus-shadow-hover: 0 4px 12px rgba(20, 20, 19, 0.08), 0 8px 24px rgba(20, 20, 19, 0.06);
+
+  /* Surfaces — derivam de Obsidian + ajustes Zeus */
+  --zeus-surface-card: var(--background-primary);
+  --zeus-surface-elevated: var(--background-secondary);
+  --zeus-surface-subtle: var(--zeus-color-lightgray);
+  --zeus-border-subtle: rgba(176, 174, 165, 0.35);
+  --zeus-border-strong: rgba(20, 20, 19, 0.12);
+}
+
+/* ============================================================================
+ * 2. SEARCH MODAL — Omnisearch-inspired (3 colunas implícitas + highlight)
+ * ============================================================================ */
 .suggestion-item.zeus-result {
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--background-modifier-border-hover);
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--zeus-border-subtle);
   cursor: pointer;
+  transition: background-color 80ms ease;
 }
 .suggestion-item.zeus-result:last-child {
   border-bottom: none;
+}
+.suggestion-item.zeus-result:hover,
+.suggestion-item.zeus-result.is-selected {
+  background: var(--zeus-color-orange-soft);
 }
 .zeus-result-head {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
   gap: 12px;
-  margin-bottom: 4px;
+  margin-bottom: 5px;
 }
 .zeus-result-title {
+  font-family: var(--zeus-font-heading);
   font-weight: 600;
-  font-size: var(--font-ui-medium);
+  font-size: 14px;
   color: var(--text-normal);
   letter-spacing: -0.01em;
+  line-height: 1.3;
 }
 .zeus-result-meta {
   display: flex;
   gap: 6px;
   flex-shrink: 0;
+  align-items: center;
 }
 .zeus-badge {
   display: inline-block;
   padding: 2px 7px;
-  border-radius: 4px;
+  border-radius: var(--zeus-radius-sm);
   font-size: 10px;
   font-weight: 600;
-  font-family: var(--font-monospace);
+  font-family: var(--zeus-font-mono);
   letter-spacing: 0.04em;
-  line-height: 1.2;
+  line-height: 1.3;
 }
+/* Score-based color mapping: alto=orange, médio=blue, baixo=gray */
 .zeus-badge-sem {
-  background: var(--color-accent-1, var(--interactive-accent));
-  color: var(--text-on-accent);
-  opacity: 0.85;
+  background: var(--zeus-color-orange);
+  color: var(--zeus-color-light);
 }
 .zeus-badge-exact {
-  background: var(--background-modifier-success, #2c5530);
-  color: var(--text-on-accent, #fff);
+  background: var(--zeus-color-green);
+  color: var(--zeus-color-light);
 }
 .zeus-result-path {
   font-size: 11px;
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
+  color: var(--zeus-color-midgray);
+  font-family: var(--zeus-font-mono);
   margin-bottom: 6px;
   letter-spacing: 0;
 }
 .zeus-result-excerpt {
+  font-family: var(--zeus-font-body);
   font-size: 13px;
   color: var(--text-muted);
-  line-height: 1.5;
-  font-family: var(--font-text);
+  line-height: 1.55;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* Inline highlight de termos matched */
+.zeus-highlight,
+.suggestion-item.zeus-result mark {
+  background: var(--zeus-color-orange-soft);
+  color: var(--text-normal);
+  padding: 0 2px;
+  border-radius: 2px;
 }
 
-/* ============ Smart View pane ============ */
+/* Keyboard hints footer (renderizado pelo modal se houver) */
+.zeus-search-hints {
+  padding: 8px 18px;
+  border-top: 1px solid var(--zeus-border-subtle);
+  font-size: 10px;
+  color: var(--zeus-color-midgray);
+  font-family: var(--zeus-font-mono);
+  display: flex;
+  gap: 14px;
+}
+.zeus-search-hints kbd {
+  background: var(--zeus-surface-subtle);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--zeus-font-mono);
+  font-size: 10px;
+  color: var(--text-normal);
+}
+
+/* ============================================================================
+ * 3. SMART VIEW PANE — Smart Connections-inspired (cards + score canto)
+ * ============================================================================ */
 .zeus-smart-view {
-  padding: 14px 16px;
+  padding: 16px;
   background: var(--background-primary);
   height: 100%;
   overflow-y: auto;
@@ -73,230 +181,305 @@
 .zeus-smart-header {
   display: flex;
   align-items: center;
+  gap: 8px;
   margin-bottom: 14px;
   padding-bottom: 10px;
-  border-bottom: 1px solid var(--background-modifier-border);
+  border-bottom: 1px solid var(--zeus-border-subtle);
+  position: sticky;
+  top: 0;
+  background: var(--background-primary);
+  z-index: 2;
 }
 .zeus-smart-title {
+  font-family: var(--zeus-font-heading);
   font-weight: 600;
-  font-size: var(--font-ui-small);
-  color: var(--text-muted);
+  font-size: 11px;
+  color: var(--zeus-color-midgray);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
 }
 .zeus-smart-empty {
-  color: var(--text-faint);
+  color: var(--zeus-color-midgray);
   font-size: 13px;
+  font-family: var(--zeus-font-body);
   font-style: italic;
-  padding: 24px 8px;
+  padding: 28px 8px;
   text-align: center;
 }
 .zeus-smart-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 8px;
 }
+
+/* Card layout (Smart Connections-style) */
 .zeus-smart-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 9px 10px;
-  border-radius: 6px;
+  position: relative;
+  display: block;
+  padding: 12px 14px;
+  border: 1px solid var(--zeus-border-subtle);
+  border-radius: var(--zeus-radius-md);
+  background: var(--zeus-surface-card);
   cursor: pointer;
-  transition: background 80ms ease;
+  transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
 }
 .zeus-smart-item:hover {
-  background: var(--background-modifier-hover);
+  background: var(--background-primary-alt, var(--background-primary));
+  border-color: var(--zeus-color-orange-faded);
+  box-shadow: var(--zeus-shadow-hover);
+  transform: translateY(-1px);
 }
+
+/* Score badge no canto superior direito */
 .zeus-smart-score {
-  flex-shrink: 0;
-  min-width: 28px;
-  height: 22px;
-  display: flex;
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  min-width: 32px;
+  height: 20px;
+  padding: 0 6px;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: var(--background-modifier-form-field);
-  color: var(--text-accent);
-  border-radius: 4px;
-  font-family: var(--font-monospace);
+  background: var(--zeus-color-blue-soft);
+  color: var(--zeus-color-blue);
+  border-radius: var(--zeus-radius-sm);
+  font-family: var(--zeus-font-mono);
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0;
-  padding: 0 4px;
-  margin-top: 2px;
+}
+/* Score alto (≥70) → Orange; default → Blue (já no base) */
+.zeus-smart-item[data-score-tier="high"] .zeus-smart-score,
+.zeus-smart-score[data-tier="high"] {
+  background: var(--zeus-color-orange-soft);
+  color: var(--zeus-color-orange);
 }
 .zeus-smart-item-body {
-  flex: 1;
+  padding-right: 48px; /* dá espaço pro score badge */
   min-width: 0;
 }
 .zeus-smart-item-title {
-  font-weight: 500;
-  font-size: 13px;
+  font-family: var(--zeus-font-heading);
+  font-weight: 600;
+  font-size: 14px;
   color: var(--text-normal);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   letter-spacing: -0.005em;
+  line-height: 1.3;
 }
 .zeus-smart-item-path {
-  font-size: 10px;
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
+  font-size: 11px;
+  color: var(--zeus-color-midgray);
+  font-family: var(--zeus-font-mono);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-top: 1px;
+  margin-top: 3px;
 }
 
-/* ============ FoundationModels reasoning section ============ */
+/* ============================================================================
+ * 4. FOUNDATIONMODELS SECTION — sub-cards com border-left accent
+ * ============================================================================ */
 .zeus-smart-header-fm {
-  margin-top: 18px;
+  margin-top: 20px;
 }
 .zeus-badge-fm {
-  background: linear-gradient(135deg, #6366f1, #8b5cf6);
-  color: #fff;
+  background: var(--zeus-color-blue);
+  color: var(--zeus-color-light);
   margin-left: auto;
+  animation: zeus-pulse 1.4s ease-in-out infinite;
+}
+@keyframes zeus-pulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
 }
 .zeus-badge-fm-ok {
-  background: var(--background-modifier-success, #2c5530);
-  color: #fff;
+  background: var(--zeus-color-green);
+  color: var(--zeus-color-light);
   margin-left: auto;
 }
 .zeus-smart-fm-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
 }
 .zeus-smart-subsection {
-  padding: 8px 0;
+  padding: 4px 0;
 }
 .zeus-smart-subtitle {
+  font-family: var(--zeus-font-heading);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-faint);
-  margin: 4px 0 6px;
+  letter-spacing: 0.1em;
+  color: var(--zeus-color-midgray);
+  margin: 0 0 8px;
 }
 .zeus-smart-item-fm {
-  border-left: 2px solid var(--color-accent-1, var(--interactive-accent));
-  padding-left: 8px;
+  border-left: 3px solid var(--zeus-color-orange);
+  padding-left: 12px;
+  border-radius: 0 var(--zeus-radius-sm) var(--zeus-radius-sm) 0;
+}
+.zeus-smart-item-fm .zeus-smart-item-body {
+  padding-right: 0;
 }
 .zeus-smart-item-reason {
-  font-size: 11px;
+  font-family: var(--zeus-font-body);
+  font-size: 12px;
   color: var(--text-muted);
   font-style: italic;
-  line-height: 1.4;
-  margin: 2px 0;
+  line-height: 1.5;
+  margin: 3px 0;
 }
 .zeus-smart-conn {
-  padding: 6px 10px;
-  background: var(--background-secondary);
-  border-radius: 4px;
-  border-left: 2px solid var(--color-purple, #8b5cf6);
+  padding: 10px 12px;
+  background: var(--zeus-surface-elevated);
+  border-radius: var(--zeus-radius-md);
+  border-left: 3px solid var(--zeus-color-blue);
 }
 .zeus-smart-conn-title {
-  font-weight: 500;
+  font-family: var(--zeus-font-heading);
+  font-weight: 600;
   font-size: 13px;
   color: var(--text-normal);
 }
 .zeus-smart-conn-reason {
-  font-size: 11px;
+  font-family: var(--zeus-font-body);
+  font-size: 12px;
   color: var(--text-muted);
-  margin-top: 3px;
-  line-height: 1.4;
+  margin-top: 4px;
+  line-height: 1.5;
 }
 .zeus-smart-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 5px;
 }
 .zeus-smart-tag {
-  padding: 2px 7px;
-  background: var(--background-modifier-form-field);
+  padding: 2px 8px;
+  background: var(--zeus-color-green-soft);
+  color: var(--zeus-color-green);
   border-radius: 10px;
   font-size: 10px;
-  color: var(--text-accent);
-  font-family: var(--font-monospace);
+  font-family: var(--zeus-font-mono);
+  font-weight: 600;
   letter-spacing: 0;
 }
 
-/* ============ Ask Vault Modal ============ */
-.zeus-ask-modal {
-  padding: 20px 24px;
+/* ============================================================================
+ * 5. ASK VAULT MODAL — textarea + answer card (Lora body)
+ * ============================================================================ */
+.zeus-ask-modal,
+.zeus-passport-find-modal {
+  padding: 24px 28px;
+  min-width: 560px;
 }
-.zeus-ask-modal h3 {
+.zeus-ask-modal h3,
+.zeus-passport-find-modal h3 {
   margin: 0 0 8px;
+  font-family: var(--zeus-font-heading);
   font-weight: 600;
+  font-size: 18px;
   letter-spacing: -0.02em;
+  color: var(--text-normal);
 }
 .zeus-ask-hint {
   color: var(--text-muted);
-  font-size: 12px;
-  margin: 0 0 16px;
-  line-height: 1.5;
+  font-family: var(--zeus-font-body);
+  font-size: 13px;
+  margin: 0 0 18px;
+  line-height: 1.55;
 }
-.zeus-ask-input {
+.zeus-ask-input,
+.zeus-passport-find-input {
   width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  background: var(--background-primary);
+  padding: 11px 14px;
+  border: 1px solid var(--zeus-border-subtle);
+  border-radius: var(--zeus-radius-md);
+  background: var(--zeus-surface-card);
   color: var(--text-normal);
-  font-family: var(--font-text);
+  font-family: var(--zeus-font-body);
   font-size: 14px;
   resize: vertical;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.zeus-ask-input:focus,
+.zeus-passport-find-input:focus {
+  border-color: var(--zeus-color-orange);
+  box-shadow: 0 0 0 3px var(--zeus-color-orange-soft);
+  outline: none;
 }
 .zeus-ask-status {
-  margin: 10px 0;
-  color: var(--text-faint);
+  margin: 12px 0;
+  color: var(--zeus-color-midgray);
   font-size: 12px;
+  font-family: var(--zeus-font-body);
   font-style: italic;
 }
 .zeus-ask-answer {
-  margin: 12px 0;
+  margin: 14px 0;
   max-height: 500px;
   overflow-y: auto;
 }
 .zeus-ask-answer-text {
-  padding: 12px;
-  background: var(--background-secondary);
-  border-radius: 6px;
-  font-family: var(--font-text);
-  font-size: 13px;
-  line-height: 1.6;
+  padding: 14px 16px;
+  background: var(--zeus-surface-subtle);
+  border-radius: var(--zeus-radius-md);
+  border-left: 3px solid var(--zeus-color-orange);
+  font-family: var(--zeus-font-body);
+  font-size: 14px;
+  line-height: 1.65;
   white-space: pre-wrap;
+  color: var(--text-normal);
 }
-.zeus-ask-submit {
-  margin-top: 10px;
+.zeus-ask-submit.mod-cta {
+  margin-top: 12px;
+  background: var(--zeus-color-orange);
+  color: var(--zeus-color-light);
+  border-radius: var(--zeus-radius-md);
+  font-family: var(--zeus-font-heading);
+  font-weight: 600;
+  padding: 8px 18px;
+  transition: background 120ms ease;
+}
+.zeus-ask-submit.mod-cta:hover {
+  background: #c46640; /* Orange darker */
 }
 
-/* ============ Knowledge Graph modal ============ */
+/* ============================================================================
+ * 6. KNOWLEDGE GRAPH MODAL — Orange nodes sobre canvas suave
+ * ============================================================================ */
 .zeus-graph-modal {
-  padding: 20px 24px;
+  padding: 24px 28px;
   min-width: 760px;
 }
 .zeus-graph-modal h3 {
   margin: 0 0 4px;
+  font-family: var(--zeus-font-heading);
   font-weight: 600;
+  font-size: 18px;
   letter-spacing: -0.02em;
 }
 .zeus-graph-path {
-  margin: 0 0 14px;
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
+  margin: 0 0 16px;
+  color: var(--zeus-color-midgray);
+  font-family: var(--zeus-font-mono);
   font-size: 11px;
 }
 .zeus-graph-status {
-  padding: 24px;
+  padding: 28px;
   text-align: center;
   color: var(--text-muted);
+  font-family: var(--zeus-font-body);
   font-style: italic;
 }
 .zeus-graph-canvas {
-  background: var(--background-secondary);
-  border-radius: 8px;
-  padding: 12px;
+  background: var(--zeus-surface-subtle);
+  border-radius: var(--zeus-radius-lg);
+  padding: 14px;
+  border: 1px solid var(--zeus-border-subtle);
 }
 .zeus-graph-svg {
   width: 100%;
@@ -304,66 +487,430 @@
   display: block;
 }
 .zeus-graph-node {
-  fill: var(--interactive-accent);
-  stroke: var(--background-primary);
+  fill: var(--zeus-color-orange);
+  stroke: var(--zeus-color-light);
   stroke-width: 2;
 }
 .zeus-graph-node-label {
   fill: var(--text-normal);
   font-size: 11px;
   text-anchor: middle;
-  font-family: var(--font-text);
+  font-family: var(--zeus-font-heading);
+  font-weight: 500;
 }
 .zeus-graph-edge {
-  stroke: var(--text-faint);
+  stroke: var(--zeus-color-midgray);
   stroke-width: 1;
-  stroke-opacity: 0.5;
+  stroke-opacity: 0.4;
 }
 .zeus-graph-edge-label {
-  fill: var(--text-muted);
+  fill: var(--zeus-color-midgray);
   font-size: 9px;
   text-anchor: middle;
-  font-family: var(--font-monospace);
+  font-family: var(--zeus-font-mono);
 }
 .zeus-graph-empty {
-  padding: 32px;
+  padding: 36px;
   text-align: center;
-  color: var(--text-faint);
+  color: var(--zeus-color-midgray);
+  font-family: var(--zeus-font-body);
 }
 .zeus-graph-summary {
-  margin-top: 10px;
+  margin-top: 12px;
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--zeus-color-midgray);
   text-align: center;
+  font-family: var(--zeus-font-mono);
 }
 
-/* ============ Settings tab — Claude-style ============ */
+/* ============================================================================
+ * 7. SETTINGS TAB — typography refinada
+ * ============================================================================ */
 .zeus-settings h2 {
+  font-family: var(--zeus-font-heading);
   font-weight: 600;
   letter-spacing: -0.02em;
+  color: var(--text-normal);
 }
 .zeus-settings p {
   color: var(--text-muted);
-  font-size: var(--font-ui-medium);
-  line-height: 1.55;
+  font-family: var(--zeus-font-body);
+  font-size: 14px;
+  line-height: 1.6;
 }
 
-/* ============ Status bar ============ */
-.zeus-status-bar { cursor: pointer; font-family: var(--font-monospace); font-size: 11px; }
-.zeus-status-bar:hover { color: var(--text-accent); }
+/* ============================================================================
+ * 8. STATUS BAR + STATUS VIEW — sections em cards + progress Orange
+ * ============================================================================ */
+.zeus-status-bar {
+  cursor: pointer;
+  font-family: var(--zeus-font-mono);
+  font-size: 11px;
+  transition: color 120ms ease;
+}
+.zeus-status-bar:hover {
+  color: var(--zeus-color-orange);
+}
 
-/* ============ Status view ============ */
-.zeus-status-view { padding: 16px; background: var(--background-primary); overflow-y: auto; height: 100%; }
-.zeus-status-header h3 { margin: 0 0 12px; font-weight: 600; letter-spacing: -0.02em; }
-.zeus-status-section { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--background-modifier-border); }
-.zeus-status-section-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); margin-bottom: 8px; }
-.zeus-status-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
-.zeus-status-label { color: var(--text-muted); }
-.zeus-status-value { font-family: var(--font-monospace); color: var(--text-normal); }
-.zeus-status-value.zeus-status-ok { color: var(--text-success, #2c5530); }
-.zeus-status-value.zeus-status-err { color: var(--text-error, #c00); }
-.zeus-status-value.zeus-status-warn { color: var(--text-warning, #cb6); }
-.zeus-progress-wrap { background: var(--background-modifier-form-field); border-radius: 4px; height: 20px; position: relative; overflow: hidden; }
-.zeus-progress-bar { background: linear-gradient(90deg, var(--interactive-accent), var(--color-accent)); height: 100%; color: white; text-align: center; line-height: 20px; font-size: 11px; font-weight: 600; transition: width 300ms ease; }
-.zeus-status-actions { display: flex; gap: 8px; margin-top: 10px; }
-.zeus-status-actions button { flex: 1; padding: 6px 10px; font-size: 12px; }
+.zeus-status-view {
+  padding: 18px;
+  background: var(--background-primary);
+  overflow-y: auto;
+  height: 100%;
+}
+.zeus-status-header h3 {
+  margin: 0 0 14px;
+  font-family: var(--zeus-font-heading);
+  font-weight: 600;
+  font-size: 17px;
+  letter-spacing: -0.02em;
+}
+.zeus-status-section {
+  margin-bottom: 14px;
+  padding: 14px;
+  background: var(--zeus-surface-subtle);
+  border-radius: var(--zeus-radius-md);
+  border: 1px solid var(--zeus-border-subtle);
+}
+.zeus-status-section-title {
+  font-family: var(--zeus-font-heading);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--zeus-color-midgray);
+  margin-bottom: 10px;
+}
+.zeus-status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 12px;
+}
+.zeus-status-label {
+  color: var(--text-muted);
+  font-family: var(--zeus-font-body);
+}
+.zeus-status-value {
+  font-family: var(--zeus-font-mono);
+  color: var(--text-normal);
+  font-weight: 500;
+}
+.zeus-status-value.zeus-status-ok {
+  color: var(--zeus-color-green);
+}
+.zeus-status-value.zeus-status-err {
+  color: var(--zeus-color-red);
+}
+.zeus-status-value.zeus-status-warn {
+  color: var(--zeus-color-orange);
+}
+.zeus-progress-wrap {
+  background: var(--zeus-color-lightgray);
+  border-radius: var(--zeus-radius-sm);
+  height: 22px;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--zeus-border-subtle);
+}
+.zeus-progress-bar {
+  background: linear-gradient(90deg, var(--zeus-color-orange) 0%, #e89372 100%);
+  height: 100%;
+  color: var(--zeus-color-light);
+  text-align: center;
+  line-height: 22px;
+  font-family: var(--zeus-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  transition: width 300ms ease;
+}
+.zeus-status-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+.zeus-status-actions button {
+  flex: 1;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: var(--zeus-font-heading);
+  font-weight: 600;
+  border-radius: var(--zeus-radius-md);
+  background: var(--zeus-color-orange);
+  color: var(--zeus-color-light);
+  border: none;
+  cursor: pointer;
+  transition: background 120ms ease, transform 120ms ease;
+}
+.zeus-status-actions button:hover {
+  background: #c46640;
+  transform: translateY(-1px);
+}
+
+/* ============================================================================
+ * 9. TOKEN ECONOMICS WIDGET — live metrics card
+ * ============================================================================ */
+.zeus-token-widget {
+  padding: 16px 18px;
+  background: var(--zeus-surface-card);
+  border: 1px solid var(--zeus-border-subtle);
+  border-radius: var(--zeus-radius-lg);
+  box-shadow: var(--zeus-shadow-card);
+  margin: 12px 0;
+}
+.zeus-token-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 4px 0;
+}
+.zeus-token-label {
+  font-family: var(--zeus-font-body);
+  font-size: 12px;
+  color: var(--zeus-color-midgray);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.zeus-token-value {
+  font-family: var(--zeus-font-heading);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--zeus-color-orange);
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.zeus-token-bar {
+  margin: 10px 0 6px;
+  height: 6px;
+  background: var(--zeus-color-lightgray);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.zeus-token-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--zeus-color-orange) 0%, #e89372 100%);
+  border-radius: 999px;
+  transition: width 400ms ease;
+}
+.zeus-token-caption {
+  font-family: var(--zeus-font-mono);
+  font-size: 11px;
+  color: var(--zeus-color-midgray);
+  text-align: right;
+}
+
+/* ============================================================================
+ * 10. EMPTY STATES — centered iconography + Lora italic hint
+ * ============================================================================ */
+.zeus-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 20px;
+  text-align: center;
+  gap: 8px;
+}
+.zeus-empty-icon {
+  font-size: 42px;
+  color: var(--zeus-color-orange-faded);
+  line-height: 1;
+  margin-bottom: 4px;
+}
+.zeus-empty-title {
+  font-family: var(--zeus-font-heading);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.zeus-empty-hint {
+  font-family: var(--zeus-font-body);
+  font-size: 13px;
+  font-style: italic;
+  color: var(--zeus-color-midgray);
+  max-width: 320px;
+  line-height: 1.5;
+}
+
+/* ============================================================================
+ * 11. LOADING SKELETON — Light Gray shimmer
+ * ============================================================================ */
+.zeus-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+}
+.zeus-skeleton-line {
+  height: 12px;
+  background: linear-gradient(
+    90deg,
+    var(--zeus-color-lightgray) 0%,
+    #f3f1e8 50%,
+    var(--zeus-color-lightgray) 100%
+  );
+  background-size: 200% 100%;
+  border-radius: var(--zeus-radius-sm);
+  animation: zeus-shimmer 1.4s ease-in-out infinite;
+}
+.zeus-skeleton-w40 { width: 40%; }
+.zeus-skeleton-w70 { width: 70%; }
+.zeus-skeleton-w100 { width: 100%; }
+@keyframes zeus-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ============================================================================
+ * 12. PASSPORT CARD — PIA results (find via passport)
+ * ============================================================================ */
+.zeus-passport-find-results {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+  max-height: 540px;
+  overflow-y: auto;
+}
+.zeus-passport-card {
+  padding: 14px 16px;
+  background: var(--zeus-surface-card);
+  border: 1px solid var(--zeus-border-subtle);
+  border-radius: var(--zeus-radius-md);
+  cursor: pointer;
+  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+.zeus-passport-card:hover {
+  border-color: var(--zeus-color-orange-faded);
+  box-shadow: var(--zeus-shadow-hover);
+  transform: translateY(-1px);
+}
+.zeus-passport-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+/* Spec novo (zeus-passport-title) + legacy (zeus-passport-card-title) */
+.zeus-passport-title,
+.zeus-passport-card-title {
+  font-family: var(--zeus-font-heading);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-normal);
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  margin: 0;
+}
+.zeus-passport-meta,
+.zeus-passport-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.zeus-passport-score {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 20px;
+  padding: 0 6px;
+  background: var(--zeus-color-orange-soft);
+  color: var(--zeus-color-orange);
+  border-radius: var(--zeus-radius-sm);
+  font-family: var(--zeus-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+.zeus-passport-difficulty {
+  font-family: var(--zeus-font-mono);
+  font-size: 12px;
+  color: var(--zeus-color-blue);
+  letter-spacing: 0.04em;
+}
+.zeus-passport-summary,
+.zeus-passport-card-summary {
+  font-family: var(--zeus-font-body);
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.55;
+  margin: 6px 0 10px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.zeus-passport-concepts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+.zeus-concept-tag {
+  padding: 2px 8px;
+  background: var(--zeus-color-blue-soft);
+  color: var(--zeus-color-blue);
+  border-radius: 10px;
+  font-family: var(--zeus-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+.zeus-passport-domain {
+  font-family: var(--zeus-font-mono);
+  font-size: 10px;
+  color: var(--zeus-color-midgray);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* ============================================================================
+ * 13. DARK MODE — invert surfaces, preserve accents
+ * ============================================================================ */
+body.theme-dark {
+  --zeus-surface-card: #1d1d1c;
+  --zeus-surface-elevated: #252523;
+  --zeus-surface-subtle: rgba(232, 230, 220, 0.04);
+  --zeus-border-subtle: rgba(232, 230, 220, 0.1);
+  --zeus-border-strong: rgba(232, 230, 220, 0.2);
+}
+body.theme-dark .zeus-progress-wrap,
+body.theme-dark .zeus-token-bar {
+  background: rgba(232, 230, 220, 0.08);
+}
+body.theme-dark .zeus-skeleton-line {
+  background: linear-gradient(
+    90deg,
+    rgba(232, 230, 220, 0.05) 0%,
+    rgba(232, 230, 220, 0.12) 50%,
+    rgba(232, 230, 220, 0.05) 100%
+  );
+  background-size: 200% 100%;
+}
+
+/* ============================================================================
+ * 14. MOBILE (iPad/iPhone) — reduced padding
+ * ============================================================================ */
+.is-mobile .zeus-ask-modal,
+.is-mobile .zeus-passport-find-modal,
+.is-mobile .zeus-graph-modal {
+  padding: 16px 14px;
+  min-width: unset;
+  width: 100%;
+}
+.is-mobile .zeus-smart-view,
+.is-mobile .zeus-status-view {
+  padding: 12px;
+}
+.is-mobile .zeus-smart-item,
+.is-mobile .zeus-passport-card {
+  padding: 10px 12px;
+}
+.is-mobile .zeus-status-section {
+  padding: 12px;
+}
+.is-mobile .suggestion-item.zeus-result {
+  padding: 12px 14px;
+}

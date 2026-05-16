@@ -1,0 +1,53 @@
+{
+  "task": "graph_extract",
+  "captured_from": "curated (estilo apple-foundationmodels)",
+  "captured_at": "2026-05-16",
+  "examples": [
+    {
+      "input": {
+        "text": "A Lei nº 13.954/2019 alterou substancialmente o regime previdenciário dos militares federais. O Supremo Tribunal Federal, no Tema 1.150, firmou tese sobre a constitucionalidade da contribuição. O TJDFT passou a sobrestar feitos análogos.",
+        "domain": "juridico"
+      },
+      "output": {
+        "entities": [
+          {"id": "lei_13954_2019", "type": "Lei", "name": "Lei nº 13.954/2019"},
+          {"id": "regime_prev_militar", "type": "Conceito", "name": "Regime previdenciário dos militares federais"},
+          {"id": "stf", "type": "Org", "name": "Supremo Tribunal Federal"},
+          {"id": "tema_1150", "type": "Doc", "name": "Tema 1.150 do STF"},
+          {"id": "tjdft", "type": "Org", "name": "TJDFT"}
+        ],
+        "relations": [
+          {"subject": "lei_13954_2019", "predicate": "altera", "object": "regime_prev_militar"},
+          {"subject": "stf", "predicate": "firma_tese", "object": "tema_1150"},
+          {"subject": "tema_1150", "predicate": "trata_de", "object": "lei_13954_2019"},
+          {"subject": "tjdft", "predicate": "sobresta_feitos_aguardando", "object": "tema_1150"}
+        ],
+        "domain": "juridico"
+      }
+    },
+    {
+      "input": {
+        "text": "O AegisDaemon é um serviço Swift que roda em iOS e macOS expondo endpoints HTTP em 127.0.0.1:2223. Em iOS, embarca o MLX Swift carregando o Gemma 4 fine-tunado. O MetassistemaApp orquestra o AegisDaemon.",
+        "domain": "tech"
+      },
+      "output": {
+        "entities": [
+          {"id": "aegis_daemon", "type": "Doc", "name": "AegisDaemon"},
+          {"id": "mlx_swift", "type": "Conceito", "name": "MLX Swift"},
+          {"id": "gemma_4", "type": "Doc", "name": "Gemma 4"},
+          {"id": "metassistema_app", "type": "Doc", "name": "MetassistemaApp"},
+          {"id": "ios", "type": "Conceito", "name": "iOS"},
+          {"id": "macos", "type": "Conceito", "name": "macOS"}
+        ],
+        "relations": [
+          {"subject": "aegis_daemon", "predicate": "roda_em", "object": "ios"},
+          {"subject": "aegis_daemon", "predicate": "roda_em", "object": "macos"},
+          {"subject": "aegis_daemon", "predicate": "embarca", "object": "mlx_swift"},
+          {"subject": "mlx_swift", "predicate": "carrega", "object": "gemma_4"},
+          {"subject": "metassistema_app", "predicate": "orquestra", "object": "aegis_daemon"}
+        ],
+        "domain": "tech"
+      }
+    }
+  ]
+}

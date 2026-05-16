@@ -1,0 +1,19 @@
+{
+  "task": "summarize",
+  "captured_from": "apple-foundationmodels-systemlanguagemodel (Mac mini)",
+  "captured_at": "2026-05-16",
+  "examples": [
+    {
+      "input": "O Gemma 4, lançado pela Google DeepMind em abril de 2026, é um modelo open-weight sob licença Apache 2.0. As variantes E2B e E4B foram projetadas para dispositivos móveis, rodando offline. O framework MLX Swift, da Apple, otimiza inferência em chips de série M. O ml-explore/mlx-swift-examples fornece módulos LLM prontos para uso.",
+      "output": "Google DeepMind lançou o Gemma 4 em abril de 2026, um modelo open-weight sob licença Apache 2.0. As variantes E2B e E4B foram projetadas para dispositivos móveis, rodando offline. O framework MLX Swift, da Apple, otimiza inferência em chips de série M. O ml-explore/mlx-swift-examples fornece módulos LLM prontos para uso."
+    },
+    {
+      "input": "Roger Maiocchi é advogado em Brasília e fundador do escritório Maiocchi Advocacia. Sua área principal é o direito previdenciário militar, em especial demandas contra o IPESM. O escritório utiliza o Obsidian como vault de conhecimento, sincronizado via iCloud entre Mac mini e MacBook. O Metassistema é o sistema interno de automação que Roger desenvolve.",
+      "output": "Roger Maiocchi, advogado e fundador da Maiocchi Advocacia, especializado em direito previdenciário militar, utiliza o Obsidian para armazenar conhecimento e sincroniza-o entre dispositivos via iCloud. Desenvolveu também o Metassistema, um sistema interno de automação."
+    },
+    {
+      "input": "A Lei nº 13.954/2019 alterou substancialmente o regime previdenciário dos militares federais, modificando a forma de cálculo da pensão por morte e instituindo a contribuição de inativos e pensionistas. O Supremo Tribunal Federal, ao julgar o Tema 1.150, firmou tese sobre a constitucionalidade da contribuição. O Tribunal de Justiça do Distrito Federal e dos Territórios passou a sobrestar feitos análogos aguardando a publicação do acórdão.",
+      "output": "A Lei nº 13.954/2019 reformou o regime previdenciário dos militares federais, alterando o cálculo da pensão por morte e instituindo contribuição de inativos e pensionistas. O STF, no Tema 1.150, firmou tese de constitucionalidade. O TJDFT passou a sobrestar feitos análogos aguardando publicação do acórdão."
+    }
+  ]
+}

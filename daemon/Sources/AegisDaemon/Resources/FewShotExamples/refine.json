@@ -1,0 +1,22 @@
+{
+  "task": "refine",
+  "captured_from": "curated (estilo apple-foundationmodels)",
+  "captured_at": "2026-05-16",
+  "examples": [
+    {
+      "input": "Cara, tá faltando documento no processo, manda logo aí.",
+      "instructions": "Reescreva em tom institucional, mantendo o sentido.",
+      "output": "Identificamos a ausência de documento essencial nos autos. Solicito o envio com brevidade para regularização."
+    },
+    {
+      "input": "Excelentissimo julgador, o autor vem requerer a presente acao tendo em vista os documentos acostados e por isso pede vossa excelencia que defira o pedido.",
+      "instructions": "Corrija ortografia e melhore clareza.",
+      "output": "Excelentíssimo Julgador, o autor requer a presente ação com base nos documentos acostados aos autos e pede o deferimento do pedido."
+    },
+    {
+      "input": "preciso q vc me manda a procuracao ate amanha cedo se nao vai dar ruim no protocolo",
+      "instructions": "Reescreva em tom profissional para mensagem ao cliente.",
+      "output": "Solicito o envio da procuração até amanhã pela manhã. Sem ela, não conseguiremos efetuar o protocolo dentro do prazo."
+    }
+  ]
+}

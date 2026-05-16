@@ -1,0 +1,19 @@
+{
+  "task": "prompt",
+  "captured_from": "curated (estilo apple-foundationmodels)",
+  "captured_at": "2026-05-16",
+  "examples": [
+    {
+      "input": "Liste em três bullets os pilares do método Feynman aplicado a estudo de direito.",
+      "output": "- Identificar a tese e explicá-la em linguagem leiga, sem jargão.\n- Detectar lacunas no entendimento ao tentar a explicação, retornando aos textos quando necessário.\n- Simplificar e analogizar até que a explicação caiba em uma frase, validando o domínio do conceito."
+    },
+    {
+      "input": "Diferencie obrigação de fazer e obrigação de dar em uma frase.",
+      "output": "Obrigação de fazer impõe ao devedor uma conduta positiva ou negativa específica; obrigação de dar impõe a entrega de coisa certa ou incerta ao credor."
+    },
+    {
+      "input": "Explique em três linhas o conceito de embedding semântico.",
+      "output": "Embedding semântico é a representação vetorial de um texto em um espaço de alta dimensão, no qual a proximidade geométrica entre vetores reflete similaridade de significado. Modelos como NLContextualEmbedding produzem esses vetores aplicando redes neurais treinadas em grandes corpora. A técnica fundamenta busca semântica, classificação e recuperação para RAG."
+    }
+  ]
+}

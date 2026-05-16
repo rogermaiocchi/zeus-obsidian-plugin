@@ -1,0 +1,30 @@
+{
+  "task": "agent_query",
+  "captured_from": "curated (estilo apple-foundationmodels com RAG)",
+  "captured_at": "2026-05-16",
+  "examples": [
+    {
+      "input": {
+        "question": "Qual é o status atual do projeto meta-grafo-juridico?",
+        "context": [
+          "meta-grafo-juridico: projeto de extração de grafo de conhecimento jurídico a partir do vault. Status: em rascunho, sem implementação. Última edição: 2026-05-09.",
+          "Pendência da auditoria 2026-05-09: definir esquema do grafo (entidades + relações) antes de qualquer extração."
+        ],
+        "pattern": "auto"
+      },
+      "output": "O projeto meta-grafo-juridico está em rascunho, sem implementação iniciada. A última edição é de 2026-05-09. A pendência aberta na auditoria daquela data é a definição do esquema do grafo (entidades e relações) antes da extração."
+    },
+    {
+      "input": {
+        "question": "Liste os arquivos de doutrina do Zeus.",
+        "context": [
+          "meta-doutrina-zeus: doutrina arquitetural para o subsistema Zeus, ênfase em privacidade on-device.",
+          "meta-doutrina-apple-soberano: princípio de soberania Apple no ecossistema.",
+          "meta-doutrina-fundacional: doutrina fundacional do Metassistema."
+        ],
+        "pattern": "plan-execute"
+      },
+      "output": "Plano: percorrer o contexto e separar os documentos cujo nome contém 'doutrina-zeus'.\n\nExecução: o vault contém um único documento de doutrina especificamente do Zeus — meta-doutrina-zeus, que trata da arquitetura on-device privacy-first. Os demais (meta-doutrina-apple-soberano e meta-doutrina-fundacional) compartilham princípios mas não são doutrinas-do-Zeus stricto sensu."
+    }
+  ]
+}

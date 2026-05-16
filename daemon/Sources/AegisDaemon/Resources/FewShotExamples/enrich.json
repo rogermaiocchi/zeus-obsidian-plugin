@@ -1,0 +1,35 @@
+{
+  "task": "enrich",
+  "captured_from": "apple-foundationmodels-systemlanguagemodel (Mac mini)",
+  "captured_at": "2026-05-16",
+  "examples": [
+    {
+      "input": "Decisão arquitetural sobre o Apple-Twin: Opção 1 — paridade total Mac↔iOS. Gemma 4 E2B no iPhone, E4B no iPad, rodando via MLX Swift on-device. Cobre as 7 funções generativas. Fase A: few-shot prompting. Fase B: fine-tune contínuo passivo no Mac mini.",
+      "output": {
+        "suggested_tags": ["generative-AI", "mac-ios", "mlx-swift"],
+        "suggested_links": [
+          {"title": "Apple-Twin", "path": "/notes/apple-twin", "reason": "Explorar mais sobre a tecnologia e a arquitetura do Apple-Twin."},
+          {"title": "MLX Swift on-device", "path": "/notes/mlx-swift", "reason": "Entender como MLX Swift é utilizado em dispositivos Apple."}
+        ],
+        "connections": [
+          {"title": "Few-shot prompting", "path": "/notes/few-shot-prompting", "reason": "Aplicabilidade de few-shot prompting em modelos de IA."},
+          {"title": "Fine-tuning contínuo", "path": "/notes/fine-tuning-contínuo", "reason": "Processo de fine-tuning contínuo e sua importância."}
+        ]
+      }
+    },
+    {
+      "input": "Cliente João Silva, militar reformado, ajuizou ação contra o IPESM pleiteando revisão de pensão por morte. Documento principal: contrato de honorários assinado em 2026-04-10. Tese: aplicação da Lei 6880/80 vigente à época da admissão.",
+      "output": {
+        "suggested_tags": ["pensão-por-morte", "ipesm", "militares", "lei-6880"],
+        "suggested_links": [
+          {"title": "Lei 6.880/80", "path": "/legislacao/lei-6880-80", "reason": "Estatuto dos Militares vigente à época da admissão."},
+          {"title": "Cliente: João Silva", "path": "/clientes/joao-silva", "reason": "Ficha do cliente vinculada ao processo."}
+        ],
+        "connections": [
+          {"title": "Tese — direito adquirido em mudança de regime previdenciário", "path": "/teses/direito-adquirido-regime", "reason": "Fundamento jurídico central da ação."},
+          {"title": "Modelo — contrato de honorários previdenciário", "path": "/modelos/contrato-honorarios-prev", "reason": "Documento de referência arquivado."}
+        ]
+      }
+    }
+  ]
+}

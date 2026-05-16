@@ -212,6 +212,15 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             return self.handleASPTranscribe(bodyJSON: body)
         case (.POST, "/v1/asp/vad"):
             return self.handleASPVAD(bodyJSON: body)
+        // v1.4 — paridade Mac↔iOS (port Fase 0 / Fase 2)
+        case (.POST, "/v1/refine"):
+            return self.handleRefineV14(bodyJSON: body)
+        case (.POST, "/v1/hyde"):
+            return self.handleHyDE(bodyJSON: body)
+        case (.POST, "/v1/graph/extract"):
+            return self.handleGraphExtract(bodyJSON: body)
+        case (.POST, "/v1/agent"):
+            return self.handleAgent(bodyJSON: body)
         default:
             return Response(status: .notFound, payload: [
                 "error": "not_found",
@@ -278,7 +287,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
             "POST /v1/data-detect", "POST /v1/spotlight/search",
             "POST /v1/afm/refine",
-            "POST /v1/asp/transcribe", "POST /v1/asp/vad"
+            "POST /v1/asp/transcribe", "POST /v1/asp/vad",
+            "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract",
+            "POST /v1/agent"
         ]
 
         // v1.3 — Speech framework availability check (asp endpoints)
@@ -289,16 +300,32 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         }
         #endif
 
+        // v1.4 — schema novo paridade Mac↔iOS
+        // No Mac, Twin nunca é wired — Apple Intelligence é a única source-of-truth.
+        let twinLoaded = false
+        let providerActive = fmAvailable ? "apple-intelligence" : "none"
+        let thermal: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:    thermal = "nominal"
+        case .fair:       thermal = "fair"
+        case .serious:    thermal = "serious"
+        case .critical:   thermal = "critical"
+        @unknown default: thermal = "unknown"
+        }
+
         return [
             "status": "ok",
             "platform": "macOS",
             "device": Self.macKindLabel(),
             "hw_model": Self.macHWModel(),
-            "version": "0.5.0",
+            "version": "1.4.0",
             "nl_available": nlAvailable,
             "nl_model": nlModel,
             "vision_available": visionAvailable,
             "fm_available": fmAvailable,
+            "apple_twin_loaded": twinLoaded,
+            "provider_active": providerActive,
+            "thermal_state": thermal,
             "speech_available": speechAvailable,
             "endpoints": endpoints,
             "endpoint_count": endpoints.count
@@ -2189,6 +2216,136 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         return totalChars > 6000 || maxTokens > 1000
     }
 
+    // MARK: - /v1/refine (v1.4 — Writing Tools, paridade com Aegis iOS)
+    //
+    // Endpoint v1.4 com `instructions` livres (diferente de /v1/afm/refine v1.3
+    // que tem mode/tone/language estruturados). Mantemos os dois.
+
+    private func handleRefineV14(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"instructions\": \"opcional\"}"
+            ])
+        }
+        let instructions = (json["instructions"] as? String)
+            ?? "Reescreva mantendo o sentido, melhore clareza, gramática e fluidez. Mantenha o idioma."
+        let maxTokens = (json["max_tokens"] as? Int) ?? 500
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: maxTokens,
+            extraPayload: ["task": "refine"]
+        )
+    }
+
+    // MARK: - /v1/hyde (v1.4 — Hypothetical Document Embeddings)
+
+    private func handleHyDE(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let query = json["query"] as? String, !query.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"query\": \"...\", \"style\": \"juridico|tecnico|generic\"}"
+            ])
+        }
+        let style = (json["style"] as? String) ?? "generic"
+        let maxTokens = (json["max_tokens"] as? Int) ?? 350
+
+        let instructions: String
+        switch style {
+        case "juridico":
+            instructions = "Você é um modelo on-device. Gere um trecho hipotético de doutrina/jurisprudência brasileira (~150 palavras) que poderia ser a resposta ideal à consulta. Sem disclaimers, sem prefixos. Cite leis ou súmulas plausíveis."
+        case "tecnico":
+            instructions = "Você é um modelo on-device. Gere um trecho hipotético de documentação técnica (~150 palavras) que seria a resposta ideal à consulta. Tom institucional."
+        default:
+            instructions = "Você é um modelo on-device. Gere um documento hipotético (~150 palavras) que seria a resposta ideal à consulta. Prosa direta, sem prefixos."
+        }
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: query,
+            maxTokens: maxTokens,
+            extraPayload: ["task": "hyde", "style": style]
+        )
+    }
+
+    // MARK: - /v1/graph/extract (v1.4 — entidades + relações)
+
+    private func handleGraphExtract(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"domain\": \"juridico|tech|geral\"}"
+            ])
+        }
+        let domain = (json["domain"] as? String) ?? "geral"
+        let instructions = """
+        Você é um modelo on-device especializado em extração de grafo de conhecimento. \
+        Analise o texto e devolva APENAS um JSON estrito (sem fences, sem comentários) com:
+          {
+            "entities":  [{"id": "string", "type": "Lei|Pessoa|Conceito|Doc|Lugar|Org|Outro", "name": "string"}],
+            "relations": [{"subject": "id", "predicate": "string", "object": "id"}],
+            "domain":    "\(domain)"
+          }
+        Predicados em português, presente do indicativo. Exclua entidades genéricas.
+        """
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: 700,
+            extraPayload: ["task": "graph_extract", "domain": domain]
+        )
+    }
+
+    // MARK: - /v1/agent (v1.4 — Q&A com contexto RAG, paridade com Aegis)
+    //
+    // Aceita {question, pattern?, context?: [String]}. No Mac, runFoundationModel
+    // sempre vai pro Apple Intelligence (Twin não é wired). Resposta inclui o campo
+    // `answer` para paridade total com /v1/agent do AegisDaemon.
+
+    private func handleAgent(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let question = json["question"] as? String, !question.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"question\": \"...\", \"pattern\": \"auto|react|plan-execute|reflexion\", \"context\": [\"chunk1\",...]}"
+            ])
+        }
+        let pattern = (json["pattern"] as? String) ?? "auto"
+        let contextDocs = (json["context"] as? [String]) ?? []
+
+        let patternHint: String
+        switch pattern {
+        case "react":        patternHint = "[ReAct] Pense em voz alta, use ferramentas iterativamente."
+        case "plan-execute": patternHint = "[Plan-Execute] Primeiro plano completo, depois execute passos."
+        case "reflexion":    patternHint = "[Reflexion] Após responder, reflita sobre erros e revise."
+        default:             patternHint = "Responda direta e objetivamente."
+        }
+
+        var assembled = ""
+        if !contextDocs.isEmpty {
+            assembled += "Contexto recuperado do vault (use APENAS este material, não invente):\n"
+            for (i, chunk) in contextDocs.enumerated() {
+                assembled += "[\(i + 1)] \(chunk)\n"
+            }
+            assembled += "\n"
+        }
+        assembled += "Pergunta:\n\(question)"
+
+        let res = self.runFoundationModel(
+            instructions: patternHint,
+            prompt: assembled,
+            maxTokens: 700,
+            extraPayload: ["task": "agent_query", "pattern": pattern]
+        )
+        // Re-mapeia "text" → "answer" pra paridade com /v1/agent do AegisDaemon
+        if res.status == .ok, let txt = res.payload["text"] as? String {
+            var p = res.payload
+            p["answer"] = txt
+            p["iterations"] = 1
+            return Response(status: .ok, payload: p, pccUsed: res.pccUsed)
+        }
+        return res
+    }
+
     private func runFoundationModel(
         instructions: String,
         prompt: String,
@@ -2231,10 +2388,19 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 var payload: [String: Any] = [
                     "text": resultText,
                     "model": "apple-foundationmodels-systemlanguagemodel",
+                    "provider": "apple-intelligence",
                     "pcc_permission": "\(pcc)",
                     "pcc_used": pccUsed
                 ]
                 for (k, v) in extraPayload { payload[k] = v }
+                // v1.4 Fase B — captura para dataset contínuo (opt-in via flag-file)
+                let taskName = (extraPayload["task"] as? String) ?? "prompt"
+                ZeusFMCaptureMiddleware.capture(
+                    task: taskName,
+                    input: ["instructions": instructions, "prompt": prompt, "max_tokens": maxTokens],
+                    output: resultText,
+                    model: "apple-foundationmodels-systemlanguagemodel"
+                )
                 return Response(status: .ok, payload: payload, pccUsed: pccUsed)
             case .unavailable(let reason):
                 return Response(status: .serviceUnavailable, payload: [

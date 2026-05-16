@@ -167,6 +167,13 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             return self.handleASPTranscribe(bodyJSON: body)
         case (.POST, "/v1/asp/vad"):
             return self.handleASPVAD(bodyJSON: body)
+        // v1.4 — paridade Mac↔iOS (port Fase 0 / Fase 2)
+        case (.POST, "/v1/refine"):
+            return self.handleRefineV14(bodyJSON: body)
+        case (.POST, "/v1/hyde"):
+            return self.handleHyDE(bodyJSON: body)
+        case (.POST, "/v1/graph/extract"):
+            return self.handleGraphExtract(bodyJSON: body)
         default:
             return Response(status: .notFound, payload: [
                 "error": "not_found",
@@ -183,7 +190,8 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                     "POST /v1/passport/find", "POST /v1/content/get",
                     "POST /v1/passport/claim", "POST /v1/passport/release",
                     "POST /v1/afm/refine",
-                    "POST /v1/asp/transcribe", "POST /v1/asp/vad"
+                    "POST /v1/asp/transcribe", "POST /v1/asp/vad",
+                    "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract"
                 ]
             ])
         }
@@ -219,6 +227,25 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         speechAvailable = true
         #endif
 
+        // v1.4 — Apple-Twin (MLX Gemma 4) loaded apenas em iOS quando Apple Intelligence ineligível
+        let twinLoaded = (MLXAppleTwinProvider.shared != nil)
+
+        // v1.4 — Provedor LLM efetivamente ativo
+        let providerActive: String
+        if fmAvailable       { providerActive = "apple-intelligence" }
+        else if twinLoaded   { providerActive = "mlx-apple-twin" }
+        else                 { providerActive = "none" }
+
+        // v1.4 — thermal state (decisão de throttle do Twin runner)
+        let thermal: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:    thermal = "nominal"
+        case .fair:       thermal = "fair"
+        case .serious:    thermal = "serious"
+        case .critical:   thermal = "critical"
+        @unknown default: thermal = "unknown"
+        }
+
         #if os(iOS)
         let platform = "iOS"
         #elseif os(macOS)
@@ -238,16 +265,20 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             "POST /v1/passport/find", "POST /v1/content/get",
             "POST /v1/passport/claim", "POST /v1/passport/release",
             "POST /v1/afm/refine",
-            "POST /v1/asp/transcribe", "POST /v1/asp/vad"
+            "POST /v1/asp/transcribe", "POST /v1/asp/vad",
+            "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract"
         ]
         return [
             "status": "ok",
             "fm_available": fmAvailable,
+            "apple_twin_loaded": twinLoaded,
+            "provider_active": providerActive,
+            "thermal_state": thermal,
             "nl_available": nlAvailable,
             "vision_available": visionAvailable,
             "speech_available": speechAvailable,
             "model": modelName,
-            "version": "0.3.0",
+            "version": "1.4.0",
             "platform": platform,
             "endpoints": endpoints,
             "endpoint_count": endpoints.count
@@ -1619,6 +1650,96 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         )
     }
 
+    // MARK: - /v1/refine (v1.4 — Writing Tools simplificado, paridade com Mac)
+    //
+    // Diferente de /v1/afm/refine (v1.3) que tem mode/tone/language estruturados,
+    // este endpoint aceita `instructions` livres do caller — match com handleRefine
+    // do ZeusDaemonMac. Para callers do plugin Obsidian (v1.4+) este é o entrypoint
+    // preferencial; /v1/afm/refine permanece como API backward-compat.
+
+    private func handleRefineV14(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"instructions\": \"opcional\"}"
+            ])
+        }
+        let instructions = (json["instructions"] as? String)
+            ?? "Reescreva mantendo o sentido, melhore clareza, gramática e fluidez. Mantenha o idioma."
+        let maxTokens = (json["max_tokens"] as? Int) ?? 500
+
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: maxTokens,
+            extraPayload: ["task": "refine"]
+        )
+    }
+
+    // MARK: - /v1/hyde (v1.4 — Hypothetical Document Embeddings)
+    //
+    // Gera um documento hipotético que responderia à query, para depois embedar e
+    // fazer retrieval. Técnica clássica HyDE — melhora top-k em RAG no vault.
+
+    private func handleHyDE(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let query = json["query"] as? String, !query.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"query\": \"...\", \"style\": \"juridico|tecnico|generic\"}"
+            ])
+        }
+        let style = (json["style"] as? String) ?? "generic"
+        let maxTokens = (json["max_tokens"] as? Int) ?? 350
+
+        let instructions: String
+        switch style {
+        case "juridico":
+            instructions = "Você é um modelo on-device. Gere um trecho hipotético de doutrina/jurisprudência brasileira (~150 palavras) que poderia ser a resposta ideal à consulta. Não use disclaimers nem prefixos. Cite leis ou súmulas plausíveis quando fizer sentido."
+        case "tecnico":
+            instructions = "Você é um modelo on-device. Gere um trecho hipotético de documentação técnica (~150 palavras) que seria a resposta ideal à consulta. Tom institucional, sem disclaimers."
+        default:
+            instructions = "Você é um modelo on-device. Gere um documento hipotético (~150 palavras) que seria a resposta ideal à consulta. Prosa direta, sem prefixos."
+        }
+
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: query,
+            maxTokens: maxTokens,
+            extraPayload: ["task": "hyde", "style": style]
+        )
+    }
+
+    // MARK: - /v1/graph/extract (v1.4 — extração de triplas para grafo do vault)
+
+    private func handleGraphExtract(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"domain\": \"juridico|tech|geral\"}"
+            ])
+        }
+        let domain = (json["domain"] as? String) ?? "geral"
+
+        let instructions = """
+        Você é um modelo on-device especializado em extração de grafo de conhecimento. \
+        Analise o texto e devolva APENAS um JSON estrito (sem fences, sem comentários) com a forma:
+          {
+            "entities":   [{"id": "string", "type": "Lei|Pessoa|Conceito|Doc|Lugar|Org|Outro", "name": "string"}],
+            "relations":  [{"subject": "id", "predicate": "string", "object": "id"}],
+            "domain":     "\(domain)"
+          }
+        Exclua entidades genéricas (ex.: "o autor", "a parte"). Predicados em português, presente do indicativo \
+        (ex.: "regula", "revoga", "cita", "depende_de"). Não inclua texto fora do JSON.
+        """
+
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: 600,
+            extraPayload: ["task": "graph_extract", "domain": domain]
+        )
+    }
+
     // MARK: - /v1/asp/transcribe (v1.3 — dual-engine: SA + SF fallback)
 
     private func handleASPTranscribe(bodyJSON: String) -> Response {
@@ -1930,9 +2051,19 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 }
                 var payload: [String: Any] = [
                     "text": resultText,
-                    "model": "apple-foundationmodels-systemlanguagemodel"
+                    "model": "apple-foundationmodels-systemlanguagemodel",
+                    "provider": "apple-intelligence"
                 ]
                 for (k, v) in extraPayload { payload[k] = v }
+                // v1.4 Fase B — captura para dataset contínuo (opt-in via flag-file)
+                let taskName = (extraPayload["task"] as? String) ?? "prompt"
+                AegisFMCaptureMiddleware.capture(
+                    task: taskName,
+                    input: ["instructions": instructions, "prompt": prompt, "max_tokens": maxTokens],
+                    output: resultText,
+                    provider: "apple-intelligence",
+                    model: "apple-foundationmodels-systemlanguagemodel"
+                )
                 return Response(status: .ok, payload: payload)
             case .unavailable(let reason):
                 return Response(status: .serviceUnavailable, payload: [

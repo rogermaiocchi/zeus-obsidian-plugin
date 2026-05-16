@@ -1,0 +1,22 @@
+{
+  "task": "hyde",
+  "captured_from": "curated (estilo apple-foundationmodels)",
+  "captured_at": "2026-05-16",
+  "examples": [
+    {
+      "input": "pensão por morte militar inativo SPSM/IPESM cumulação com previdência geral",
+      "style": "juridico",
+      "output": "A pensão por morte deixada por militar inativo, paga pelo Sistema de Proteção Social dos Militares por intermédio do IPESM, possui natureza jurídica autônoma em relação ao Regime Geral de Previdência Social. A cumulação entre os benefícios é admitida quando decorrentes de fontes contributivas distintas, conforme entendimento consolidado do STF a partir do RE 612.451. Eventual vedação dependerá de norma específica do regime aplicável e da relação jurídica originária entre instituidor e beneficiário."
+    },
+    {
+      "input": "como configurar swift package manager para dependência condicional por plataforma",
+      "style": "tecnico",
+      "output": "Em Swift Package Manager, a inclusão condicional de dependências por plataforma é declarada em cada `.product(...)` do array `dependencies` do target, usando o parâmetro `condition: .when(platforms: [.iOS])`. Essa estratégia permite linkar frameworks específicos somente nos targets desejados, evitando que pacotes pesados sejam compilados em plataformas onde não fazem sentido. Compatível desde swift-tools-version 5.7."
+    },
+    {
+      "input": "estratégias de retrieval RAG com HyDE para vault Obsidian",
+      "style": "tecnico",
+      "output": "HyDE (Hypothetical Document Embeddings) melhora retrieval em RAG ao gerar previamente um documento hipotético que responde à consulta, e em seguida usar o embedding desse documento — e não da consulta crua — como vetor de busca. Em vaults Obsidian, a abordagem reduz o gap léxico entre perguntas curtas e notas longas. A geração ocorre on-device via FoundationModels no Mac e via Gemma 4 Apple-Twin no iPhone/iPad."
+    }
+  ]
+}

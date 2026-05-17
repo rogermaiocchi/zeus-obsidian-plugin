@@ -38,7 +38,7 @@
   "hierarchicalThreshold": 10000,
   "multiVectorEnabled": false,
   "multiVectorIndexOnReindex": false,
-  "zeusDaemonUrl": "http://127.0.0.1:2223",
+  "zeusDaemonUrl": "http://rogers-mac-mini:2223",
   "daemonPreferredOverSpawn": true,
   "imagesIndexFeaturePrint": false,
   "autoLanguageDetectOnSave": false,

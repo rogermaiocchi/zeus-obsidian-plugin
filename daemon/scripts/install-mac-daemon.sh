@@ -24,11 +24,15 @@ die() { printf '[install-mac-daemon] FATAL: %s\n' "$*" >&2; exit 1; }
 [[ -d "${PROJECT_ROOT}" ]] || die "project root não encontrado: ${PROJECT_ROOT}"
 [[ -f "${PLIST_SRC}" ]] || die "plist template não encontrado: ${PLIST_SRC}"
 
-say "1/6 — swift build -c release --product ZeusDaemonMac (cwd=${PROJECT_ROOT})"
-cd "${PROJECT_ROOT}"
-swift build -c release --product ZeusDaemonMac
+# Scratch path FORA do iCloud: swift build gera ~500MB; dentro do vault sincronizado polui o iCloud em todos os devices.
+SCRATCH_DIR="${HOME}/Library/Caches/com.maiocchi.zeusdaemon/build"
+mkdir -p "${SCRATCH_DIR}"
 
-BUILT_BIN="${PROJECT_ROOT}/.build/release/ZeusDaemonMac"
+say "1/6 — swift build -c release --product ZeusDaemonMac (cwd=${PROJECT_ROOT}, scratch=${SCRATCH_DIR})"
+cd "${PROJECT_ROOT}"
+swift build -c release --product ZeusDaemonMac --scratch-path "${SCRATCH_DIR}"
+
+BUILT_BIN="${SCRATCH_DIR}/release/ZeusDaemonMac"
 [[ -x "${BUILT_BIN}" ]] || die "binário esperado não encontrado: ${BUILT_BIN}"
 
 say "2/6 — instalando binário em ${BIN_PATH}"

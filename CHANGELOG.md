@@ -4,6 +4,38 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.4.0] — 2026-05-16 — Paridade Mac ↔ iOS (port Fase 0 + Fase 2 do meta-projeto-aegis)
+
+Integra o trabalho `v1.0.0-zeus-port` do fork `meta-projeto-aegis` sobre o canônico v1.3.4, sem regressão das features v1.3.x (SFSpeechRecognizer dual-engine, real-time audio indexing, refine via Apple, `/v1/asp/transcribe`, `/v1/asp/vad`, `X-Zeus-Allow-Pcc`).
+
+### Added — Fase 0: infraestrutura Apple-Twin
+
+- `AegisFMCaptureMiddleware.swift` e `ZeusFMCaptureMiddleware.swift` — captura opt-in de gerações `runFoundationModel` (via flag-file `~/.aegis/capture.enabled`).
+- `MLXAppleTwinProvider.swift` / `MLXAppleTwinBootstrap.swift` — provider MLX guardado `#if os(iOS)` (`.shared = nil` em macOS).
+- `AppleTwinSystemPrompt.swift` e `FewShotLoader.swift` + `Resources/FewShotExamples/` (agent_query, summarize, prompt, hyde, graph_extract, refine, enrich).
+
+### Added — Fase 2: endpoints (paridade funcional Mac ↔ iOS)
+
+- `POST /v1/refine` — Writing Tools com instructions livres.
+- `POST /v1/hyde` — Hypothetical Document Embeddings (juridico|tecnico|generic).
+- `POST /v1/graph/extract` — extração de triplas `{entities, relations, domain}`.
+- `POST /v1/agent` — Q&A com `context: [String]` (RAG-style); versão Aegis mantém `AegisClaudeAgent` e ganha `context` (não-breaking).
+
+### Changed — `/v1/health`
+
+- `version` interno do daemon: `0.3.0`/`0.5.0` → `1.4.0`.
+- Novos campos: `provider_active` (apple-intelligence|mlx-apple-twin|none), `apple_twin_loaded` (Mac sempre false), `thermal_state`.
+- Mantém todos os campos v1.3.x (`fm_available`, `speech_available`, etc.).
+
+### Notas de merge
+
+- Conflito `handleRefine`: canônico v1.3 (mode/tone/language) preservado; versão v1.4 (instructions livres) renomeada para `handleRefineV14` e wired no `/v1/refine` — ambos coexistem.
+- `/v1/afm/refine` v1.3.x permanece intacto.
+- MLX deps NÃO adicionadas ao `Package.swift` (Mac não usa Twin; iOS port fica para PR separado).
+- `/v1/apps*` do fork excluídos do escopo v1.4 (dependem de `AegisNativeTools` ainda não portados).
+
+---
+
 ## [1.3.4] — 2026-05-15 — AegisDaemon iOS port (paridade Mac ↔ iPhone/iPad daemons)
 
 Portagem dos 3 endpoints v1.3 do `ZeusDaemonMac` para o `AegisDaemon` iOS (target SwiftPM library embutida em `MetassistemaApp-iOS`). Atinge paridade de capabilities entre daemons macOS e iOS — agora todos os 4 devices Apple (Mac mini · MacBook Air · iPad Air · iPhone 15) expõem a mesma API HTTP local quando atualizados.

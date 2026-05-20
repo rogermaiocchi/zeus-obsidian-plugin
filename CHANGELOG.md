@@ -4,6 +4,69 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.6.0] — 2026-05-20 — Hybrid retrieval + Graphify→graph nativo + FSEvents observability
+
+Integração profunda de 4 superfícies (request do usuário). Plano debatido com `codex exec` ANTES da execução; 5 dos 6 achados do codex incorporados na primeira iteração; pós-execução re-auditada via codex.
+
+### Added — `lib/hybrid-search.js` (~140 LOC)
+
+- `HybridSearch.fuse(lists)`: Reciprocal Rank Fusion k=60 (Cormack et al. SIGIR 2009). Score invariante a escala de cada retriever, agrega `sources` por path.
+- `sisterNotes(filePath, topN=12)`: combina 3 retrievers ortogonais — semantic (cosine `searcher.neighbors`), graph (parsing wikilinks de frontmatter `zeus_graph_related` / `zeus_related`), passport (concept overlap via daemon). RRF fuse.
+- `query(q, topN=30)`: busca livre — semantic + path/basename substring + passport. Estilo Cmd+P unificado.
+- Resolve wikilinks via `metadataCache.getFirstLinkpathDest()` em vez de regex naïve (codex MED #2 — respeita pastas, aliases, relative links).
+- `searcher.search()` agora awaitado corretamente (codex HIGH #1 — antes caía silencioso em `.map` sobre Promise).
+
+### Added — `lib/native-watcher.js` (~110 LOC)
+
+- `fs.watch(vaultRoot, {recursive:true})` no Mac (FSEvents nativo). iOS Capacitor: no-op gracioso.
+- **NÃO faz re-embedding** (codex HIGH #3): só observa. Mede latência `vault.on('modify')` vs FSEvents — detecta quando o adapter do Obsidian perdeu uma sync iCloud.
+- Quiet window 1.5s por arquivo (espera estabilidade do iCloud).
+- Deadline 5s para `vault.on('modify')` correlacionar; se não correlacionar, contabiliza como `adapterMissed`.
+- Comando `Zeus: status do native-watcher` reporta hit rate + paths missed + last activity.
+
+### Added — `ZeusNativeGraphIntegration.syncFromGraphExtract` (manual)
+
+- Roda `afm graph-extract` na nota ativa, resolve entidades nomeadas para arquivos do vault via `metadataCache.getFirstLinkpathDest`, escreve como wikilinks em `zeus_graph_related`. Obsidian native Graph View renderiza essas wikilinks como arestas — **Graphify 100% integrado ao graph nativo, não mais SVG modal isolado**.
+- Comando manual apenas (graph-extract custa ~3-8s/nota); não roda em real-time pra não competir com pipeline de embed.
+- Codex HIGH #2 fix: comparação SHA antes de escrever (`_lastWritten` cache), in-flight tracking (`_inFlight` Set), `zeus_indexed_at` só muda quando set de neighbors muda — quebra o loop iCloud↔Obsidian.
+- Codex MED #1 fix: `clearAll()` agora remove `zeus_related` E `zeus_graph_related` (+ metadados associados).
+
+### Added — 4 comandos novos
+
+- `Zeus: notas irmãs (graph + semantic híbrido)` — abre modal com RRF dos 3 retrievers para o arquivo ativo
+- `Zeus: busca híbrida (graph + semantic + path)` — SuggestModal estilo Cmd+P unificado (codex MED #3: complementa, não substitui Quick Switcher nativo)
+- `Zeus: graphify → frontmatter (integra ao graph nativo)` — roda `syncFromGraphExtract` no arquivo ativo
+- `Zeus: status do native-watcher (FSEvents iCloud)` — Notice com stats do watcher
+
+### Debate Codex × Claude — pré-execução
+
+Plano enviado ao `codex exec` antes de qualquer edit em `main.source.js`. Codex respondeu com 6 achados (3 HIGH, 3 MED):
+
+| # | Severidade | Achado | Aplicado? |
+|---|---|---|---|
+| 1 | HIGH | `searcher.search()` async sem await em `hybrid-search.js:130` | ✅ adicionado `await` |
+| 2 | HIGH | Loop frontmatter `modify → sync → write → modify` com timestamp churn | ✅ SHA-compare antes de escrever + `_inFlight` |
+| 3 | HIGH | `fs.watch` duplicaria pipeline existente (race `saveEmbeddings`) | ✅ watcher virou observability-only, sem re-embed |
+| 4 | MED | `clearAll()` só removia `zeus_related`, não `zeus_graph_related` | ✅ estendido |
+| 5 | MED | Regex `Nome.md` falha com pastas/aliases | ✅ `metadataCache.getFirstLinkpathDest` |
+| 6 | MED | SuggestModal não substitui Quick Switcher nativo (limite de API Obsidian) | 📋 vendido como "Hybrid Search" complementar |
+
+### Limitação técnica honesta
+
+Obsidian **não expõe API pública** para injetar arestas no Graph View nem para substituir o backend do Quick Switcher / Search. A integração "100% nativa" é alcançada via:
+- **Graph**: wikilinks em frontmatter (Obsidian renderiza como arestas automaticamente — efetivamente nativo)
+- **Search**: comando custom + SuggestModal (não substitui Cmd+O, mas oferece UX nativa equivalente com backend híbrido)
+
+### Validation
+
+- `node esbuild.config.mjs` → `main.js` 247.3 KB
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9
+- Empirical: `HybridSearch.fuse([[a,b],[b,c]])` → `b` rankeia 1º (RRF correto)
+- Empirical: `NativeWatcher` ctor + module load OK
+
+---
+
 ## [1.5.1] — 2026-05-20 — Fixes pós-auditoria Codex × Claude
 
 Debate cruzado entre `codex review` (gpt-5.5 high-reasoning) e auditoria Claude sobre o commit v1.5.0. Os dois revisores convergiram em 1 bug HIGH e codex pegou outros 4 que Claude perdeu. Aplicados 5 fixes neste patch.

@@ -2388,6 +2388,259 @@ var require_daemon_lifecycle = __commonJS({
   }
 });
 
+// lib/hybrid-search.js
+var require_hybrid_search = __commonJS({
+  "lib/hybrid-search.js"(exports2, module2) {
+    "use strict";
+    var RRF_K = 60;
+    var HybridSearch2 = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+      }
+      // ---------------------------------------------------------------------------
+      // RRF fuse — recebe array de listas ranqueadas, cada item {path, source}
+      // (score por item ignorado — só posição). Devolve lista única ordenada por
+      // RRF score com `sources` agregadas.
+      // ---------------------------------------------------------------------------
+      fuse(lists) {
+        const fused = /* @__PURE__ */ new Map();
+        for (const list of lists) {
+          if (!Array.isArray(list)) continue;
+          list.forEach((item, idx) => {
+            if (!item || !item.path) return;
+            const inc = 1 / (RRF_K + idx + 1);
+            const cur = fused.get(item.path) || { path: item.path, score: 0, sources: /* @__PURE__ */ new Set() };
+            cur.score += inc;
+            if (item.source) cur.sources.add(item.source);
+            fused.set(item.path, cur);
+          });
+        }
+        const out = [];
+        for (const v of fused.values()) {
+          out.push({ path: v.path, score: v.score, sources: Array.from(v.sources) });
+        }
+        out.sort((a, b) => b.score - a.score);
+        return out;
+      }
+      // ---------------------------------------------------------------------------
+      // sisterNotes — combina semantic + graph (frontmatter) + passport para uma
+      // nota dada. Diferente de `searcher.neighbors` puro porque inclui o sinal
+      // explícito do afm graph-extract (entidades nomeadas) e do passport (conceitos
+      // Apple NLTagger + Feynman summary). Retorna top-N RRF.
+      // ---------------------------------------------------------------------------
+      async sisterNotes(filePath, topN = 12) {
+        const lists = [];
+        try {
+          const sem = this.plugin.searcher.neighbors(filePath, topN * 2);
+          lists.push(sem.map((x) => ({ path: x.path, source: "semantic" })));
+        } catch (e) {
+          console.warn("[zeus.hybrid] semantic neighbors failed", e.message);
+        }
+        try {
+          const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
+          const mdc = this.plugin.app.metadataCache;
+          const cache = file ? mdc.getFileCache(file) : null;
+          const fm = cache && cache.frontmatter ? cache.frontmatter : null;
+          const collected = /* @__PURE__ */ new Set();
+          if (fm) {
+            for (const key of ["zeus_graph_related", "zeus_related"]) {
+              const arr = fm[key];
+              if (!Array.isArray(arr)) continue;
+              for (const raw of arr) {
+                const link = String(raw).replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0].split("#")[0].trim();
+                if (!link) continue;
+                const dest = mdc.getFirstLinkpathDest ? mdc.getFirstLinkpathDest(link, filePath) : null;
+                if (dest && dest.path && dest.path !== filePath) {
+                  collected.add(dest.path);
+                }
+              }
+            }
+          }
+          if (collected.size > 0) {
+            const validated = [...collected].filter((p) => this.plugin.searcher.embeddings.has(p));
+            lists.push(validated.map((p) => ({ path: p, source: "graph" })));
+          }
+        } catch (e) {
+          console.warn("[zeus.hybrid] graph frontmatter parse failed", e.message);
+        }
+        try {
+          if (this.plugin.passport && typeof this.plugin.passport.findByQuery === "function") {
+            const basename = filePath.split("/").pop().replace(/\.md$/, "");
+            const hits = await this.plugin.passport.findByQuery(basename, { topN: topN * 2 });
+            const list = (hits || []).map((h) => h && (h.path || h.file) || null).filter((p) => p && p !== filePath).map((p) => ({ path: p, source: "passport" }));
+            lists.push(list);
+          }
+        } catch (e) {
+          console.warn("[zeus.hybrid] passport find failed", e.message);
+        }
+        return this.fuse(lists).slice(0, topN);
+      }
+      // ---------------------------------------------------------------------------
+      // query — busca livre estilo Cmd+P. Funde semantic + path (basename match) +
+      // passport. Bom para "busca híbrida" que pega tanto "encontrei pelo nome"
+      // quanto "encontrei pelo conceito".
+      // ---------------------------------------------------------------------------
+      async query(q, topN = 30) {
+        if (!q || !q.trim()) return [];
+        const lists = [];
+        try {
+          const sem = await this.plugin.searcher.search(q, topN * 2);
+          lists.push((sem || []).map((x) => ({ path: x.path, source: "semantic" })));
+        } catch (e) {
+          console.warn("[zeus.hybrid] semantic search failed", e.message);
+        }
+        try {
+          const qn = q.toLowerCase().trim();
+          const all = this.plugin.app.vault.getMarkdownFiles ? this.plugin.app.vault.getMarkdownFiles() : [];
+          const matched = [];
+          for (const f of all) {
+            const base = (f.basename || "").toLowerCase();
+            const full = (f.path || "").toLowerCase();
+            if (base.includes(qn) || full.includes(qn)) {
+              matched.push({ path: f.path, source: "path" });
+              if (matched.length >= topN * 2) break;
+            }
+          }
+          lists.push(matched);
+        } catch (e) {
+          console.warn("[zeus.hybrid] path match failed", e.message);
+        }
+        try {
+          if (this.plugin.passport && typeof this.plugin.passport.findByQuery === "function") {
+            const hits = await this.plugin.passport.findByQuery(q, { topN: topN * 2 });
+            const list = (hits || []).map((h) => h && (h.path || h.file) || null).filter(Boolean).map((p) => ({ path: p, source: "passport" }));
+            lists.push(list);
+          }
+        } catch (e) {
+          console.warn("[zeus.hybrid] passport find failed", e.message);
+        }
+        return this.fuse(lists).slice(0, topN);
+      }
+    };
+    module2.exports = HybridSearch2;
+  }
+});
+
+// lib/native-watcher.js
+var require_native_watcher = __commonJS({
+  "lib/native-watcher.js"(exports2, module2) {
+    "use strict";
+    var universal2 = require_universal_fs();
+    var QUIET_MS = 1500;
+    var ADAPTER_DEADLINE_MS = 5e3;
+    var MAX_TRACKED = 500;
+    var NativeWatcher2 = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+        this.watcher = null;
+        this.running = false;
+        this._pending = /* @__PURE__ */ new Map();
+        this.stats = {
+          externalEvents: 0,
+          adapterSawEvent: 0,
+          adapterMissed: 0,
+          missedPaths: [],
+          lastExternalAt: 0
+        };
+        this._vaultListener = null;
+      }
+      start() {
+        if (this.running) return { running: true, reason: "already-running" };
+        const fs2 = universal2.nodeFs;
+        if (!fs2 || !fs2.watch) {
+          return { running: false, reason: "fs.watch indispon\xEDvel (Capacitor/iOS)" };
+        }
+        const root = this.plugin.vaultRoot;
+        if (!root) return { running: false, reason: "no vaultRoot" };
+        try {
+          this.watcher = fs2.watch(root, { recursive: true }, (eventType, filename) => {
+            if (!filename) return;
+            const rel = String(filename);
+            if (!rel.endsWith(".md")) return;
+            if (rel.includes("/.") || rel.startsWith(".")) return;
+            const prev = this._pending.get(rel);
+            if (prev && prev.timer) clearTimeout(prev.timer);
+            const entry = {
+              lastSeenAt: Date.now(),
+              source: eventType,
+              timer: setTimeout(() => this._onStable(rel), QUIET_MS)
+            };
+            this._pending.set(rel, entry);
+            if (this._pending.size > MAX_TRACKED) {
+              const oldest = [...this._pending.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
+              if (oldest) {
+                clearTimeout(oldest[1].timer);
+                this._pending.delete(oldest[0]);
+              }
+            }
+          });
+        } catch (e) {
+          return { running: false, reason: `fs.watch failed: ${e.message}` };
+        }
+        try {
+          const ref = this.plugin.app.vault.on("modify", (file) => {
+            const seen = this._adapterSeen.get(file && file.path);
+            if (seen) {
+              this.stats.adapterSawEvent++;
+              this._adapterSeen.delete(file.path);
+            }
+          });
+          if (this.plugin.registerEvent) this.plugin.registerEvent(ref);
+          this._vaultListener = ref;
+        } catch (_) {
+        }
+        this._adapterSeen = /* @__PURE__ */ new Map();
+        this.running = true;
+        return { running: true, root, quietMs: QUIET_MS };
+      }
+      _onStable(rel) {
+        this._pending.delete(rel);
+        this.stats.externalEvents++;
+        this.stats.lastExternalAt = Date.now();
+        const deadline = Date.now() + ADAPTER_DEADLINE_MS;
+        this._adapterSeen.set(rel, deadline);
+        setTimeout(() => {
+          if (this._adapterSeen.has(rel)) {
+            this.stats.adapterMissed++;
+            this.stats.missedPaths.push({ path: rel, at: Date.now() });
+            if (this.stats.missedPaths.length > 50) this.stats.missedPaths.shift();
+            this._adapterSeen.delete(rel);
+          }
+        }, ADAPTER_DEADLINE_MS + 200);
+      }
+      getStats() {
+        const elapsed = this.stats.lastExternalAt ? Date.now() - this.stats.lastExternalAt : null;
+        const hitRate = this.stats.externalEvents > 0 ? this.stats.adapterSawEvent / this.stats.externalEvents : null;
+        return {
+          running: this.running,
+          externalEvents: this.stats.externalEvents,
+          adapterSawEvent: this.stats.adapterSawEvent,
+          adapterMissed: this.stats.adapterMissed,
+          missedPaths: this.stats.missedPaths.slice(-10),
+          adapterHitRate: hitRate,
+          lastExternalAgoMs: elapsed
+        };
+      }
+      stop() {
+        if (this.watcher) {
+          try {
+            this.watcher.close();
+          } catch (e) {
+          }
+          this.watcher = null;
+        }
+        for (const entry of this._pending.values()) {
+          if (entry.timer) clearTimeout(entry.timer);
+        }
+        this._pending.clear();
+        if (this._adapterSeen) this._adapterSeen.clear();
+        this.running = false;
+      }
+    };
+    module2.exports = NativeWatcher2;
+  }
+});
+
 // main.source.js
 function _zeusFindPluginDir() {
   let fs0, path0;
@@ -2499,6 +2752,8 @@ var BasesGenerator = require_bases_generator();
 var DistributedCoordinator = require_distributed_coordinator();
 var PassportScheduler = require_passport_scheduler();
 var DaemonLifecycle = require_daemon_lifecycle();
+var HybridSearch = require_hybrid_search();
+var NativeWatcher = require_native_watcher();
 var VIEW_TYPE_SMART = "zeus-smart-view";
 var VIEW_TYPE_STATUS = "zeus-status-view";
 var DATA_DIR_NAME = "data";
@@ -3489,26 +3744,109 @@ var ZeusGraphModal = class extends obsidian.Modal {
 var ZeusNativeGraphIntegration = class {
   constructor(plugin) {
     this.plugin = plugin;
-    this.lastSync = 0;
     this.SYNC_DEBOUNCE_MS = 3e3;
     this.FRONTMATTER_KEY = "zeus_related";
+    this.FRONTMATTER_GRAPH_KEY = "zeus_graph_related";
+    this._lastWritten = /* @__PURE__ */ new Map();
+    this._inFlight = /* @__PURE__ */ new Set();
   }
-  // Top-N neighbors da nota, injeta como frontmatter array de wikilinks
+  _arraySha(arr) {
+    const txt = (arr || []).join("\n");
+    if (universal.nodeCrypto && universal.nodeCrypto.createHash) {
+      return universal.nodeCrypto.createHash("sha256").update(txt).digest("hex").slice(0, 16);
+    }
+    let h = 0;
+    for (let i = 0; i < txt.length; i++) h = (h << 5) - h + txt.charCodeAt(i) | 0;
+    return (h >>> 0).toString(16).padStart(8, "0");
+  }
+  _renderLinks(items) {
+    return items.map((n) => {
+      const name = String(n.path || "").replace(/\.md$/, "");
+      const alias = name.split("/").pop();
+      const pct = typeof n.score === "number" ? ` (${(n.score * 100).toFixed(0)}%)` : "";
+      return `[[${name}|${alias}${pct}]]`;
+    });
+  }
+  // Top-N neighbors da nota (cosine NL), injeta como wikilinks no frontmatter.
+  // v1.6 — compara SHA antes de escrever, evita timestamp churn.
   async syncFile(filePath, topN = 5, minScore = 0.3) {
     if (!this.plugin.settings.nativeGraphIntegration) return;
+    if (this._inFlight.has(filePath)) return;
     const neighbors = this.plugin.searcher.neighbors(filePath, topN);
     const filtered = neighbors.filter((n) => n.score >= minScore);
     if (filtered.length === 0) return;
     const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
     if (!file) return;
-    await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
-      fm[this.FRONTMATTER_KEY] = filtered.map((n) => {
-        const name = n.path.replace(/\.md$/, "");
-        return `[[${name}|${name.split("/").pop()} (${(n.score * 100).toFixed(0)}%)]]`;
+    const wikilinks = this._renderLinks(filtered);
+    const sha = this._arraySha(wikilinks);
+    if (this._lastWritten.get(`${filePath}|${this.FRONTMATTER_KEY}`) === sha) return;
+    this._inFlight.add(filePath);
+    try {
+      await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
+        const current = Array.isArray(fm[this.FRONTMATTER_KEY]) ? fm[this.FRONTMATTER_KEY] : null;
+        const currentSha = current ? this._arraySha(current) : null;
+        if (currentSha === sha) return;
+        fm[this.FRONTMATTER_KEY] = wikilinks;
+        fm.zeus_neighbor_count = filtered.length;
+        fm.zeus_indexed_at = (/* @__PURE__ */ new Date()).toISOString();
       });
-      fm.zeus_indexed_at = (/* @__PURE__ */ new Date()).toISOString();
-      fm.zeus_neighbor_count = filtered.length;
-    });
+      this._lastWritten.set(`${filePath}|${this.FRONTMATTER_KEY}`, sha);
+    } finally {
+      this._inFlight.delete(filePath);
+    }
+  }
+  // v1.6 — codex MED #1 + user request "Graphify 100% integrado com graph nativo".
+  // Roda afm graph-extract (entidades + arestas) e escreve as entidades cujos
+  // basenames existem no vault como wikilinks em `zeus_graph_related`. Obsidian
+  // native Graph View renderiza estas como arestas naturais.
+  //
+  // Manual/on-command apenas — graph-extract é caro (~3-8s/nota), não roda em
+  // real-time pra não competir com pipeline de embed.
+  async syncFromGraphExtract(filePath) {
+    if (this._inFlight.has(filePath)) return { skipped: "in-flight" };
+    if (!this.plugin.graphExtractor) return { error: "graphExtractor indispon\xEDvel" };
+    const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
+    if (!file) return { error: "arquivo n\xE3o encontrado no vault" };
+    let graph;
+    try {
+      graph = await this.plugin.graphExtractor.extract(filePath);
+    } catch (e) {
+      return { error: "graph-extract: " + (e.message || String(e)).slice(0, 200) };
+    }
+    const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+    if (nodes.length === 0) return { skipped: "sem nodes extra\xEDdos" };
+    const mdc = this.plugin.app.metadataCache;
+    const matches = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const node of nodes) {
+      const label = String(node && (node.id || node.label || node.name) || "").trim();
+      if (!label || label.length < 2) continue;
+      const dest = mdc.getFirstLinkpathDest ? mdc.getFirstLinkpathDest(label, filePath) : null;
+      if (dest && dest.path && dest.path !== filePath && !seen.has(dest.path)) {
+        seen.add(dest.path);
+        matches.push({ path: dest.path, score: void 0, label });
+      }
+    }
+    if (matches.length === 0) return { skipped: `nenhum dos ${nodes.length} nodes corresponde a notas do vault` };
+    const wikilinks = this._renderLinks(matches);
+    const sha = this._arraySha(wikilinks);
+    if (this._lastWritten.get(`${filePath}|${this.FRONTMATTER_GRAPH_KEY}`) === sha) {
+      return { skipped: "j\xE1 sincronizado", count: matches.length };
+    }
+    this._inFlight.add(filePath);
+    try {
+      await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
+        const current = Array.isArray(fm[this.FRONTMATTER_GRAPH_KEY]) ? fm[this.FRONTMATTER_GRAPH_KEY] : null;
+        if (current && this._arraySha(current) === sha) return;
+        fm[this.FRONTMATTER_GRAPH_KEY] = wikilinks;
+        fm.zeus_graph_node_count = nodes.length;
+        fm.zeus_graph_synced_at = (/* @__PURE__ */ new Date()).toISOString();
+      });
+      this._lastWritten.set(`${filePath}|${this.FRONTMATTER_GRAPH_KEY}`, sha);
+    } finally {
+      this._inFlight.delete(filePath);
+    }
+    return { ok: true, count: matches.length, nodes: nodes.length };
   }
   // Sync TODAS as notas com embeddings (batch operation)
   async syncAllFiles(onProgress) {
@@ -3529,16 +3867,20 @@ var ZeusNativeGraphIntegration = class {
     }
     if (onProgress) onProgress(`done: ${paths.length} notes synced`);
   }
-  // Cleanup: remove zeus_related from all files
+  // v1.6 — codex MED #1: clearAll agora limpa ambos zeus_related e zeus_graph_related.
   async clearAll() {
     const files = this.plugin.app.vault.getMarkdownFiles();
     for (const file of files) {
       await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
         delete fm[this.FRONTMATTER_KEY];
+        delete fm[this.FRONTMATTER_GRAPH_KEY];
         delete fm.zeus_indexed_at;
         delete fm.zeus_neighbor_count;
+        delete fm.zeus_graph_node_count;
+        delete fm.zeus_graph_synced_at;
       });
     }
+    this._lastWritten.clear();
   }
 };
 var ZeusEnricher = class {
@@ -3837,6 +4179,75 @@ var ZeusSearchModal = class extends SuggestModal {
     if (file instanceof TFile) {
       await this.app.workspace.getLeaf().openFile(file);
     }
+  }
+};
+var ZeusHybridSearchModal = class extends SuggestModal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.setPlaceholder("Zeus \u2014 busca h\xEDbrida (semantic \u2295 graph \u2295 passport \u2295 path)\u2026");
+    this.cached = [];
+    this.lastQuery = "";
+  }
+  async getSuggestions(q) {
+    if (!q || q.length < 2) return [];
+    if (q === this.lastQuery) return this.cached;
+    this.lastQuery = q;
+    try {
+      const r = await this.plugin.hybrid.query(q, this.plugin.settings.maxResults || 30);
+      this.cached = r;
+      return r;
+    } catch (e) {
+      console.warn("[zeus] hybrid query failed", e.message);
+      return [];
+    }
+  }
+  renderSuggestion(hit, el) {
+    el.empty();
+    el.addClass("zeus-result");
+    const head = el.createDiv({ cls: "zeus-result-head" });
+    const name = hit.path.replace(/\.md$/, "").split("/").pop();
+    head.createSpan({ cls: "zeus-result-title", text: name });
+    const meta = head.createSpan({ cls: "zeus-result-meta" });
+    for (const src of hit.sources || []) {
+      meta.createSpan({ cls: `zeus-badge zeus-badge-${src}`, text: src });
+    }
+    meta.createSpan({ cls: "zeus-badge zeus-badge-sem", text: hit.score.toFixed(3) });
+    el.createDiv({ cls: "zeus-result-path", text: hit.path });
+  }
+  async onChooseSuggestion(hit) {
+    const file = this.app.vault.getAbstractFileByPath(hit.path);
+    if (file instanceof TFile) await this.app.workspace.getLeaf().openFile(file);
+  }
+};
+var ZeusHybridResultsModal = class extends SuggestModal {
+  constructor(app, plugin, items, title) {
+    super(app);
+    this.plugin = plugin;
+    this.items = items;
+    this.setPlaceholder(title || "Zeus \u2014 resultados h\xEDbridos");
+  }
+  getSuggestions(q) {
+    if (!q) return this.items;
+    const qn = q.toLowerCase();
+    return this.items.filter((it) => (it.path || "").toLowerCase().includes(qn));
+  }
+  renderSuggestion(hit, el) {
+    el.empty();
+    el.addClass("zeus-result");
+    const head = el.createDiv({ cls: "zeus-result-head" });
+    const name = hit.path.replace(/\.md$/, "").split("/").pop();
+    head.createSpan({ cls: "zeus-result-title", text: name });
+    const meta = head.createSpan({ cls: "zeus-result-meta" });
+    for (const src of hit.sources || []) {
+      meta.createSpan({ cls: `zeus-badge zeus-badge-${src}`, text: src });
+    }
+    meta.createSpan({ cls: "zeus-badge zeus-badge-sem", text: hit.score.toFixed(3) });
+    el.createDiv({ cls: "zeus-result-path", text: hit.path });
+  }
+  async onChooseSuggestion(hit) {
+    const file = this.app.vault.getAbstractFileByPath(hit.path);
+    if (file instanceof TFile) await this.app.workspace.getLeaf().openFile(file);
   }
 };
 var ZeusSmartView = class extends ItemView {
@@ -4424,6 +4835,8 @@ var ZeusPlugin = class extends Plugin {
       this.hyde = new HyDEExpander(this);
       this.graphExtractor = new ZeusGraphExtractor(this);
       this.nativeGraph = new ZeusNativeGraphIntegration(this);
+      this.hybrid = new HybridSearch(this);
+      this.nativeWatcher = new NativeWatcher(this);
       const pluginDataPath = path && this.vaultRoot ? path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME) : universal.joinPath(this.manifest.dir, DATA_DIR_NAME);
       this.hierarchical = new HierarchicalProcessor(null, this.settings.hierarchicalThreshold);
       this.multiVector = new MultiVectorEmbedder(null, pluginDataPath);
@@ -4434,6 +4847,12 @@ var ZeusPlugin = class extends Plugin {
       this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
       this.daemonLifecycle = new DaemonLifecycle(this);
       if (isMac()) {
+        try {
+          const ws = this.nativeWatcher.start();
+          console.log("[zeus] native-watcher:", ws);
+        } catch (e) {
+          console.warn("[zeus] native-watcher start failed:", e.message);
+        }
         try {
           const status = await this.daemonLifecycle.ensureRunning();
           console.log("[zeus] daemon lifecycle:", status);
@@ -5308,6 +5727,84 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
           console.log("[zeus] real-time rename:", oldPath, "\u2192", file.path);
         }
       }));
+      this.addCommand({
+        id: "zeus-sister-notes-hybrid",
+        name: "Zeus: notas irm\xE3s (graph + semantic h\xEDbrido)",
+        callback: async () => {
+          const file = this.app.workspace.getActiveFile();
+          if (!file) {
+            new Notice("Zeus: sem arquivo ativo");
+            return;
+          }
+          const n = new Notice("Zeus: calculando notas-irm\xE3s (RRF semantic+graph+passport)\u2026", 0);
+          try {
+            const hits = await this.hybrid.sisterNotes(file.path, 15);
+            n.hide();
+            if (!hits.length) {
+              new Notice("Zeus: nenhuma nota-irm\xE3 encontrada");
+              return;
+            }
+            new ZeusHybridResultsModal(this.app, this, hits, `Notas-irm\xE3s de ${file.basename}`).open();
+          } catch (e) {
+            n.hide();
+            new Notice("Zeus sister falhou: " + (e.message || String(e)).slice(0, 150));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-hybrid-search",
+        name: "Zeus: busca h\xEDbrida (graph + semantic + path)",
+        callback: () => {
+          new ZeusHybridSearchModal(this.app, this).open();
+        }
+      });
+      this.addCommand({
+        id: "zeus-graphify-to-frontmatter",
+        name: "Zeus: graphify \u2192 frontmatter (integra ao graph nativo)",
+        callback: async () => {
+          const file = this.app.workspace.getActiveFile();
+          if (!file) {
+            new Notice("Zeus: sem arquivo ativo");
+            return;
+          }
+          const n = new Notice("Zeus: extraindo grafo (afm graph-extract) e escrevendo wikilinks\u2026", 0);
+          try {
+            const r = await this.nativeGraph.syncFromGraphExtract(file.path);
+            n.hide();
+            if (r.ok) {
+              new Notice(`Zeus graph\u2192FM: ${r.count}/${r.nodes} entidades resolvidas e gravadas em zeus_graph_related`, 6e3);
+            } else if (r.skipped) {
+              new Notice(`Zeus graph\u2192FM: ${r.skipped}`, 5e3);
+            } else {
+              new Notice(`Zeus graph\u2192FM: ${r.error || "erro desconhecido"}`, 6e3);
+            }
+          } catch (e) {
+            n.hide();
+            new Notice("Zeus graphify falhou: " + (e.message || String(e)).slice(0, 150));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-native-watcher-status",
+        name: "Zeus: status do native-watcher (FSEvents iCloud)",
+        callback: () => {
+          if (!this.nativeWatcher) {
+            new Notice("Zeus: native-watcher indispon\xEDvel");
+            return;
+          }
+          const s = this.nativeWatcher.getStats();
+          if (!s.running) {
+            new Notice(`Zeus watcher OFF (iOS Capacitor ou fs.watch indispon\xEDvel)`, 5e3);
+            return;
+          }
+          const hitRate = s.adapterHitRate != null ? `${(s.adapterHitRate * 100).toFixed(0)}%` : "n/a";
+          const ago = s.lastExternalAgoMs != null ? `${(s.lastExternalAgoMs / 1e3).toFixed(0)}s` : "never";
+          new Notice(
+            `Zeus watcher: ${s.externalEvents} ext events \xB7 adapter caught ${hitRate} \xB7 ${s.adapterMissed} missed \xB7 last ${ago}`,
+            8e3
+          );
+        }
+      });
       console.log(`[zeus] loaded v${this.manifest.version} \u2014 Apple-native search & connections`);
       trace("onload.complete");
       writeTrace(null);
@@ -5331,6 +5828,13 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
     if (this._passportRefreshTimers) {
       for (const t of this._passportRefreshTimers.values()) clearTimeout(t);
       this._passportRefreshTimers.clear();
+    }
+    if (this.nativeWatcher) {
+      try {
+        this.nativeWatcher.stop();
+      } catch (e) {
+        console.warn("[zeus] native-watcher stop:", e.message);
+      }
     }
     if (this.daemonLifecycle) {
       try {

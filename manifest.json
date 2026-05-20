@@ -1,9 +1,9 @@
 {
   "id": "zeus",
   "name": "Zeus — Apple-native Search & Connections",
-  "version": "1.13.0",
+  "version": "1.13.1",
   "minAppVersion": "1.5.0",
-  "description": "Cápsula drop-in Mac + iOS. Indexação 100% automática via FSEvents Apple (vault.on hooks). Stack turboquantico multi-camada: NLContextualEmbedding 512-dim (embeddings.jsonl) · Passports NLTagger+FoundationModels (passports.jsonl, 84% token reduction) · BM25 lexical lane puro JS · Multiplex graph 8 edge types com why explanation · Leiden communities · MMR diversity rerank · HybridSearch RRF 5-way (semantic⊕path⊕passport⊕spotlight⊕bm25) · CSSearchableIndex programático isolado per-vault · MobileCLIP stub opt-in. Mac: bin/ZeusDaemonMac arm64 codesigned adhoc auto-spawn (FoundationModels/Vision/NaturalLanguage/Speech/Translation/CoreSpotlight nativos). iOS Capacitor: degrada gracioso read-only via iCloud sync (multiplex/leiden/bm25/base rodam JS puro; passport/spotlight skipam quando daemon ausente). AutoIndexer orquestra rebuilds via debounce+cooldown, zero polling.",
+  "description": "Cápsula drop-in Mac + iOS. Indexação 100% automática via FSEvents Apple (vault.on hooks). Stack turboquantico multi-camada: NLContextualEmbedding 512-dim (embeddings.jsonl) · Passports NLTagger+FoundationModels (passports.jsonl, 84% token reduction) · BM25 lexical lane puro JS · Multiplex graph 8 edge types com why explanation · Leiden communities · MMR diversity rerank · HybridSearch RRF 7-way (semantic⊕path⊕graph⊕passport⊕spotlight⊕bm25⊕lexicalIos) · CSSearchableIndex programático isolado per-vault · MobileCLIP stub opt-in. Mac: bin/ZeusDaemonMac arm64 codesigned adhoc auto-spawn (FoundationModels/Vision/NaturalLanguage/Speech/Translation/CoreSpotlight nativos). iOS Capacitor: degrada gracioso read-only via iCloud sync (multiplex/leiden/bm25/base rodam JS puro; passport/spotlight skipam quando daemon ausente). AutoIndexer orquestra rebuilds via debounce+cooldown, zero polling.",
   "author": "Roger Maiocchi",
   "authorUrl": "https://maiocchi.adv.br",
   "isDesktopOnly": false

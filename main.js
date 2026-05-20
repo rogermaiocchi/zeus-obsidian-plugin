@@ -4138,7 +4138,7 @@ var require_auto_indexer = __commonJS({
           resolution: this.plugin.settings && this.plugin.settings.leidenResolution || 1,
           seed: 42
         });
-        if (this.plugin.leiden.persist) await this.plugin.leiden.persist();
+        if (this.plugin.leiden.persist) await this.plugin.leiden.persist(r);
         return {
           communities: (/* @__PURE__ */ new Set([...r.communities.values()])).size,
           nodes: r.communities.size,
@@ -4819,12 +4819,28 @@ var require_io_queue = __commonJS({
     var universal2 = require_universal_fs();
     var QUEUE_DIR_NAME = "ios-queue";
     var VALID_TYPES = /* @__PURE__ */ new Set(["passport", "embed", "spotlight"]);
-    var IoQueue2 = class {
+    var IoQueue2 = class _IoQueue {
       /**
        * @param {*} plugin Zeus plugin instance
        */
       constructor(plugin) {
         this.plugin = plugin;
+      }
+      /**
+       * codex HIGH #4 — privacy gate hard-enforced.
+       * Recusa paths sigilosos (Clientes/**, ou marcados como privacy:'sigiloso' no
+       * payload). Conforme ~/Code/claude-config/rules/juridico.md: Clientes/** é
+       * SIGILOSO por default, NÃO pode ir para nenhum caminho cloud — incluindo
+       * io-queue que persiste em iCloud sync.
+       * @param {string} path — vault-relative
+       * @param {object} [payload]
+       * @returns {boolean} true se path é privado e NÃO pode ser enfileirado
+       */
+      static isPrivatePath(path2, payload) {
+        if (!path2) return false;
+        if (/^Clientes\//i.test(path2)) return true;
+        if (payload && payload.privacy && /sigiloso/i.test(String(payload.privacy))) return true;
+        return false;
       }
       get _adapter() {
         return this.plugin.app.vault.adapter;
@@ -4870,6 +4886,9 @@ var require_io_queue = __commonJS({
         }
         if (!task.type || !VALID_TYPES.has(task.type)) {
           return { enqueued: false, reason: `type inv\xE1lido (esperado: ${[...VALID_TYPES].join("|")})` };
+        }
+        if (_IoQueue.isPrivatePath(task.path, task.payload)) {
+          return { enqueued: false, reason: "privacy-gate: path sigiloso, n\xE3o enfileirado" };
         }
         if (!task.sha) {
           task.sha = "";
@@ -5307,8 +5326,9 @@ var require_lexical_ios = __commonJS({
         for (const doc of this._docs.values()) {
           totalLen += doc.dl || 0;
           const seen = /* @__PURE__ */ new Set();
-          for (const [token] of doc.tokens || []) {
-            if (seen.has(token)) continue;
+          for (const entry of doc.tokens || []) {
+            const token = entry && entry.token;
+            if (!token || seen.has(token)) continue;
             seen.add(token);
             df.set(token, (df.get(token) || 0) + 1);
           }
@@ -6908,13 +6928,16 @@ var ZeusSearchModal = class extends SuggestModal {
     this.cachedResults = [];
     this.lastQuery = "";
     this.searchTimer = null;
+    this._querySeq = 0;
   }
   async getSuggestions(query) {
     if (!query || query.length < 2) return [];
     if (query === this.lastQuery) return this.cachedResults;
     this.lastQuery = query;
+    const seq = ++this._querySeq;
     try {
       const results = await this.plugin.searcher.search(query, this.plugin.settings.maxResults);
+      if (seq !== this._querySeq) return this.cachedResults;
       this.cachedResults = results;
       return results;
     } catch (e) {
@@ -7908,12 +7931,17 @@ Ou desative "Permitir fallback remoto" para for\xE7ar modo strict on-device.`, 1
             return;
           }
           const n = new Notice("Zeus: reindex\u2026", 0);
-          await this.indexer.runFullIndex((m) => {
-            n.setMessage("Zeus: " + m);
-            this.updateStatusBar("indexing", m);
-          });
-          n.hide();
-          this.updateStatusBar("idle", null);
+          try {
+            await this.indexer.runFullIndex((m) => {
+              n.setMessage("Zeus: " + m);
+              this.updateStatusBar("indexing", m);
+            });
+          } catch (e) {
+            new Notice("Zeus reindex falhou: " + (e.message || String(e)).slice(0, 200), 7e3);
+          } finally {
+            n.hide();
+            this.updateStatusBar("idle", null);
+          }
         }
       });
       this.addCommand({
@@ -7941,11 +7969,19 @@ Ou desative "Permitir fallback remoto" para for\xE7ar modo strict on-device.`, 1
             return;
           }
           const n = new Notice("Zeus enrich: FoundationModels processando\u2026", 0);
-          const result = await this.enricher.enrichNote(f.path);
-          n.hide();
-          if (result) new Notice(`Zeus enrich: ${(result.suggested_links || []).length} links, ${(result.connections || []).length} conex\xF5es.`);
-          else new Notice("Zeus enrich falhou \u2014 veja Console.");
-          this.refreshSmartView();
+          try {
+            const result = await this.enricher.enrichNote(f.path);
+            if (result) new Notice(`Zeus enrich: ${(result.suggested_links || []).length} links, ${(result.connections || []).length} conex\xF5es.`);
+            else new Notice("Zeus enrich falhou \u2014 veja Console.");
+          } catch (e) {
+            new Notice("Zeus enrich falhou: " + (e.message || String(e)).slice(0, 200), 7e3);
+          } finally {
+            n.hide();
+            try {
+              this.refreshSmartView();
+            } catch (e) {
+            }
+          }
         }
       });
       this.addCommand({
@@ -9372,9 +9408,27 @@ last_built: ${s.last_built || "never"}`,
         console.warn("[zeus] scheduler stop:", e.message);
       }
     }
-    if (this._passportRefreshTimers) {
-      for (const t of this._passportRefreshTimers.values()) clearTimeout(t);
-      this._passportRefreshTimers.clear();
+    for (const mapKey of ["_embedTimers", "_audioTimers", "_passportTimers", "_graphSyncTimers", "_passportRefreshTimers"]) {
+      const m = this[mapKey];
+      if (m && typeof m.values === "function") {
+        for (const t of m.values()) {
+          try {
+            clearTimeout(t);
+          } catch (e) {
+          }
+        }
+        if (typeof m.clear === "function") m.clear();
+      }
+    }
+    for (const key of ["_idxTimer", "_graphSyncTimer", "_zeusInitialTimer", "initialTimerId"]) {
+      const t = this[key];
+      if (t) {
+        try {
+          clearTimeout(t);
+        } catch (e) {
+        }
+        this[key] = null;
+      }
     }
     if (this.nativeWatcher) {
       try {

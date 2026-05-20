@@ -1815,14 +1815,20 @@ class ZeusSearchModal extends SuggestModal {
     this.cachedResults = [];
     this.lastQuery = '';
     this.searchTimer = null;
+    // codex MED #8: querySeq monotonic — sem isso, queries async stale podem
+    // sobrescrever cachedResults da query atual (user já digitou outra coisa).
+    // Mesmo padrão de ZeusHybridSearchModal v1.6.1.
+    this._querySeq = 0;
   }
 
   async getSuggestions(query) {
     if (!query || query.length < 2) return [];
     if (query === this.lastQuery) return this.cachedResults;
     this.lastQuery = query;
+    const seq = ++this._querySeq;
     try {
       const results = await this.plugin.searcher.search(query, this.plugin.settings.maxResults);
+      if (seq !== this._querySeq) return this.cachedResults; // resposta stale
       this.cachedResults = results;
       return results;
     } catch (e) {
@@ -3134,13 +3140,20 @@ class ZeusPlugin extends Plugin {
       name: 'Zeus: reindexar vault completo',
       callback: async () => {
         if (!isMac()) { new Notice('Zeus reindex: só Mac'); return; }
+        // codex MED #7: try/catch/finally garante Notice hide + status reset
+        // mesmo se runFullIndex lançar (antes: Notice ficava preso na tela).
         const n = new Notice('Zeus: reindex…', 0);
-        await this.indexer.runFullIndex(m => {
-          n.setMessage('Zeus: ' + m);
-          this.updateStatusBar('indexing', m);
-        });
-        n.hide();
-        this.updateStatusBar('idle', null);
+        try {
+          await this.indexer.runFullIndex(m => {
+            n.setMessage('Zeus: ' + m);
+            this.updateStatusBar('indexing', m);
+          });
+        } catch (e) {
+          new Notice('Zeus reindex falhou: ' + (e.message || String(e)).slice(0, 200), 7000);
+        } finally {
+          n.hide();
+          this.updateStatusBar('idle', null);
+        }
       },
     });
     this.addCommand({
@@ -3164,12 +3177,19 @@ class ZeusPlugin extends Plugin {
       callback: async () => {
         const f = this.app.workspace.getActiveFile();
         if (!f) { new Notice('Sem nota ativa'); return; }
+        // codex MED #7: try/catch/finally — sem isso, falha do enricher deixa
+        // Notice preso e refreshSmartView nunca roda.
         const n = new Notice('Zeus enrich: FoundationModels processando…', 0);
-        const result = await this.enricher.enrichNote(f.path);
-        n.hide();
-        if (result) new Notice(`Zeus enrich: ${(result.suggested_links || []).length} links, ${(result.connections || []).length} conexões.`);
-        else new Notice('Zeus enrich falhou — veja Console.');
-        this.refreshSmartView();
+        try {
+          const result = await this.enricher.enrichNote(f.path);
+          if (result) new Notice(`Zeus enrich: ${(result.suggested_links || []).length} links, ${(result.connections || []).length} conexões.`);
+          else new Notice('Zeus enrich falhou — veja Console.');
+        } catch (e) {
+          new Notice('Zeus enrich falhou: ' + (e.message || String(e)).slice(0, 200), 7000);
+        } finally {
+          n.hide();
+          try { this.refreshSmartView(); } catch { /* ignore */ }
+        }
       },
     });
     this.addCommand({
@@ -4591,9 +4611,26 @@ class ZeusPlugin extends Plugin {
     if (this.scheduler) {
       try { this.scheduler.stop(); } catch (e) { console.warn('[zeus] scheduler stop:', e.message); }
     }
-    if (this._passportRefreshTimers) {
-      for (const t of this._passportRefreshTimers.values()) clearTimeout(t);
-      this._passportRefreshTimers.clear();
+    // codex HIGH #3: limpa TODOS os timer maps reais (era só _passportRefreshTimers
+    // que nem existia). Maps reais são _embedTimers, _audioTimers, _passportTimers,
+    // _graphSyncTimers. Sem isso, hooks vault.on disparavam timers que ficavam
+    // pendurados pós-unload tentando escrever no plugin destruído.
+    for (const mapKey of ['_embedTimers', '_audioTimers', '_passportTimers', '_graphSyncTimers', '_passportRefreshTimers']) {
+      const m = this[mapKey];
+      if (m && typeof m.values === 'function') {
+        for (const t of m.values()) {
+          try { clearTimeout(t); } catch { /* ignore */ }
+        }
+        if (typeof m.clear === 'function') m.clear();
+      }
+    }
+    // Limpa também timers individuais standalone (não em Maps)
+    for (const key of ['_idxTimer', '_graphSyncTimer', '_zeusInitialTimer', 'initialTimerId']) {
+      const t = this[key];
+      if (t) {
+        try { clearTimeout(t); } catch { /* ignore */ }
+        this[key] = null;
+      }
     }
     if (this.nativeWatcher) {
       try { this.nativeWatcher.stop(); } catch (e) { console.warn('[zeus] native-watcher stop:', e.message); }

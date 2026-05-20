@@ -173,6 +173,20 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             return self.handleUnsupportedEndpoint("/v1/data-detect", reason: "NSDataDetector ainda não está portado no AegisDaemon standalone")
         case (.POST, "/v1/spotlight/search"):
             return self.handleUnsupportedEndpoint("/v1/spotlight/search", reason: "Spotlight search (mdfind shell) só macOS — use /v1/spotlight/query no iOS")
+        // codex MED #6: client expõe /v1/mobileclip/* mas Aegis não routava.
+        // Adicionado handlers unsupported_on_aegis_daemon (Mac-only feature até
+        // v2.0 labs implementar Core ML inference iOS).
+        case (.POST, "/v1/mobileclip/embed-image"):
+            return self.handleUnsupportedEndpoint("/v1/mobileclip/embed-image", reason: "MobileCLIP CoreML inference só macOS por enquanto (v2.0 labs)")
+        case (.POST, "/v1/mobileclip/embed-text"):
+            return self.handleUnsupportedEndpoint("/v1/mobileclip/embed-text", reason: "MobileCLIP CoreML inference só macOS por enquanto (v2.0 labs)")
+        case (.GET, "/v1/mobileclip/status"):
+            return Response(status: .ok, payload: [
+                "installed": false,
+                "platform": "ios",
+                "note": "MobileCLIP iOS pendente — v2.0 labs implementará via Core ML iOS",
+                "model_dir": NSString("~/Library/Application Support/Zeus/mobileclip-model").expandingTildeInPath,
+            ])
         // v1.13 — CoreSpotlight nativo iOS via CSSearchableIndex programático.
         case (.POST, "/v1/spotlight/index"):
             return self.handleSpotlightIndex(bodyJSON: body)
@@ -2201,11 +2215,14 @@ final class AegisHTTPHandler: ChannelInboundHandler {
     //
     // domainIdentifier por vault hash isolam indices entre vaults diferentes.
 
-    private static func deriveSpotlightDomain(_ json: [String: Any]) -> String {
+    private static func deriveSpotlightDomain(_ json: [String: Any]) -> String? {
         if let hint = json["domain_hint"] as? String, !hint.isEmpty {
             return hint
         }
-        return "com.maiocchi.zeus.ios.default"
+        // codex MED #11: NÃO retornar default — collision cross-vault possível.
+        // Caller (plugin Zeus JS) sempre envia domain_hint = sha256(vaultRoot).slice(0,16).
+        // Clientes diretos que esquecem domain_hint recebem 400 → erro acionável.
+        return nil
     }
 
     private func handleSpotlightIndex(bodyJSON: String) -> Response {
@@ -2216,7 +2233,11 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 "error": "body inválido: requer {\"items\": [{\"path\":...,\"title\":...,...}]}"
             ])
         }
-        let domainHint = Self.deriveSpotlightDomain(json)
+        guard let domainHint = Self.deriveSpotlightDomain(json) else {
+            return Response(status: .badRequest, payload: [
+                "error": "domain_hint obrigatório (sha do vaultRoot para evitar collision cross-vault no Spotlight global iOS)"
+            ])
+        }
 
         var searchableItems: [CSSearchableItem] = []
         for it in items {
@@ -2279,7 +2300,11 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             return Response(status: .badRequest, payload: ["error": "body inválido: requer {\"query\": \"...\"}"])
         }
         let limit = (json["limit"] as? Int) ?? 50
-        let domainHint = Self.deriveSpotlightDomain(json)
+        guard let domainHint = Self.deriveSpotlightDomain(json) else {
+            return Response(status: .badRequest, payload: [
+                "error": "domain_hint obrigatório (sha do vaultRoot para evitar collision cross-vault no Spotlight global iOS)"
+            ])
+        }
 
         // Escape \ e " para predicate seguro
         var escaped = query
@@ -2330,7 +2355,11 @@ final class AegisHTTPHandler: ChannelInboundHandler {
     private func handleSpotlightPurge(bodyJSON: String) -> Response {
         #if canImport(CoreSpotlight)
         let json = Self.parseJSON(bodyJSON) ?? [:]
-        let domainHint = Self.deriveSpotlightDomain(json)
+        guard let domainHint = Self.deriveSpotlightDomain(json) else {
+            return Response(status: .badRequest, payload: [
+                "error": "domain_hint obrigatório (sha do vaultRoot para evitar collision cross-vault no Spotlight global iOS)"
+            ])
+        }
 
         let index = CSSearchableIndex(name: domainHint)
         let sem = DispatchSemaphore(value: 0)

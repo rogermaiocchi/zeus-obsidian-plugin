@@ -103,6 +103,42 @@ function checkMacOS() {
   else add('macOS', 'XX', `${ver} — FoundationModels requer macOS 15+`, 'atualize o macOS');
 }
 
+// codex MED #10: doctor expandido — cobre Aegis target + endpoint parity +
+// freshness do bundle vs source.
+function checkAegisTarget() {
+  const aegisPath = join(root, 'daemon/Sources/AegisDaemon/AegisHTTPHandlers.swift');
+  if (!existsSync(aegisPath)) {
+    add('AegisDaemon iOS', '!!', 'fonte ausente em daemon/Sources/AegisDaemon/', 'verifique repo integrity');
+    return;
+  }
+  const txt = readFileSync(aegisPath, 'utf8');
+  const hasSpotlight = /handleSpotlightIndex/.test(txt);
+  const hasMobileCLIPRoute = /\/v1\/mobileclip\//.test(txt);
+  if (hasSpotlight && hasMobileCLIPRoute) {
+    add('AegisDaemon iOS', 'OK', 'spotlight + mobileclip routes presentes');
+  } else if (hasSpotlight) {
+    add('AegisDaemon iOS', '!!', 'spotlight ok, mobileclip stub ausente', 'verifique handleUnsupportedEndpoint /v1/mobileclip/*');
+  } else {
+    add('AegisDaemon iOS', '!!', 'spotlight handlers ausentes', 'verifique daemon/Sources/AegisDaemon/AegisHTTPHandlers.swift');
+  }
+}
+
+function checkBundleFreshness() {
+  const mainJs = join(root, 'main.js');
+  const mainSrc = join(root, 'main.source.js');
+  if (!existsSync(mainJs) || !existsSync(mainSrc)) {
+    add('bundle freshness', '!!', 'main.js ou main.source.js ausente');
+    return;
+  }
+  const srcM = statSync(mainSrc).mtimeMs;
+  const bundleM = statSync(mainJs).mtimeMs;
+  if (bundleM >= srcM) {
+    add('bundle freshness', 'OK', `main.js mtime ≥ source (Δ ${Math.round((bundleM - srcM)/1000)}s)`);
+  } else {
+    add('bundle freshness', '!!', `main.js stale: source ${Math.round((srcM - bundleM)/1000)}s mais novo`, 'rode: bun run build');
+  }
+}
+
 async function main() {
   console.log('zeus doctor — stack overview');
   console.log('='.repeat(36));
@@ -112,6 +148,8 @@ async function main() {
   checkCodesign();
   checkMainJs();
   checkManifests();
+  checkAegisTarget();
+  checkBundleFreshness();
   await checkDaemon();
 
   let ok = 0, warn = 0, fail = 0;

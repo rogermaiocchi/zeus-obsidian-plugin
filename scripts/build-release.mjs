@@ -70,9 +70,20 @@ function main() {
     run('node', ['esbuild.config.mjs']);
   }
 
-  // 5. Final smoke: spawn binary, hit /v1/health, kill
-  console.log('[build-release] ✓ bin/ZeusDaemonMac pronto. Para validar:');
-  console.log('              node scripts/zeus-smoke.mjs');
+  // 5. Final smoke: roda zeus-smoke.mjs contra daemon LIVE (opt-out via --no-smoke).
+  // codex MED #9: antes só imprimia "Para validar" — agora valida de fato.
+  const skipSmoke = process.argv.includes('--no-smoke');
+  if (!skipSmoke) {
+    try {
+      console.log('[build-release] $ smoke validation (--no-smoke skipa)');
+      run('node', ['scripts/zeus-smoke.mjs']);
+    } catch (e) {
+      console.warn('[build-release] ⚠ smoke falhou (daemon offline?):', e.message);
+      console.log('[build-release] continue mesmo assim — rebuild OK, smoke não-bloqueante');
+    }
+  }
+
+  console.log('[build-release] ✓ bin/ZeusDaemonMac pronto.');
 }
 
 try { main(); }

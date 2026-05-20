@@ -321,8 +321,7 @@ var require_hierarchical = __commonJS({
     }
     var HierarchicalProcessor2 = class {
       constructor(afmBinPath, maxChunkChars = 8e3) {
-        if (!afmBinPath) throw new Error("HierarchicalProcessor: afmBinPath required");
-        this.afmBin = afmBinPath;
+        this.afmBin = afmBinPath || null;
         this.maxChunkChars = maxChunkChars;
         this._batchMode = null;
       }
@@ -1121,7 +1120,22 @@ var require_zeus_http_client = __commonJS({
         return await this._post("/v1/asp/vad", { path: absPath }, 15e3);
       }
       async embedBatch(texts, options = {}) {
-        return await this._post("/v1/embed", { texts, ...options }, 12e4);
+        if (!Array.isArray(texts)) {
+          throw new Error("embedBatch: requer array de strings");
+        }
+        const vectors = [];
+        let dim = 0, model = "";
+        for (const t of texts) {
+          const r = await this._post("/v1/embed", { text: t, ...options }, 3e4);
+          const v = r.vectors && r.vectors[0] || r.vector;
+          if (!Array.isArray(v)) throw new Error('embedBatch: daemon n\xE3o retornou vetor para "' + (t || "").slice(0, 40) + '..."');
+          vectors.push(v);
+          if (!dim) {
+            dim = r.dim || v.length;
+            model = r.model || "";
+          }
+        }
+        return { vectors, dim, model, count: vectors.length };
       }
       async enrich(noteContent, notePath, vaultSummary = "") {
         return await this._post("/v1/enrich", {
@@ -1134,10 +1148,11 @@ var require_zeus_http_client = __commonJS({
         return await this._post("/v1/agent", { question, pattern }, 18e4);
       }
       async ocr(filePath, outputFormat = "text", language = "pt-BR,en") {
+        const langArr = typeof language === "string" ? language.split(",").map((s) => s.trim()).filter(Boolean) : Array.isArray(language) ? language : ["pt-BR", "en-US"];
         return await this._post("/v1/ocr", {
-          path: filePath,
-          output_format: outputFormat,
-          language
+          image_path: filePath,
+          languages: langArr,
+          output_format: outputFormat
         }, 12e4);
       }
       async summarize(text) {
@@ -2194,6 +2209,7 @@ var require_daemon_lifecycle = __commonJS({
         this.child = null;
         this.spawnedByUs = false;
         this.lastStatus = null;
+        this._startPromise = null;
       }
       _fs() {
         try {
@@ -2260,6 +2276,17 @@ var require_daemon_lifecycle = __commonJS({
         }
       }
       async ensureRunning() {
+        if (this._startPromise) return this._startPromise;
+        this._startPromise = (async () => {
+          try {
+            return await this._doEnsureRunning();
+          } finally {
+            this._startPromise = null;
+          }
+        })();
+        return this._startPromise;
+      }
+      async _doEnsureRunning() {
         if (await this.isHealthy(800)) {
           this.lastStatus = { running: true, source: "pre-existing", url: this.url };
           return this.lastStatus;
@@ -2332,16 +2359,29 @@ var require_daemon_lifecycle = __commonJS({
         const child = this.child;
         this.child = null;
         this.spawnedByUs = false;
+        let exited = false;
+        const exitPromise = new Promise((resolve) => {
+          const onExit = () => {
+            exited = true;
+            resolve();
+          };
+          child.once("exit", onExit);
+          child.once("close", onExit);
+        });
         try {
           child.kill("SIGTERM");
         } catch (e) {
         }
-        await new Promise((r) => setTimeout(r, graceMs));
-        try {
-          child.kill("SIGKILL");
-        } catch (e) {
+        const timer = new Promise((r) => setTimeout(r, graceMs));
+        await Promise.race([exitPromise, timer]);
+        if (!exited) {
+          try {
+            child.kill("SIGKILL");
+          } catch (e) {
+          }
+          await Promise.race([exitPromise, new Promise((r) => setTimeout(r, 500))]);
         }
-        return { stopped: true };
+        return { stopped: true, force: !exited };
       }
     };
     module2.exports = DaemonLifecycle2;
@@ -4397,6 +4437,11 @@ var ZeusPlugin = class extends Plugin {
         try {
           const status = await this.daemonLifecycle.ensureRunning();
           console.log("[zeus] daemon lifecycle:", status);
+          if (status && status.running && status.url && this.httpClient.baseUrl !== status.url) {
+            console.log("[zeus] httpClient rebase:", this.httpClient.baseUrl, "\u2192", status.url);
+            this.httpClient.setBaseUrl(status.url);
+            _zeusSetLocalDaemonUrl(status.url);
+          }
         } catch (e) {
           console.warn("[zeus] daemon lifecycle ensureRunning failed:", e.message);
         }

@@ -2477,6 +2477,16 @@ class ZeusPlugin extends Plugin {
       try {
         const status = await this.daemonLifecycle.ensureRunning();
         console.log('[zeus] daemon lifecycle:', status);
+        // v1.5.1 — fix P2 codex review: quando o lifecycle sobe (ou reaproveita)
+        // um daemon local em 127.0.0.1:2223, redireciona httpClient pra ele,
+        // sobrescrevendo qualquer cache de URL remota (Tailscale peer). Sem
+        // esse rebase, plugin spawna localmente mas continua falando com peer
+        // remoto — "drop-in/on-device" não cumprido.
+        if (status && status.running && status.url && this.httpClient.baseUrl !== status.url) {
+          console.log('[zeus] httpClient rebase:', this.httpClient.baseUrl, '→', status.url);
+          this.httpClient.setBaseUrl(status.url);
+          _zeusSetLocalDaemonUrl(status.url);
+        }
       } catch (e) {
         console.warn('[zeus] daemon lifecycle ensureRunning failed:', e.message);
       }

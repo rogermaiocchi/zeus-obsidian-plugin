@@ -4,6 +4,45 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.5.1] — 2026-05-20 — Fixes pós-auditoria Codex × Claude
+
+Debate cruzado entre `codex review` (gpt-5.5 high-reasoning) e auditoria Claude sobre o commit v1.5.0. Os dois revisores convergiram em 1 bug HIGH e codex pegou outros 4 que Claude perdeu. Aplicados 5 fixes neste patch.
+
+### Fixed — bugs introduzidos pelo v1.5.0
+
+- **[P0/HIGH]** `HierarchicalProcessor` constructor lançava `Error('afmBinPath required')` quando recebia `null` (`lib/hierarchical.js:93`) — main.source.js passava null após excisão do CLI, **plugin não carregava no Mac**. Relaxado para `this.afmBin = afmBinPath || null`; métodos que tentam spawn caem via `execAfm()` guards em runtime.
+- **[P1]** Contratos HTTP cliente↔daemon quebrados após remoção do fallback CLI (`lib/zeus-http-client.js:280, 297`):
+  - `embedBatch({texts:[...]})` → daemon Swift exige `{text:"single"}`. Reescrito para fazer N chamadas sequenciais e devolver `{vectors, dim, model, count}`.
+  - `ocr({path:...})` → daemon exige `{image_path:..., languages:[...]}`. Cliente ajustado para o contrato real.
+  - Validado por curl direto + `embedBatch(['hello','segundo'])` → 2 vetores 512-dim ✓; `ocr('/tmp/x.png')` → erro de arquivo (não de contrato) ✓.
+- **[P2]** `daemonLifecycle.ensureRunning()` retornava `status.url` mas `httpClient.baseUrl` nunca era rebasado (`main.source.js:2475-2483`). Se settings apontasse para Tailscale peer remoto, plugin spawnava local mas seguia falando com remoto — promessa "drop-in/on-device" quebrada. Adicionado `this.httpClient.setBaseUrl(status.url)` quando `status.running && status.url`.
+- **[MED]** `ensureRunning()` sem mutex permitia spawn duplo concorrente (`lib/daemon-lifecycle.js`). Adicionado `this._startPromise` que serializa chamadas — futuras callers compartilham a promessa em vôo.
+- **[LOW]** `stop()` mandava `SIGTERM` e dormia 2s antes de `SIGKILL` cego, sem aguardar `exit` do filho (`lib/daemon-lifecycle.js`). Reescrito para `Promise.race([exitPromise, timer])` — SIGKILL só dispara se SIGTERM não fechou. Garante que shutdown gracioso do NIO complete. `stop()` retorna `{stopped, force}` indicando se foi força.
+
+### Known issues (não bloqueia release)
+
+- **[HIGH não-acionável]** Binário `bin/ZeusDaemonMac` é adhoc-signed (não notarizado com Developer ID). `xattr -d com.apple.quarantine` no spawn enfraquece Gatekeeper. Mitigação real requer conta Apple Developer ($99/ano) + notarização. Workaround atual: `_prepareBinary()` faz best-effort strip e o binário roda em ambiente local controlado. Para distribuição pública, próximo passo é notarizar.
+- **[MED não-acionável]** Daemon sobrevive crash/force-quit do Obsidian (orphan reparenta a PID 1). Próximo `onload` reaproveita via `isHealthy()` ✓, mas sem versão check. Mitigação completa exigiria mudar daemon Swift para monitorar `ZEUS_PARENT_PID` — fora do escopo deste patch JS-only.
+- **[MED não-acionável]** iOS UX inconsistente: 19 callsites `httpClient.X()` bare vs 3 com `isAvailable()` preflight. Wrapper `requireDaemon(feature)` seria a solução estrutural — defer.
+- **[MED não-acionável]** Drift binário vs source: nenhum SHA256/manifest cruzando código Swift com binário commitado. Doctor só verifica tamanho/codesign. Próximo passo: gerar `bin/ZeusDaemonMac.sha256` no `build-release.mjs` e validar no `doctor`.
+- **[LOW não-acionável]** `tryDaemonOrSpawn` mantém nome legado mesmo sendo daemon-only — refactor cosmético adiado.
+
+### Auditoria — material reproduzível
+
+- Codex review do commit `ed2b1b0` em `/tmp/codex-review-ed2b1b0.txt` (gpt-5.5 high)
+- Codex exec audit em `/tmp/codex-exec-ed2b1b0.txt` (3 fixes adicionais detectados)
+- Validação empírica (curl + node) em conversa de desenvolvimento
+
+### Validation
+
+- `node esbuild.config.mjs` → `main.js` 225.5 KB
+- `node scripts/zeus-smoke.mjs` → 9/9 asserts
+- HP ctor com null: empiricamente OK (era THROW antes)
+- `embedBatch(['a','b'])` end-to-end: 2 vetores 512-dim
+- OCR contract: daemon aceita `image_path` (era 400 antes)
+
+---
+
 ## [1.5.0] — 2026-05-20 — Autonomia drop-in (daemon embarcado + dead code removido)
 
 Refatoração arquitetural inspirada no padrão [`ios-control-mcp`](https://github.com/rogermaiocchi/ios-control-mcp) (declarar deps + doctor + bootstrap + degradação graciosa). Plugin agora roda no Mac sem nenhuma instalação prévia — `swift build`, `launchctl`, `pip install` foram abolidos do caminho do usuário final.

@@ -3116,9 +3116,16 @@ class ZeusPlugin extends Plugin {
         if (!query || !query.trim()) return;
         const n = new Notice('Spotlight searching…', 0);
         try {
-          const r = await this.httpClient.spotlightSearch(query, null, 50);
+          // codex MED B/E: nome do comando diz CSSearchQuery — usa endpoint
+          // nativo com fallback gracioso, declara mode.
+          const r = await this.httpClient.spotlightQueryNative(query, this.vaultRoot, 50);
           n.hide();
           const results = (r && (r.results || r.matches || r.hits)) || [];
+          if (r && r.mode === 'mdfind-fallback') {
+            new Notice(`Spotlight: ${results.length} results via mdfind fallback (CSSearchQuery não disponível)`, 4000);
+          } else if (r && r.mode === 'error') {
+            new Notice('Spotlight: erro — ' + (r.error || '').slice(0, 150), 6000);
+          }
           try { await navigator.clipboard.writeText(JSON.stringify(results, null, 2)); } catch {}
           new Notice(`Spotlight: ${results.length} hits (JSON no clipboard)`);
           console.log('[zeus] spotlight:', r);
@@ -3650,6 +3657,24 @@ class ZeusPlugin extends Plugin {
       },
     });
     // v1.7 — Spotlight CSSearchableIndex integration
+    // codex audit MED A/F: computa domain_hint no JS para que daemon não caia
+    // em "com.maiocchi.zeus.default" quando spawned sem --vault. Hash do
+    // vaultRoot via universal.sha256Hex (Web Crypto fallback no iOS).
+    this._deriveSpotlightDomain = async () => {
+      if (!this.vaultRoot) return 'com.maiocchi.zeus.default';
+      try {
+        const hex = await universal.sha256Hex(this.vaultRoot);
+        return 'com.maiocchi.zeus.' + hex.slice(0, 16);
+      } catch { return 'com.maiocchi.zeus.default'; }
+    };
+    // codex audit MED F: o _post lança em qualquer erro HTTP — branches de
+    // "r.error" eram inalcançáveis. Wrapper único que pega Error e detecta
+    // 404/not_found/CoreSpotlight indisponível, mapeando para Notice de rebuild.
+    const _isRebuildNeededError = (msg) => {
+      const s = String(msg || '');
+      return /HTTP 404|not_found|CoreSpotlight indisponível|spotlight\/index|spotlight\/query|spotlight\/purge.*available/.test(s);
+    };
+
     this.addCommand({
       id: 'zeus-spotlight-index',
       name: 'Zeus: indexar vault no Spotlight (CSSearchableIndex)',
@@ -3658,7 +3683,6 @@ class ZeusPlugin extends Plugin {
           if (!isMac()) { new Notice('Zeus Spotlight: apenas macOS'); return; }
           const n = new Notice('Zeus: montando lote de items para CSSearchableIndex…', 0);
           const files = this.app.vault.getMarkdownFiles();
-          // Carrega passports em memória (1x) para enriquecer items.
           const passportMap = (this.passport && typeof this.passport.loadAll === 'function')
             ? await this.passport.loadAll().catch(() => new Map())
             : new Map();
@@ -3675,11 +3699,23 @@ class ZeusPlugin extends Plugin {
               modality: 'md',
             });
           }
-          n.setMessage(`Zeus: enviando ${items.length} items para CSSearchableIndex…`);
-          const r = await this.httpClient.spotlightIndex(items);
+          const domainHint = await this._deriveSpotlightDomain();
+          n.setMessage(`Zeus: enviando ${items.length} items (domain ${domainHint.slice(-16)})…`);
+          let r;
+          try {
+            r = await this.httpClient.spotlightIndex(items, domainHint);
+          } catch (e) {
+            n.hide();
+            if (_isRebuildNeededError(e.message)) {
+              new Notice('Zeus Spotlight: daemon bundled não suporta /v1/spotlight/index. Rebuild via `node scripts/build-release.mjs`.', 9000);
+            } else {
+              new Notice('Zeus Spotlight: ' + (e.message || '').slice(0, 200), 8000);
+            }
+            return;
+          }
           n.hide();
           if (r.indexed != null) {
-            new Notice(`Zeus Spotlight: ${r.indexed} items indexados · domain ${r.domain}`, 7000);
+            new Notice(`Zeus Spotlight: ${r.indexed} items indexados · domain ${r.domain.slice(-16)}`, 7000);
             try {
               const adapter = this.app.vault.adapter;
               const stateRel = universal.joinPath(this.manifest.dir, 'data', 'spotlight-state.json');
@@ -3691,10 +3727,8 @@ class ZeusPlugin extends Plugin {
                 mode: r.mode || 'queued',
               }, null, 2));
             } catch (e) { console.warn('[zeus] spotlight-state persist failed', e.message); }
-          } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
-            new Notice('Zeus Spotlight: daemon bundled v1.0 não suporta /v1/spotlight/index. Rebuild via `node scripts/build-release.mjs` para ativar.', 9000);
           } else {
-            new Notice('Zeus Spotlight: ' + (r.error || JSON.stringify(r).slice(0, 200)), 8000);
+            new Notice('Zeus Spotlight: resposta inesperada — ' + JSON.stringify(r).slice(0, 200), 8000);
           }
         } catch (e) {
           new Notice('Zeus Spotlight index falhou: ' + (e.message || String(e)).slice(0, 200), 8000);
@@ -3708,11 +3742,20 @@ class ZeusPlugin extends Plugin {
       callback: async () => {
         try {
           if (!isMac()) { new Notice('Zeus Spotlight: apenas macOS'); return; }
-          const r = await this.httpClient.spotlightPurge();
+          const domainHint = await this._deriveSpotlightDomain();
+          let r;
+          try {
+            r = await this.httpClient.spotlightPurge(domainHint);
+          } catch (e) {
+            if (_isRebuildNeededError(e.message)) {
+              new Notice('Zeus Spotlight purge: daemon bundled não suporta. Rebuild necessário.', 7000);
+            } else {
+              new Notice('Zeus Spotlight purge falhou: ' + (e.message || '').slice(0, 200), 7000);
+            }
+            return;
+          }
           if (r.purged) {
-            new Notice(`Zeus Spotlight purged · domain ${r.domain}`, 5000);
-          } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
-            new Notice('Zeus Spotlight purge: daemon bundled v1.0 não suporta. Rebuild necessário.', 7000);
+            new Notice(`Zeus Spotlight purged · domain ${r.domain.slice(-16)}`, 5000);
           } else {
             new Notice('Zeus Spotlight purge: ' + (r.error || 'erro'), 6000);
           }

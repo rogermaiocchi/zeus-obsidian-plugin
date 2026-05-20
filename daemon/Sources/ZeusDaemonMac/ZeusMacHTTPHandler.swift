@@ -2996,13 +2996,25 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             searchableItems.append(item)
         }
 
+        // codex MED A: CSSearchableIndex(name:) isolado por vault. Mantém
+        // domainIdentifier nos items para query/purge surface.
+        let index = CSSearchableIndex(name: domainHint)
         let sem = DispatchSemaphore(value: 0)
         var indexError: Error?
-        CSSearchableIndex.default().indexSearchableItems(searchableItems) { err in
+        index.indexSearchableItems(searchableItems) { err in
             indexError = err
             sem.signal()
         }
-        _ = sem.wait(timeout: .now() + .seconds(30))
+        // codex LOW A: timeout não é sucesso silencioso — retorna 504.
+        let waitResult = sem.wait(timeout: .now() + .seconds(30))
+        if waitResult == .timedOut {
+            return Response(status: .init(statusCode: 504, reasonPhrase: "Gateway Timeout"), payload: [
+                "error": "indexSearchableItems excedeu 30s sem callback",
+                "domain": domainHint,
+                "mode": "timeout",
+                "items_attempted": searchableItems.count
+            ])
+        }
 
         if let e = indexError {
             return Response(status: .internalServerError, payload: [
@@ -3042,12 +3054,25 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         // Sintaxe CSSearchQuery: "** == 'token'cdw" busca em todos os attrs.
         // Suporta wildcards. Restrição por domainIdentifier garante que só
         // items do nosso vault aparecem.
-        let escaped = query.replacingOccurrences(of: "'", with: "\\'")
+        // codex MED A: escape de \ E " (estamos interpolando dentro de "...").
+        // Antes só escapava ', que não aparecia na string interpolada.
+        var escaped = query
+        escaped = escaped.replacingOccurrences(of: "\\", with: "\\\\")
+        escaped = escaped.replacingOccurrences(of: "\"", with: "\\\"")
         let predicate = "(domainIdentifier == \"\(domainHint)\") && (** == \"\(escaped)*\"cdw)"
 
+        // codex MED A: CSSearchableIndex(name:) isolado — query precisa rodar
+        // no mesmo índice em que foi indexado.
+        let index = CSSearchableIndex(name: domainHint)
         let csQuery = CSSearchQuery(queryString: predicate, attributes: [
             "title", "contentDescription", "keywords", "identifier"
         ])
+        // CSSearchQuery não aceita `index` diretamente — `default()` é o root.
+        // CSSearchableIndex(name:) cria um índice nomeado que populamos, mas a
+        // query sempre roda sobre o root. A separação por nome só vale para
+        // o batch index/delete; queries continuam vendo tudo, filtradas por
+        // domainIdentifier predicate. Mantemos `index` por consistência futura.
+        _ = index
 
         var results: [[String: Any]] = []
         let sem = DispatchSemaphore(value: 0)
@@ -3099,13 +3124,23 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let json = Self.parseJSON(bodyJSON) ?? [:]
         let domainHint = (json["domain_hint"] as? String) ?? Self.deriveDomain(vaultURL: vaultURL)
 
+        // codex MED A: usa CSSearchableIndex(name:) isolado.
+        let index = CSSearchableIndex(name: domainHint)
         let sem = DispatchSemaphore(value: 0)
         var purgeError: Error?
-        CSSearchableIndex.default().deleteSearchableItems(withDomainIdentifiers: [domainHint]) { err in
+        index.deleteSearchableItems(withDomainIdentifiers: [domainHint]) { err in
             purgeError = err
             sem.signal()
         }
-        _ = sem.wait(timeout: .now() + .seconds(15))
+        // codex LOW A: timeout honesto — não retorna sucesso se callback nunca veio.
+        let waitResult = sem.wait(timeout: .now() + .seconds(15))
+        if waitResult == .timedOut {
+            return Response(status: .init(statusCode: 504, reasonPhrase: "Gateway Timeout"), payload: [
+                "error": "deleteSearchableItems excedeu 15s sem callback",
+                "domain": domainHint,
+                "mode": "timeout"
+            ])
+        }
 
         if let e = purgeError {
             return Response(status: .internalServerError, payload: [

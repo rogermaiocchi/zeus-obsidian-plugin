@@ -1858,31 +1858,27 @@ var require_bases_generator = __commonJS({
       }
       _renderYaml(stats, generatedAt) {
         return [
-          "# zeus-cards.base \u2014 auto-generated v1.7 (rich schema, formulas)",
+          "# zeus-cards.base \u2014 auto-generated v1.7.1 (rich schema, codex audit)",
           "# DO NOT EDIT MANUALLY \u2014 regenerated on each passport rebuild.",
           `# generated_at: ${generatedAt}`,
           `# stats: ${stats.count} passports \xB7 summary=${stats.withSummary} \xB7 concepts=${stats.withConcepts} \xB7 domain=${stats.withDomain}`,
           `# domains: ${stats.domainList.slice(0, 10).join(", ")}${stats.domainList.length > 10 ? " \u2026" : ""}`,
           "#",
           "# Can\xF4nico: data/passports.jsonl. Bases \xE9 UI derivativa.",
+          "# Sintaxe: https://obsidian.md/help/bases/syntax",
           "",
           "filters:",
           "  and:",
           '    - file.ext == "md"',
           "",
           "formulas:",
-          "  density_est:",
-          "    formula: file.size / 6",
-          "  freshness_days:",
-          "    formula: (now() - file.mtime) / 86400000",
-          "  has_graph:",
-          "    formula: list(zeus_graph_related).length() > 0",
-          "  has_neighbors:",
-          "    formula: list(zeus_related).length() > 0",
-          "  neighbor_count:",
-          "    formula: list(zeus_related).length()",
-          "  graph_node_count:",
-          "    formula: list(zeus_graph_related).length()",
+          '  density_est: "file.size / 6"',
+          '  freshness_days: "(now() - file.mtime) / 86400000"',
+          '  has_graph: "list(zeus_graph_related).length > 0"',
+          '  has_neighbors: "list(zeus_related).length > 0"',
+          '  neighbor_count: "list(zeus_related).length"',
+          '  graph_node_count: "list(zeus_graph_related).length"',
+          '  domain_primary: "list(zeus_domain)[0]"',
           "",
           "properties:",
           "  file.path:",
@@ -1904,9 +1900,9 @@ var require_bases_generator = __commonJS({
           "  formula.freshness_days:",
           "    displayName: Days since edit",
           "  formula.neighbor_count:",
-          "    displayName: # neighbors",
+          '    displayName: "# neighbors"',
           "  formula.graph_node_count:",
-          "    displayName: # graph nodes",
+          '    displayName: "# graph nodes"',
           "",
           "views:",
           "  - type: table",
@@ -1956,7 +1952,9 @@ var require_bases_generator = __commonJS({
           "      - zeus_summary",
           "      - zeus_concepts",
           "      - zeus_difficulty",
-          "    groupBy: zeus_domain",
+          "    groupBy:",
+          "      property: formula.domain_primary",
+          "      direction: ASC",
           "",
           "  - type: table",
           "    name: Recently edited",
@@ -2618,13 +2616,45 @@ var require_hybrid_search = __commonJS({
               topN * 2
             );
             this._lastSpotlightMode = r.mode;
-            const root = this.plugin.vaultRoot.endsWith("/") ? this.plugin.vaultRoot : this.plugin.vaultRoot + "/";
+            let nodePath = null;
+            let nodeFs = null;
+            try {
+              nodePath = require("path");
+            } catch (e) {
+            }
+            try {
+              nodeFs = require("fs");
+            } catch (e) {
+            }
+            let canonicalRoot = this.plugin.vaultRoot;
+            try {
+              if (nodeFs && nodeFs.realpathSync && nodeFs.realpathSync.native) {
+                canonicalRoot = nodeFs.realpathSync.native(this.plugin.vaultRoot);
+              }
+            } catch (e) {
+            }
             const list = [];
             for (const raw of r.results || []) {
-              if (typeof raw !== "string") continue;
-              let rel = raw;
-              if (raw.startsWith(root)) rel = raw.slice(root.length);
-              if (rel.startsWith("/")) continue;
+              if (typeof raw !== "string" || !raw) continue;
+              let rel;
+              if (nodePath && nodePath.relative) {
+                try {
+                  let canonAbs = raw;
+                  try {
+                    if (nodeFs && nodeFs.realpathSync && nodeFs.realpathSync.native) {
+                      canonAbs = nodeFs.realpathSync.native(raw);
+                    }
+                  } catch (e) {
+                  }
+                  rel = nodePath.relative(canonicalRoot, canonAbs);
+                } catch (e) {
+                  continue;
+                }
+              } else {
+                const root = canonicalRoot.endsWith("/") ? canonicalRoot : canonicalRoot + "/";
+                rel = raw.startsWith(root) ? raw.slice(root.length) : raw;
+              }
+              if (!rel || rel.startsWith("..") || nodePath && nodePath.isAbsolute && nodePath.isAbsolute(rel)) continue;
               if (!rel.endsWith(".md")) continue;
               list.push({ path: rel, source: "spotlight" });
               if (list.length >= topN * 2) break;
@@ -5422,9 +5452,14 @@ Ou desative "Permitir fallback remoto" para for\xE7ar modo strict on-device.`, 1
           if (!query || !query.trim()) return;
           const n = new Notice("Spotlight searching\u2026", 0);
           try {
-            const r = await this.httpClient.spotlightSearch(query, null, 50);
+            const r = await this.httpClient.spotlightQueryNative(query, this.vaultRoot, 50);
             n.hide();
             const results = r && (r.results || r.matches || r.hits) || [];
+            if (r && r.mode === "mdfind-fallback") {
+              new Notice(`Spotlight: ${results.length} results via mdfind fallback (CSSearchQuery n\xE3o dispon\xEDvel)`, 4e3);
+            } else if (r && r.mode === "error") {
+              new Notice("Spotlight: erro \u2014 " + (r.error || "").slice(0, 150), 6e3);
+            }
             try {
               await navigator.clipboard.writeText(JSON.stringify(results, null, 2));
             } catch (e) {
@@ -5937,6 +5972,19 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
           }
         }
       });
+      this._deriveSpotlightDomain = async () => {
+        if (!this.vaultRoot) return "com.maiocchi.zeus.default";
+        try {
+          const hex = await universal.sha256Hex(this.vaultRoot);
+          return "com.maiocchi.zeus." + hex.slice(0, 16);
+        } catch (e) {
+          return "com.maiocchi.zeus.default";
+        }
+      };
+      const _isRebuildNeededError = (msg) => {
+        const s = String(msg || "");
+        return /HTTP 404|not_found|CoreSpotlight indisponível|spotlight\/index|spotlight\/query|spotlight\/purge.*available/.test(s);
+      };
       this.addCommand({
         id: "zeus-spotlight-index",
         name: "Zeus: indexar vault no Spotlight (CSSearchableIndex)",
@@ -5962,11 +6010,23 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
                 modality: "md"
               });
             }
-            n.setMessage(`Zeus: enviando ${items.length} items para CSSearchableIndex\u2026`);
-            const r = await this.httpClient.spotlightIndex(items);
+            const domainHint = await this._deriveSpotlightDomain();
+            n.setMessage(`Zeus: enviando ${items.length} items (domain ${domainHint.slice(-16)})\u2026`);
+            let r;
+            try {
+              r = await this.httpClient.spotlightIndex(items, domainHint);
+            } catch (e) {
+              n.hide();
+              if (_isRebuildNeededError(e.message)) {
+                new Notice("Zeus Spotlight: daemon bundled n\xE3o suporta /v1/spotlight/index. Rebuild via `node scripts/build-release.mjs`.", 9e3);
+              } else {
+                new Notice("Zeus Spotlight: " + (e.message || "").slice(0, 200), 8e3);
+              }
+              return;
+            }
             n.hide();
             if (r.indexed != null) {
-              new Notice(`Zeus Spotlight: ${r.indexed} items indexados \xB7 domain ${r.domain}`, 7e3);
+              new Notice(`Zeus Spotlight: ${r.indexed} items indexados \xB7 domain ${r.domain.slice(-16)}`, 7e3);
               try {
                 const adapter = this.app.vault.adapter;
                 const stateRel = universal.joinPath(this.manifest.dir, "data", "spotlight-state.json");
@@ -5980,10 +6040,8 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
               } catch (e) {
                 console.warn("[zeus] spotlight-state persist failed", e.message);
               }
-            } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
-              new Notice("Zeus Spotlight: daemon bundled v1.0 n\xE3o suporta /v1/spotlight/index. Rebuild via `node scripts/build-release.mjs` para ativar.", 9e3);
             } else {
-              new Notice("Zeus Spotlight: " + (r.error || JSON.stringify(r).slice(0, 200)), 8e3);
+              new Notice("Zeus Spotlight: resposta inesperada \u2014 " + JSON.stringify(r).slice(0, 200), 8e3);
             }
           } catch (e) {
             new Notice("Zeus Spotlight index falhou: " + (e.message || String(e)).slice(0, 200), 8e3);
@@ -5999,11 +6057,20 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
               new Notice("Zeus Spotlight: apenas macOS");
               return;
             }
-            const r = await this.httpClient.spotlightPurge();
+            const domainHint = await this._deriveSpotlightDomain();
+            let r;
+            try {
+              r = await this.httpClient.spotlightPurge(domainHint);
+            } catch (e) {
+              if (_isRebuildNeededError(e.message)) {
+                new Notice("Zeus Spotlight purge: daemon bundled n\xE3o suporta. Rebuild necess\xE1rio.", 7e3);
+              } else {
+                new Notice("Zeus Spotlight purge falhou: " + (e.message || "").slice(0, 200), 7e3);
+              }
+              return;
+            }
             if (r.purged) {
-              new Notice(`Zeus Spotlight purged \xB7 domain ${r.domain}`, 5e3);
-            } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
-              new Notice("Zeus Spotlight purge: daemon bundled v1.0 n\xE3o suporta. Rebuild necess\xE1rio.", 7e3);
+              new Notice(`Zeus Spotlight purged \xB7 domain ${r.domain.slice(-16)}`, 5e3);
             } else {
               new Notice("Zeus Spotlight purge: " + (r.error || "erro"), 6e3);
             }

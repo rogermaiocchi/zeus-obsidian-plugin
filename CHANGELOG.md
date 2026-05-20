@@ -4,6 +4,49 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.7.1] — 2026-05-20 — Fixes pós-auditoria codex v1.7 (2 HIGH + 5 MED + 2 LOW)
+
+Codex auditou v1.7.0 e achou 9 issues. Todos os 8 acionáveis aplicados.
+
+### Fixed — Bases schema sintaticamente válido (HIGH)
+- `lib/bases-generator.js`: formulas como mapa direto `nome: "expressão"` (era `nome: { formula: "..." }`). `.length` (sem parênteses) seguindo sintaxe documentada (era `.length()`).
+- groupBy agora objeto `{ property, direction }` com formula intermediária `domain_primary: "list(zeus_domain)[0]"` (era string `groupBy: zeus_domain` — frágil quando o campo é array). Cobertura completa conforme https://obsidian.md/help/bases/syntax.
+
+### Fixed — Domain isolation per-vault (MED A/F)
+- Plugin agora calcula `domain_hint` via `universal.sha256Hex(vaultRoot)` e passa explicitamente em cada chamada (`spotlightIndex`, `spotlightPurge`). Daemon não cai mais em `com.maiocchi.zeus.default` quando spawned sem `--vault`.
+
+### Fixed — Swift improvements (MED A + LOW A, ativam após rebuild)
+- `CSSearchableIndex(name: domainHint)` substitui `.default()` no index e purge — isolado por vault.
+- Predicate CSSearchQuery escapa `\` e `"` (interpolação dentro de `"..."`). Antes só escapava `'`, ineficaz contra injeção.
+- Timeouts de 30s (index) e 15s (purge) retornam 504 + `mode: "timeout"` em vez de sucesso falso quando callback nunca veio.
+
+### Fixed — Spotlight UX (MED B/E + MED F)
+- Comando `Zeus: buscar via Spotlight nativo (CSSearchQuery)` agora usa `spotlightQueryNative` (era `spotlightSearch` legacy) — alinha nome ao comportamento, declara `mode` no Notice.
+- Detecção robusta de "daemon não suporta endpoint" via regex sobre `e.message` capturada (em vez de branches `r.error` inalcançáveis porque `_post` lança).
+
+### Fixed — Path conversion robusta (MED C)
+- `HybridSearch.query()` retriever spotlight agora usa `path.relative()` + `realpathSync.native()` para resolver symlinks corretamente. Valida `!rel.startsWith('..') && !path.isAbsolute(rel)`. iOS Capacitor sem fs/path: fallback simples startsWith preservado.
+
+### Notes — não aplicado
+- LOW C (filtro .md only exclui .canvas/.txt): cosmetic; preservado por simplicidade. ADR futuro se vault começar a usar .canvas como notas primárias.
+
+### Brainstorm registrado (não implementado, ADR futuro)
+- Grafo multiplex de vizinhança: arestas `wikilink + backlink + entity_overlap + date_overlap + folder_path + semantic_cosine + spotlight_token_bm25 + co-citation` com `why: ["same_entity: X", "links_to: Y"]` explicação por aresta
+- UI top-5 via MMR (Maximum Marginal Relevance) — diversidade em vez de top-5 cosine puro
+- Leiden community detection (copiar `maiocchi-ia/skills/tripla-fusao/scripts/cluster.py`)
+- BM25 lexical lane (copiar `maiocchi-ia/skills/tripla-fusao/scripts/bm25.py`)
+- `apple/swift-collections` `OrderedSet` para dedup estável em `HybridSearch.fuse`; `BitSet` para "path presente em retriever X"
+- `apple/ml-mobileclip` (Apache-2.0): vision-language model on-device para text→image neighbors zero-shot
+- Spotlight `mdimporter` plugin (Quick Look + Spotlight contributors) para `.md` permitindo Cmd+Space achar notas sem precisar do plugin do Zeus rodando
+
+### Validation
+- `node esbuild.config.mjs` → main.js OK
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9
+- `node --check` em todos os 4 .js modificados
+
+---
+
 ## [1.7.0] — 2026-05-20 — Spotlight CSSearchableIndex + .base enriquecido + 4º retriever híbrido
 
 Protocolo formal: codex debateu o plano com claude → claude executou autônomo → codex audita (próximo). Codex aprovou escopo enxuto (cortou MobileCLIP, mdimporter, frontmatter mass-write); achados HIGH/MED incorporados na concepção.

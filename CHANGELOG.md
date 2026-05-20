@@ -4,6 +4,72 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.8.0] — 2026-05-20 — BM25 lexical lane + MMR diversify + Multiplex graph (8 edge types)
+
+Materializa o brainstorm registrado em v1.7.1: a perna léxica BM25 (porte JS puro do `~/Code/maiocchi-ia/skills/tripla-fusao/scripts/bm25.py`, IDF Okapi clássico +1 nunca-negativa, k1=1.5/b=0.75) entra como 5º retriever do `HybridSearch`; MMR rerank opcional troca top-N puro por diversidade de fontes (jaccard sobre sourceMask); grafo multiplex de 8 evidências com `why` auditável aterrissa em `data/multiplex.jsonl`. Codex aprovou escopo enxuto — deferidos: Leiden communities (v1.9), MobileCLIP CoreML (v2.0 labs, opt-in via download de modelo), mdimporter Spotlight companion plugin (futuramente em `daemon/MDImporters/`).
+
+### Added — lib/bm25.js (~210 LOC)
+- `tokenize(text)`: regex `/[0-9a-zà-ÿ_-]{2,}/g` lowercased — espelha bm25.py canônico (interop léxica entre stacks Py/JS).
+- `bm25Scores(corpus, queryTokens, k1=1.5, b=0.75)`: Okapi BM25 puro. IDF clássico com `log(1 + (N-df+0.5)/(df+0.5))` — variante +1 que nunca fica negativa. TF saturation via k1, length normalization via b · |doc|/avgdl. Documento sem termo da query recebe score 0.
+- `rankNotes(notes, query, topN, opts)`: top-N por score decrescente, descarta score 0. Aceita override de k1/b via opts.
+- CLI demo: `node lib/bm25.js "query"` roda smoke test com corpus sintético — útil pra debug sem rodar o plugin.
+
+### Added — lib/multiplex-graph.js (~340 LOC)
+8 edge types, cada um com `weight` default calibrado e `why: string[]` por aresta (XAI auditável):
+- `wikilink` (w=1.0): A → B com `[[B]]` explícito. Via `metadataCache.resolvedLinks`.
+- `backlink` (w=1.0): recíproca de wikilink.
+- `entity_overlap` (w=0.7): passports.jsonl concepts(A) ∩ concepts(B) ≥ 2. Index reverso concept→Set<path>; descarta conceito ubíquo (>100 paths) como ruído.
+- `date_overlap` (w=0.2): file.mtime mesmo dia (UTC). Cap em 30 notas/dia para evitar rajadas.
+- `folder_path` (w=0.3): mesmo diretório. Cap em 50 notas/pasta.
+- `semantic_cosine` (w=0.8): cosine(emb(A), emb(B)) > 0.5. Cap em 2000 entries (O(N²)).
+- `spotlight_token_bm25` (w=0.6): placeholder — population real virá em v1.9 quando daemon expor `/v1/spotlight/tokens`. v1.8 declara schema, skip gracioso.
+- `co_citation` (w=0.5): A e B citadas pela mesma C. Limitado a top-1000 notas mais backlinked (cap O(N²)) e 20 alvos por fonte.
+
+Persistência: `data/multiplex.jsonl` (1 edge per line, JSONL). Dedup natural via `Map<"src|dst|type", edge>` — re-build não duplica.
+
+API: `buildFromVault(onProgress) → {total, elapsedMs, builtAt}`, `persist() / load()`, `neighbors(path, types?)`, `neighborsByDst(path)` (agrega por destino somando weight), `stats() → {total, byType}`.
+
+### Updated — lib/hybrid-search.js
+- 5º retriever **bm25** integrado em `query()`. Corpus = notas com embedding já carregado (lazy, `searcher.embeddings`), text = title + readDoc(path) com cap em 30KB/nota e 2000 notas/corpus. iOS sem `readDoc` cai para título.
+- `sources: Set` interno virou `sourceMask: number` (bitmask 6 bits — bit 0=semantic, 1=path, 2=graph, 3=passport, 4=spotlight, 5=bm25). Consumer continua recebendo `sources: string[]` por compat. `sourceMask` exposto também para MMR.
+- Novo método `diversify(items, lambda=0.5, topN)` — MMR (Carbonell & Goldstein 1998). Score normalizado para [0,1] no batch; jaccard de bitmask via popcount Hamming O(1) como proxy de diversidade (real seria embeddings cosine, mas custo > benefício em hot path). λ=1 desliga MMR (só relevância); λ=0 ignora score (só diversidade).
+- `query()` e `sisterNotes()` ganham `opts = {diversify, diversityLambda, disableBm25}`. ZeusHybridSearchModal propaga settings `hybridDiversifyDefault` + `hybridDiversityLambda`.
+- `sisterNotes()` ganha 5ª lista opcional **multiplex**: quando `this.plugin.multiplex.edges` carregado, agrega `neighborsByDst()` como source 'graph' (somando ao zeus_related frontmatter).
+
+### Added — Comandos novos no plugin
+- "Zeus: construir grafo multiplex (8 edge types)" — invoca `buildFromVault` + `persist`. Notice com breakdown por tipo.
+- "Zeus: vizinhos multiplex desta nota (com why)" — abre `ZeusMultiplexNeighborsModal` listando edges por type com `why` explícito (auditabilidade XAI). Lazy-load do `data/multiplex.jsonl` quando o comando é invocado.
+
+### Added — Settings v1.8
+- `hybridDiversityLambda` (slider 0..1, default 0.5) — λ da MMR.
+- `hybridDiversifyDefault` (toggle, default false) — se ON, busca híbrida aplica MMR por padrão.
+- `multiplexAutoBuild` (toggle, default false) — se ON, plugin chama `buildFromVault + persist` 5s após onload (background, falha silenciosa). Default OFF porque build é O(N²) em entity/cosine.
+- Botão "Multiplex stats" — snapshot do grafo carregado.
+
+### Deferred — não acionável em v1.8
+- **Leiden communities**: deferido v1.9 — precisa schema multiplex congelado para definir o que pesar como input. Plano: porte do `cluster.py` para JS puro, comando "Zeus: detectar comunidades multiplex" que escreve `zeus_community: <id>` em frontmatter.
+- **MobileCLIP CoreML (text→image zero-shot)**: deferido v2.0 labs. Modelo bundle ruim (250MB+); plano: comando "Zeus: instalar modelo MobileCLIP" baixa sob demanda. Apache-2.0 ok para distribuir, mas UX de "plugin de 500KB → 250MB ao primeiro uso" precisa redesign.
+- **mdimporter Spotlight companion**: deferido futuramente como `daemon/MDImporters/ZeusMD.mdimporter`. Permitiria Cmd+Space achar notas sem plugin Zeus rodando — UX disruptivo mas requer notarização Apple (não-trivial).
+
+### Codex × Claude debate pré-implementação
+- IDF Okapi com +1 (nunca negativa) sobre IDF clássico (pode ficar negativa pra termo em >50% docs). Convergência: +1.
+- MMR sobre `sources` jaccard como proxy barato vs MMR sobre embeddings cosine (real). Convergência: jaccard, com hook documentado para upgrade futuro.
+- Multiplex edge dedup: `Map<"src|dst|type", edge>` agrega `why` em vez de re-criar. Self-loop ignorado silencioso.
+- co_citation O(N²) sobre todos os wikilinks → cap a top-1000 notas mais backlinked. Convergência: cap.
+- spotlight_token_bm25 requer daemon vivo + indexed; daemon down → skip sem fail. Convergência: schema-only em v1.8.
+- BM25 corpus pode estourar em vault >10k notas → cap maxCorpus=2000 + leitura lazy via searcher.readDoc. Convergência: cap + lazy.
+
+### Validation
+- `node --check` em `lib/bm25.js`, `lib/multiplex-graph.js`, `lib/hybrid-search.js`, `main.source.js` — OK
+- Empirical BM25 (`node lib/bm25.js "habeas corpus"`): doc-a/doc-b score 1.00, doc-d (repetição) 0.64 — saturação k1 verificada.
+- Empirical multiplex (`new MultiplexGraph(mockPlugin)`): addEdge dedup + neighbors filter por tipo + self-loop reject — todos OK.
+- Empirical hybrid fuse + diversify: bitmask propagation OK, MMR top-2 favorece mistura de sources.
+- `bun run build` (esbuild bundling main.source.js → main.js) — OK.
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9 asserts passaram
+
+---
+
 ## [1.7.1] — 2026-05-20 — Fixes pós-auditoria codex v1.7 (2 HIGH + 5 MED + 2 LOW)
 
 Codex auditou v1.7.0 e achou 9 issues. Todos os 8 acionáveis aplicados.

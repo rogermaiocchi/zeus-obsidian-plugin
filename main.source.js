@@ -181,8 +181,9 @@ const BasesGenerator = require('./lib/bases-generator');     // v0.9: Obsidian B
 const DistributedCoordinator = require('./lib/distributed-coordinator'); // v0.10: cross-device claim/release via iCloud lock files
 const PassportScheduler = require('./lib/passport-scheduler');           // v0.10: background sweep for stale passports
 const DaemonLifecycle = require('./lib/daemon-lifecycle');               // v1.5: auto-spawn bin/ZeusDaemonMac (autonomia total Mac)
-const HybridSearch = require('./lib/hybrid-search');                     // v1.6: RRF semantic+graph+passport+path
+const HybridSearch = require('./lib/hybrid-search');                     // v1.6: RRF semantic+graph+passport+path; v1.8: +bm25 +MMR diversify
 const NativeWatcher = require('./lib/native-watcher');                   // v1.6: FSEvents observability (Mac iCloud)
+const MultiplexGraph = require('./lib/multiplex-graph');                 // v1.8: 8-edge-type multiplex graph (wikilink/backlink/entity/date/folder/cosine/spotlight/co-citation)
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -267,6 +268,10 @@ const DEFAULT_SETTINGS = {
   // 'auto'   = sempre permite roteamento para PCC quando on-device excede capacidade
   pccMode: 'off',
   pccVisualIndicator: true,                 // exibe ☁️PCC no status bar quando daemon roteou via PCC
+  // v1.8 — hybrid search MMR diversify + multiplex graph
+  hybridDiversityLambda: 0.5,               // λ ∈ [0,1] da MMR — 1=só relevância, 0=só diversidade
+  hybridDiversifyDefault: false,            // se ON, query() aplica MMR por padrão (lambda configurável acima)
+  multiplexAutoBuild: false,                // se ON, build inicial roda no onload em background
 };
 
 // =========================================================================
@@ -1838,7 +1843,11 @@ class ZeusHybridSearchModal extends SuggestModal {
     this.lastQuery = q;
     const seq = ++this._querySeq;
     try {
-      const r = await this.plugin.hybrid.query(q, this.plugin.settings.maxResults || 30);
+      // v1.8: propaga hybridDiversifyDefault + lambda das settings
+      const r = await this.plugin.hybrid.query(q, this.plugin.settings.maxResults || 30, {
+        diversify: !!this.plugin.settings.hybridDiversifyDefault,
+        diversityLambda: this.plugin.settings.hybridDiversityLambda,
+      });
       if (seq !== this._querySeq) return this.cached; // resposta stale — usuário já digitou outra coisa
       this.cached = r;
       return r;
@@ -1891,6 +1900,50 @@ class ZeusHybridResultsModal extends SuggestModal {
     }
     meta.createSpan({ cls: 'zeus-badge zeus-badge-sem', text: hit.score.toFixed(3) });
     el.createDiv({ cls: 'zeus-result-path', text: hit.path });
+  }
+  async onChooseSuggestion(hit) {
+    const file = this.app.vault.getAbstractFileByPath(hit.path);
+    if (file instanceof TFile) await this.app.workspace.getLeaf().openFile(file);
+  }
+}
+
+// v1.8 — Modal de vizinhos multiplex: mostra cada edge type com why (XAI).
+// Reusa SuggestModal mas expõe um item por destino — ao expandir vê edges.
+class ZeusMultiplexNeighborsModal extends SuggestModal {
+  constructor(app, plugin, items, title) {
+    super(app);
+    this.plugin = plugin;
+    this.items = items;
+    this.setPlaceholder(title || 'Zeus — vizinhos multiplex (com why)');
+  }
+  getSuggestions(q) {
+    if (!q) return this.items;
+    const qn = q.toLowerCase();
+    return this.items.filter(it => (it.path || '').toLowerCase().includes(qn));
+  }
+  renderSuggestion(hit, el) {
+    el.empty();
+    el.addClass('zeus-result');
+    const head = el.createDiv({ cls: 'zeus-result-head' });
+    const name = hit.path.replace(/\.md$/, '').split('/').pop();
+    head.createSpan({ cls: 'zeus-result-title', text: name });
+    const meta = head.createSpan({ cls: 'zeus-result-meta' });
+    for (const src of (hit.sources || [])) {
+      meta.createSpan({ cls: `zeus-badge zeus-badge-${src}`, text: src });
+    }
+    meta.createSpan({ cls: 'zeus-badge zeus-badge-sem', text: 'Σw=' + (hit.score || 0).toFixed(2) });
+    el.createDiv({ cls: 'zeus-result-path', text: hit.path });
+    // why expandido — uma linha por edge type
+    if (Array.isArray(hit._edges)) {
+      const whyWrap = el.createDiv({ cls: 'zeus-result-path' });
+      for (const edge of hit._edges) {
+        const whyText = (edge.why && edge.why.length) ? edge.why.slice(0, 2).join(' · ') : '';
+        const line = whyWrap.createDiv();
+        line.style.fontSize = '0.85em';
+        line.style.opacity = '0.8';
+        line.setText(`  ${edge.type} (w=${(edge.weight || 0).toFixed(2)}): ${whyText}`);
+      }
+    }
   }
   async onChooseSuggestion(hit) {
     const file = this.app.vault.getAbstractFileByPath(hit.path);
@@ -2585,6 +2638,58 @@ class ZeusSettingTab extends PluginSettingTab {
       }));
 
     // ────────────────────────────────────────────────────────────────────
+    // v1.8 — Hybrid diversify (MMR) + Multiplex graph
+    // ────────────────────────────────────────────────────────────────────
+    containerEl.createEl('h3', { text: 'v1.8 — Hybrid diversify (MMR) + Multiplex graph (8 edge types)' });
+    const v18Desc = containerEl.createEl('p', { cls: 'setting-item-description' });
+    v18Desc.appendText('5º retriever BM25 (Okapi puro JS) já está ativo no hybrid-search — acha termo exato (sigla, processo, id) que a perna semântica perde. ');
+    v18Desc.appendText('MMR rerank opcional usa jaccard de sources como proxy de diversidade. Multiplex graph captura 8 evidências (wikilink·backlink·entity·date·folder·cosine·spotlight·co-citation) com `why` auditável.');
+
+    new Setting(containerEl)
+      .setName('Diversify hybrid query (MMR) por padrão')
+      .setDesc('Quando ON, busca híbrida aplica MMR rerank antes de retornar — favorece resultados que vêm de fontes diferentes (semantic+bm25+path vs 3 semanticos puros).')
+      .addToggle(t => t.setValue(this.plugin.settings.hybridDiversifyDefault).onChange(async v => {
+        this.plugin.settings.hybridDiversifyDefault = v;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('MMR λ (lambda) — relevância vs diversidade')
+      .setDesc('1.0 = só relevância (sem MMR). 0.0 = só diversidade (ignora score). Default 0.5 = balanceado. Aplica-se quando "diversify default" está ON ou comandos passam opts.diversify.')
+      .addSlider(s => s.setLimits(0, 1, 0.05).setValue(this.plugin.settings.hybridDiversityLambda).setDynamicTooltip().onChange(async v => {
+        this.plugin.settings.hybridDiversityLambda = v;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('Auto-build multiplex no onload')
+      .setDesc('Quando ON, plugin constrói o grafo multiplex em background no startup. Default OFF — rode manualmente via comando "Zeus: construir grafo multiplex". Build pesa O(N²) por entity/cosine.')
+      .addToggle(t => t.setValue(this.plugin.settings.multiplexAutoBuild).onChange(async v => {
+        this.plugin.settings.multiplexAutoBuild = v;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('Multiplex stats')
+      .setDesc('Snapshot do grafo carregado (load preguiçoso — abre comando "vizinhos multiplex" para carregar).')
+      .addButton(b => b.setButtonText('Stats').onClick(async () => {
+        try {
+          if (!this.plugin._multiplexLoaded) {
+            await this.plugin.multiplex.load();
+            this.plugin._multiplexLoaded = true;
+          }
+          const s = this.plugin.multiplex.stats();
+          const breakdown = Object.entries(s.byType)
+            .filter(([_, c]) => c > 0)
+            .map(([t, c]) => `${t}:${c}`)
+            .join(' · ');
+          new Notice(`Zeus multiplex: ${s.total} edges · ${breakdown || '(vazio)'}\n${s.builtAt ? 'built ' + s.builtAt : '(nunca buildado)'}`, 9000);
+        } catch (e) {
+          new Notice('Zeus multiplex stats falhou: ' + e.message, 5000);
+        }
+      }));
+
+    // ────────────────────────────────────────────────────────────────────
     // Ações finais
     // ────────────────────────────────────────────────────────────────────
     containerEl.createEl('h3', { text: 'Ações' });
@@ -2652,10 +2757,16 @@ class ZeusPlugin extends Plugin {
     this.hyde = new HyDEExpander(this);
     this.graphExtractor = new ZeusGraphExtractor(this);
     this.nativeGraph = new ZeusNativeGraphIntegration(this);
-    // v1.6 — busca híbrida (RRF semantic+graph+passport+path)
+    // v1.6 — busca híbrida (RRF semantic+graph+passport+path); v1.8 ganha bm25 +MMR
     this.hybrid = new HybridSearch(this);
     // v1.6 — FSEvents observability (Mac apenas; iOS é no-op).
     this.nativeWatcher = new NativeWatcher(this);
+    // v1.8 — Multiplex graph (8 edge types). Carregamento lazy: o objeto existe
+    // mas só lê data/multiplex.jsonl quando um comando o invoca, OU on-demand
+    // quando hybrid.sisterNotes() detecta arquivo existindo. multiplexAutoBuild
+    // = true reroda buildFromVault em background no onload.
+    this.multiplex = new MultiplexGraph(this);
+    this._multiplexLoaded = false;
 
     // v0.5.0 — modular extensions
     // pluginDataPath: absolute on Mac, vault-relative on iOS (multi-vector saveAll
@@ -2757,6 +2868,25 @@ class ZeusPlugin extends Plugin {
     });
     if (this.settings.schedulerEnabled) {
       this.scheduler.start();
+    }
+
+    // v1.8 — Multiplex auto-build (opt-in via settings). Roda em background
+    // após onLayoutReady para não bloquear o startup; falha silenciosa.
+    if (this.settings.multiplexAutoBuild) {
+      setTimeout(async () => {
+        try {
+          console.log('[zeus.multiplex] auto-build starting…');
+          await this.multiplex.buildFromVault((msg, pct) => {
+            if (pct % 25 === 0) console.log(`[zeus.multiplex] ${pct}%`, msg);
+          });
+          await this.multiplex.persist();
+          this._multiplexLoaded = true;
+          const s = this.multiplex.stats();
+          console.log('[zeus.multiplex] auto-build done:', s.total, 'edges');
+        } catch (e) {
+          console.warn('[zeus.multiplex] auto-build failed:', e.message);
+        }
+      }, 5000);
     }
 
     // v0.6.1 — Adaptive daemon discovery (async, doesn't block onload)
@@ -3654,6 +3784,70 @@ class ZeusPlugin extends Plugin {
           n.hide();
           new Notice('Zeus graphify falhou: ' + (e.message || String(e)).slice(0, 150));
         }
+      },
+    });
+    // v1.8 — Multiplex graph (8 edge types). Helpers para lazy-load do
+    // data/multiplex.jsonl: comandos chamam isso antes de consultar `edges`.
+    const _ensureMultiplexLoaded = async () => {
+      if (this._multiplexLoaded) return;
+      try {
+        const r = await this.multiplex.load();
+        this._multiplexLoaded = true;
+        console.log('[zeus.multiplex] loaded', r);
+      } catch (e) {
+        console.warn('[zeus.multiplex] load failed:', e.message);
+      }
+    };
+    this.addCommand({
+      id: 'zeus-multiplex-build',
+      name: 'Zeus: construir grafo multiplex (8 edge types)',
+      callback: async () => {
+        const n = new Notice('Zeus: construindo grafo multiplex (wikilink·backlink·entity·date·folder·cosine·spotlight·co-citation)…', 0);
+        try {
+          const r = await this.multiplex.buildFromVault((msg, pct) => {
+            n.setMessage(`Zeus multiplex (${pct}%): ${msg}`);
+          });
+          const persisted = await this.multiplex.persist();
+          this._multiplexLoaded = true;
+          n.hide();
+          const stats = this.multiplex.stats();
+          const breakdown = Object.entries(stats.byType)
+            .filter(([_, c]) => c > 0)
+            .map(([t, c]) => `${t}:${c}`)
+            .join(' · ');
+          new Notice(`Zeus multiplex: ${r.total} edges em ${r.elapsedMs}ms · ${breakdown} · persistido em ${persisted.path}`, 9000);
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus multiplex build falhou: ' + (e.message || String(e)).slice(0, 200));
+        }
+      },
+    });
+    this.addCommand({
+      id: 'zeus-multiplex-neighbors',
+      name: 'Zeus: vizinhos multiplex desta nota (com why)',
+      callback: async () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice('Zeus: sem arquivo ativo'); return; }
+        await _ensureMultiplexLoaded();
+        if (!this.multiplex.edges || this.multiplex.edges.size === 0) {
+          new Notice('Zeus multiplex: grafo vazio — rode "Zeus: construir grafo multiplex" primeiro', 6000);
+          return;
+        }
+        const groups = this.multiplex.neighborsByDst(file.path);
+        if (!groups.length) {
+          new Notice(`Zeus multiplex: nenhum vizinho para ${file.basename}`, 5000);
+          return;
+        }
+        // Constrói lista de hits no shape do ZeusHybridResultsModal, mas
+        // empacotando o detalhe `why` por aresta em campo extra. Reaproveita
+        // o modal hybrid (já renderiza sources + score).
+        const items = groups.slice(0, 30).map(g => ({
+          path: g.dst,
+          score: g.totalWeight,
+          sources: Array.from(new Set(g.edges.map(e => e.type))),
+          _edges: g.edges,
+        }));
+        new ZeusMultiplexNeighborsModal(this.app, this, items, `Vizinhos multiplex de ${file.basename}`).open();
       },
     });
     // v1.7 — Spotlight CSSearchableIndex integration

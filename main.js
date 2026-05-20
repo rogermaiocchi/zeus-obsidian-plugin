@@ -2482,11 +2482,142 @@ var require_daemon_lifecycle = __commonJS({
   }
 });
 
+// lib/bm25.js
+var require_bm25 = __commonJS({
+  "lib/bm25.js"(exports2, module2) {
+    "use strict";
+    var _TOKEN = /[0-9a-zà-ÿ_-]{2,}/g;
+    var K1_DEFAULT = 1.5;
+    var B_DEFAULT = 0.75;
+    function tokenize(text) {
+      if (!text || typeof text !== "string") return [];
+      return text.toLowerCase().match(_TOKEN) || [];
+    }
+    function bm25Scores(corpus, queryTokens, k1 = K1_DEFAULT, b = B_DEFAULT) {
+      const N = corpus.length;
+      if (N === 0) return [];
+      if (!Array.isArray(queryTokens) || queryTokens.length === 0) {
+        return new Array(N).fill(0);
+      }
+      const docLens = new Array(N);
+      let totalLen = 0;
+      for (let i = 0; i < N; i++) {
+        const dl = corpus[i].length;
+        docLens[i] = dl;
+        totalLen += dl;
+      }
+      const avgdl = totalLen / N;
+      const df = /* @__PURE__ */ new Map();
+      for (let i = 0; i < N; i++) {
+        const seen = new Set(corpus[i]);
+        for (const term of seen) {
+          df.set(term, (df.get(term) || 0) + 1);
+        }
+      }
+      const idf = /* @__PURE__ */ new Map();
+      for (const [term, freq] of df.entries()) {
+        idf.set(term, Math.log(1 + (N - freq + 0.5) / (freq + 0.5)));
+      }
+      const querySet = new Set(queryTokens);
+      const scores = new Array(N).fill(0);
+      for (let i = 0; i < N; i++) {
+        const doc = corpus[i];
+        const docLen = docLens[i];
+        if (doc.length === 0) continue;
+        const tf = /* @__PURE__ */ new Map();
+        for (const term of doc) {
+          tf.set(term, (tf.get(term) || 0) + 1);
+        }
+        let score = 0;
+        for (const term of querySet) {
+          const freq = tf.get(term) || 0;
+          if (freq === 0) continue;
+          const denom = avgdl > 0 ? freq + k1 * (1 - b + b * docLen / avgdl) : freq;
+          score += (idf.get(term) || 0) * (freq * (k1 + 1)) / denom;
+        }
+        scores[i] = score;
+      }
+      return scores;
+    }
+    function rankNotes(notes, query, topN = 30, opts = {}) {
+      if (!Array.isArray(notes) || notes.length === 0) return [];
+      const queryTokens = tokenize(query);
+      if (queryTokens.length === 0) return [];
+      const k1 = opts.k1 != null ? opts.k1 : K1_DEFAULT;
+      const b = opts.b != null ? opts.b : B_DEFAULT;
+      const corpus = new Array(notes.length);
+      const docTokens = new Array(notes.length);
+      for (let i = 0; i < notes.length; i++) {
+        const tokens = tokenize(notes[i].text || "");
+        corpus[i] = tokens;
+        docTokens[i] = tokens;
+      }
+      const scores = bm25Scores(corpus, queryTokens, k1, b);
+      const ranked = [];
+      for (let i = 0; i < notes.length; i++) {
+        if (scores[i] <= 0) continue;
+        ranked.push({ path: notes[i].path, score: scores[i], tokens: docTokens[i] });
+      }
+      ranked.sort((a, b2) => b2.score - a.score);
+      return ranked.slice(0, topN);
+    }
+    module2.exports = {
+      tokenize,
+      bm25Scores,
+      rankNotes,
+      K1_DEFAULT,
+      B_DEFAULT
+    };
+    if (require.main === module2) {
+      const query = process.argv.slice(2).join(" ") || "habeas corpus";
+      console.log(`[bm25 demo] query=${JSON.stringify(query)}`);
+      const notes = [
+        { path: "doc-a.md", text: "O habeas corpus \xE9 rem\xE9dio constitucional contra pris\xE3o ilegal. Garantia fundamental do art. 5\xBA." },
+        { path: "doc-b.md", text: "Mandado de seguran\xE7a protege direito l\xEDquido e certo. Distinto do habeas corpus." },
+        { path: "doc-c.md", text: "Contratos administrativos seguem regime de direito p\xFAblico \u2014 Lei 14.133/2021." },
+        { path: "doc-d.md", text: "habeas habeas habeas \u2014 repeti\xE7\xE3o satura via k1=1.5." }
+      ];
+      const ranked = rankNotes(notes, query, 10);
+      console.log(JSON.stringify(ranked.map((r) => ({ path: r.path, score: +r.score.toFixed(4) })), null, 2));
+      console.log(`[bm25 demo] tokenize("Habeas Corpus, Lei 14.133"):`, tokenize("Habeas Corpus, Lei 14.133"));
+    }
+  }
+});
+
 // lib/hybrid-search.js
 var require_hybrid_search = __commonJS({
   "lib/hybrid-search.js"(exports2, module2) {
     "use strict";
     var RRF_K = 60;
+    var SOURCE_BITS = {
+      semantic: 1 << 0,
+      path: 1 << 1,
+      graph: 1 << 2,
+      passport: 1 << 3,
+      spotlight: 1 << 4,
+      bm25: 1 << 5
+    };
+    var SOURCE_NAMES = Object.keys(SOURCE_BITS);
+    function _maskToNames(mask) {
+      const out = [];
+      for (const name of SOURCE_NAMES) {
+        if ((mask & SOURCE_BITS[name]) !== 0) out.push(name);
+      }
+      return out;
+    }
+    function _popcount(n) {
+      n = n - (n >> 1 & 1431655765);
+      n = (n & 858993459) + (n >> 2 & 858993459);
+      n = n + (n >> 4) & 252645135;
+      return n * 16843009 >>> 24;
+    }
+    var _bm25;
+    try {
+      _bm25 = require_bm25();
+    } catch (e) {
+      console.warn("[zeus.hybrid] bm25 lib n\xE3o carregou \u2014 5\xBA retriever desativado:", e.message);
+      _bm25 = null;
+    }
     var HybridSearch2 = class {
       constructor(plugin) {
         this.plugin = plugin;
@@ -2494,7 +2625,7 @@ var require_hybrid_search = __commonJS({
       // ---------------------------------------------------------------------------
       // RRF fuse — recebe array de listas ranqueadas, cada item {path, source}
       // (score por item ignorado — só posição). Devolve lista única ordenada por
-      // RRF score com `sources` agregadas.
+      // RRF score com `sources` agregadas. Internamente usa bitmask, expõe string[].
       // ---------------------------------------------------------------------------
       fuse(lists) {
         const fused = /* @__PURE__ */ new Map();
@@ -2503,26 +2634,128 @@ var require_hybrid_search = __commonJS({
           list.forEach((item, idx) => {
             if (!item || !item.path) return;
             const inc = 1 / (RRF_K + idx + 1);
-            const cur = fused.get(item.path) || { path: item.path, score: 0, sources: /* @__PURE__ */ new Set() };
+            const cur = fused.get(item.path) || { path: item.path, score: 0, sourceMask: 0 };
             cur.score += inc;
-            if (item.source) cur.sources.add(item.source);
+            if (item.source && SOURCE_BITS[item.source]) {
+              cur.sourceMask |= SOURCE_BITS[item.source];
+            }
             fused.set(item.path, cur);
           });
         }
         const out = [];
         for (const v of fused.values()) {
-          out.push({ path: v.path, score: v.score, sources: Array.from(v.sources) });
+          out.push({
+            path: v.path,
+            score: v.score,
+            sources: _maskToNames(v.sourceMask),
+            // sourceMask exposto pra MMR/diversify; consumer não-MMR ignora.
+            sourceMask: v.sourceMask
+          });
         }
         out.sort((a, b) => b.score - a.score);
         return out;
       }
       // ---------------------------------------------------------------------------
-      // sisterNotes — combina semantic + graph (frontmatter) + passport para uma
-      // nota dada. Diferente de `searcher.neighbors` puro porque inclui o sinal
-      // explícito do afm graph-extract (entidades nomeadas) e do passport (conceitos
-      // Apple NLTagger + Feynman summary). Retorna top-N RRF.
+      // diversify(items, lambda, topN) — Maximal Marginal Relevance (Carbonell &
+      // Goldstein 1998) sobre `sources` jaccard como proxy de diversidade.
+      //
+      //   MMR: argmax [ λ · score(d) - (1-λ) · max_{s ∈ selected} sim(d, s) ]
+      //
+      // sim aqui = jaccard(sourceMask) = |A ∩ B| / |A ∪ B|. Itens com fontes
+      // idênticas (ex: dois resultados puramente semânticos) penalizam um ao outro;
+      // mistura semantic+bm25+path se favorece sobre 3 semantic puros.
+      //
+      // lambda 0..1: 1 = só relevância (sem MMR), 0 = só diversidade (ignora score).
+      // Default 0.5 = balanceado.
       // ---------------------------------------------------------------------------
-      async sisterNotes(filePath, topN = 12) {
+      diversify(items, lambda = 0.5, topN = null) {
+        if (!Array.isArray(items) || items.length === 0) return [];
+        const clampLambda = Math.max(0, Math.min(1, lambda));
+        const limit = topN ? Math.min(topN, items.length) : items.length;
+        const maxScore = items.reduce((m, it) => Math.max(m, it.score || 0), 0);
+        const normScore = (s) => maxScore > 0 ? (s || 0) / maxScore : 0;
+        const candidates = items.slice();
+        const selected = [];
+        while (selected.length < limit && candidates.length > 0) {
+          let bestIdx = -1;
+          let bestVal = -Infinity;
+          for (let i = 0; i < candidates.length; i++) {
+            const c = candidates[i];
+            let maxSim = 0;
+            const cMask = c.sourceMask || 0;
+            for (const s of selected) {
+              const sMask = s.sourceMask || 0;
+              const inter = _popcount(cMask & sMask);
+              const union = _popcount(cMask | sMask);
+              const sim = union > 0 ? inter / union : 0;
+              if (sim > maxSim) maxSim = sim;
+            }
+            const val = clampLambda * normScore(c.score) - (1 - clampLambda) * maxSim;
+            if (val > bestVal) {
+              bestVal = val;
+              bestIdx = i;
+            }
+          }
+          if (bestIdx < 0) break;
+          selected.push(candidates[bestIdx]);
+          candidates.splice(bestIdx, 1);
+        }
+        return selected;
+      }
+      // ---------------------------------------------------------------------------
+      // _bm25Retriever — roda BM25 sobre as notas com embedding carregado (lazy
+      // corpus para limitar a memória; vault grande não precisa carregar TUDO).
+      //
+      // Estratégia:
+      //   - corpus = todas as notas em this.plugin.searcher.embeddings (já carregadas).
+      //   - text = title + body (lido via searcher.readDoc quando disponível;
+      //            fallback título quando readDoc indisponível ou vazio — iOS).
+      //   - cap em maxCorpus pra evitar leitura de >2k arquivos por query.
+      // ---------------------------------------------------------------------------
+      _bm25Retriever(query, topN, maxCorpus = 2e3) {
+        if (!_bm25 || !_bm25.rankNotes) return [];
+        try {
+          const searcher = this.plugin.searcher;
+          if (!searcher || !searcher.embeddings) return [];
+          const embs = searcher.embeddings;
+          const notes = [];
+          let count = 0;
+          const canReadDoc = typeof searcher.readDoc === "function";
+          for (const [p, e] of embs.entries()) {
+            if (count >= maxCorpus) break;
+            let text = "";
+            const title = e && e.title ? e.title : p.split("/").pop().replace(/\.md$/, "");
+            if (canReadDoc) {
+              try {
+                const body = searcher.readDoc(p);
+                if (body) text = title + "\n" + body.slice(0, 3e4);
+                else text = title;
+              } catch (e2) {
+                text = title;
+              }
+            } else {
+              text = title;
+            }
+            notes.push({ path: p, text });
+            count++;
+          }
+          const ranked = _bm25.rankNotes(notes, query, topN);
+          return ranked.map((r) => ({ path: r.path, source: "bm25" }));
+        } catch (e) {
+          console.warn("[zeus.hybrid] bm25 retriever failed:", e.message);
+          return [];
+        }
+      }
+      // ---------------------------------------------------------------------------
+      // sisterNotes — combina semantic + graph (frontmatter) + passport + multiplex
+      // (opcional) para uma nota dada. Diferente de `searcher.neighbors` puro porque
+      // inclui o sinal explícito do afm graph-extract (entidades nomeadas) e do
+      // passport (conceitos Apple NLTagger + Feynman summary). Retorna top-N RRF.
+      //
+      // v1.8: aceita opts.diversify (default false) — quando true aplica MMR sobre
+      // jaccard de sources com lambda=0.5 (override via opts.diversityLambda).
+      // ---------------------------------------------------------------------------
+      async sisterNotes(filePath, topN = 12, opts = {}) {
         const lists = [];
         try {
           const sem = this.plugin.searcher.neighbors(filePath, topN * 2);
@@ -2567,14 +2800,30 @@ var require_hybrid_search = __commonJS({
         } catch (e) {
           console.warn("[zeus.hybrid] passport find failed", e.message);
         }
-        return this.fuse(lists).slice(0, topN);
+        try {
+          const mg = this.plugin.multiplex;
+          if (mg && mg.edges && mg.edges.size > 0) {
+            const byDst = mg.neighborsByDst(filePath);
+            if (byDst.length > 0) {
+              lists.push(byDst.slice(0, topN * 2).map((x) => ({ path: x.dst, source: "graph" })));
+            }
+          }
+        } catch (e) {
+          console.warn("[zeus.hybrid] multiplex neighbors failed", e.message);
+        }
+        let fused = this.fuse(lists).slice(0, topN * 2);
+        if (opts.diversify) {
+          fused = this.diversify(fused, opts.diversityLambda != null ? opts.diversityLambda : 0.5, topN);
+        } else {
+          fused = fused.slice(0, topN);
+        }
+        return fused;
       }
       // ---------------------------------------------------------------------------
-      // query — busca livre estilo Cmd+P. Funde semantic + path (basename match) +
-      // passport. Bom para "busca híbrida" que pega tanto "encontrei pelo nome"
-      // quanto "encontrei pelo conceito".
+      // query — busca livre estilo Cmd+P. Funde semantic + path + passport +
+      // spotlight + bm25. v1.8 ganha 5º retriever (bm25) + opcional MMR diversify.
       // ---------------------------------------------------------------------------
-      async query(q, topN = 30) {
+      async query(q, topN = 30, opts = {}) {
         if (!q || !q.trim()) return [];
         const lists = [];
         try {
@@ -2664,10 +2913,25 @@ var require_hybrid_search = __commonJS({
         } catch (e) {
           console.warn("[zeus.hybrid] spotlight retrieval failed", e.message);
         }
-        return this.fuse(lists).slice(0, topN);
+        if (!opts.disableBm25) {
+          try {
+            const bm25Hits = this._bm25Retriever(q, topN * 2);
+            if (bm25Hits.length > 0) lists.push(bm25Hits);
+          } catch (e) {
+            console.warn("[zeus.hybrid] bm25 retrieval failed", e.message);
+          }
+        }
+        let fused = this.fuse(lists);
+        if (opts.diversify) {
+          fused = this.diversify(fused, opts.diversityLambda != null ? opts.diversityLambda : 0.5, topN);
+        } else {
+          fused = fused.slice(0, topN);
+        }
+        return fused;
       }
     };
     module2.exports = HybridSearch2;
+    module2.exports.SOURCE_BITS = SOURCE_BITS;
   }
 });
 
@@ -2800,6 +3064,337 @@ var require_native_watcher = __commonJS({
   }
 });
 
+// lib/multiplex-graph.js
+var require_multiplex_graph = __commonJS({
+  "lib/multiplex-graph.js"(exports2, module2) {
+    "use strict";
+    var universal2 = require_universal_fs();
+    var DATA_DIR_NAME2 = "data";
+    var MULTIPLEX_FILE = "multiplex.jsonl";
+    var EDGE_TYPES = [
+      "wikilink",
+      "backlink",
+      "entity_overlap",
+      "date_overlap",
+      "folder_path",
+      "semantic_cosine",
+      "spotlight_token_bm25",
+      "co_citation"
+    ];
+    var DEFAULT_WEIGHTS = {
+      wikilink: 1,
+      backlink: 1,
+      entity_overlap: 0.7,
+      date_overlap: 0.2,
+      folder_path: 0.3,
+      semantic_cosine: 0.8,
+      spotlight_token_bm25: 0.6,
+      co_citation: 0.5
+    };
+    function _cosine(a, b) {
+      if (!a || !b) return 0;
+      let dot = 0, na = 0, nb = 0;
+      const len = Math.min(a.length, b.length);
+      for (let i = 0; i < len; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+      }
+      if (na === 0 || nb === 0) return 0;
+      return dot / (Math.sqrt(na) * Math.sqrt(nb));
+    }
+    function _dayBucket(mtime) {
+      if (!mtime || typeof mtime !== "number") return null;
+      const d = new Date(mtime);
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    }
+    function _folderOf(filePath) {
+      if (!filePath) return "";
+      const idx = filePath.lastIndexOf("/");
+      return idx < 0 ? "" : filePath.slice(0, idx);
+    }
+    function _edgeKey(src, dst, type) {
+      return `${src}|${dst}|${type}`;
+    }
+    var MultiplexGraph2 = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+        this.edges = /* @__PURE__ */ new Map();
+        this._builtAt = null;
+      }
+      get _adapter() {
+        return this.plugin.app.vault.adapter;
+      }
+      get dataPath() {
+        return universal2.joinPath(this.plugin.manifest.dir, DATA_DIR_NAME2);
+      }
+      get jsonlPath() {
+        return universal2.joinPath(this.dataPath, MULTIPLEX_FILE);
+      }
+      // ---------------------------------------------------------------------------
+      // Edge primitives
+      // ---------------------------------------------------------------------------
+      addEdge(src, dst, type, why, weight) {
+        if (!src || !dst || src === dst) return;
+        if (!EDGE_TYPES.includes(type)) return;
+        const w = weight != null ? weight : DEFAULT_WEIGHTS[type];
+        const key = _edgeKey(src, dst, type);
+        const existing = this.edges.get(key);
+        if (existing) {
+          if (why) {
+            if (!Array.isArray(existing.why)) existing.why = [];
+            for (const w2 of Array.isArray(why) ? why : [why]) {
+              if (!existing.why.includes(w2)) existing.why.push(w2);
+            }
+          }
+          if (w > existing.weight) existing.weight = w;
+          return;
+        }
+        this.edges.set(key, {
+          src,
+          dst,
+          type,
+          weight: w,
+          why: Array.isArray(why) ? why.slice() : why ? [why] : []
+        });
+      }
+      // ---------------------------------------------------------------------------
+      // Build — coleta todas as 8 evidências do vault
+      // ---------------------------------------------------------------------------
+      async buildFromVault(onProgress = () => {
+      }) {
+        const t0 = Date.now();
+        this.edges.clear();
+        const app = this.plugin.app;
+        const mdc = app.metadataCache;
+        const files = (app.vault.getMarkdownFiles ? app.vault.getMarkdownFiles() : []) || [];
+        const allPaths = new Set(files.map((f) => f.path));
+        onProgress("build: edges wikilink + backlink (resolvedLinks)", 5);
+        const resolved = mdc && mdc.resolvedLinks || {};
+        const backlinkCount = /* @__PURE__ */ new Map();
+        for (const src of Object.keys(resolved)) {
+          const inner = resolved[src] || {};
+          for (const dst of Object.keys(inner)) {
+            if (!allPaths.has(dst)) continue;
+            const count = inner[dst] || 1;
+            this.addEdge(src, dst, "wikilink", `${count}\xD7 [[${dst.replace(/\.md$/, "").split("/").pop()}]] em ${src.split("/").pop()}`);
+            this.addEdge(dst, src, "backlink", `${src.split("/").pop()} \u2192 ${dst.split("/").pop()}`);
+            backlinkCount.set(dst, (backlinkCount.get(dst) || 0) + 1);
+          }
+        }
+        onProgress("build: folder_path + date_overlap", 25);
+        const byFolder = /* @__PURE__ */ new Map();
+        const byDay = /* @__PURE__ */ new Map();
+        for (const f of files) {
+          const fp = _folderOf(f.path);
+          if (fp) {
+            if (!byFolder.has(fp)) byFolder.set(fp, []);
+            byFolder.get(fp).push(f.path);
+          }
+          const day = _dayBucket(f.stat && f.stat.mtime);
+          if (day) {
+            if (!byDay.has(day)) byDay.set(day, []);
+            byDay.get(day).push(f.path);
+          }
+        }
+        for (const [folder, paths] of byFolder.entries()) {
+          const slice = paths.length > 50 ? paths.slice(0, 50) : paths;
+          for (let i = 0; i < slice.length; i++) {
+            for (let j = i + 1; j < slice.length; j++) {
+              this.addEdge(slice[i], slice[j], "folder_path", `pasta ${folder}`);
+              this.addEdge(slice[j], slice[i], "folder_path", `pasta ${folder}`);
+            }
+          }
+        }
+        for (const [day, paths] of byDay.entries()) {
+          if (paths.length > 30 || paths.length < 2) continue;
+          for (let i = 0; i < paths.length; i++) {
+            for (let j = i + 1; j < paths.length; j++) {
+              this.addEdge(paths[i], paths[j], "date_overlap", `editadas ${day}`);
+              this.addEdge(paths[j], paths[i], "date_overlap", `editadas ${day}`);
+            }
+          }
+        }
+        onProgress("build: entity_overlap (passports concepts)", 45);
+        try {
+          if (this.plugin.passport && typeof this.plugin.passport.loadAll === "function") {
+            const passportMap = await this.plugin.passport.loadAll();
+            const conceptIndex = /* @__PURE__ */ new Map();
+            for (const [path2, p] of passportMap.entries()) {
+              if (!Array.isArray(p.concepts)) continue;
+              for (const c of p.concepts) {
+                const cl = String(c).toLowerCase();
+                if (!conceptIndex.has(cl)) conceptIndex.set(cl, /* @__PURE__ */ new Set());
+                conceptIndex.get(cl).add(path2);
+              }
+            }
+            const pairOverlap = /* @__PURE__ */ new Map();
+            for (const [concept, paths] of conceptIndex.entries()) {
+              if (paths.size < 2 || paths.size > 100) continue;
+              const arr = Array.from(paths);
+              for (let i = 0; i < arr.length; i++) {
+                for (let j = i + 1; j < arr.length; j++) {
+                  const key = arr[i] < arr[j] ? `${arr[i]}|${arr[j]}` : `${arr[j]}|${arr[i]}`;
+                  if (!pairOverlap.has(key)) pairOverlap.set(key, /* @__PURE__ */ new Set());
+                  pairOverlap.get(key).add(concept);
+                }
+              }
+            }
+            for (const [key, concepts] of pairOverlap.entries()) {
+              if (concepts.size < 2) continue;
+              const [a, b] = key.split("|");
+              const sample = Array.from(concepts).slice(0, 3).join(", ");
+              this.addEdge(a, b, "entity_overlap", `${concepts.size} conceitos: ${sample}`);
+              this.addEdge(b, a, "entity_overlap", `${concepts.size} conceitos: ${sample}`);
+            }
+          }
+        } catch (e) {
+          console.warn("[zeus.multiplex] entity_overlap failed:", e.message);
+        }
+        onProgress("build: semantic_cosine (embeddings)", 65);
+        try {
+          const emb = this.plugin.searcher && this.plugin.searcher.embeddings || /* @__PURE__ */ new Map();
+          const entries = [];
+          for (const [p, e] of emb.entries()) {
+            if (e && Array.isArray(e.vec) && e.vec.length > 0) entries.push([p, e.vec]);
+          }
+          const MAX = 2e3;
+          const useEntries = entries.length > MAX ? entries.slice(0, MAX) : entries;
+          const MIN_COS = 0.5;
+          for (let i = 0; i < useEntries.length; i++) {
+            const [pa, va] = useEntries[i];
+            for (let j = i + 1; j < useEntries.length; j++) {
+              const [pb, vb] = useEntries[j];
+              const c = _cosine(va, vb);
+              if (c < MIN_COS) continue;
+              this.addEdge(pa, pb, "semantic_cosine", `cosine ${c.toFixed(3)}`);
+              this.addEdge(pb, pa, "semantic_cosine", `cosine ${c.toFixed(3)}`);
+            }
+          }
+        } catch (e) {
+          console.warn("[zeus.multiplex] semantic_cosine failed:", e.message);
+        }
+        onProgress("build: spotlight_token_bm25 (best-effort)", 80);
+        try {
+          const hasSpotlight = this.plugin.httpClient && this.plugin.vaultRoot && await this.plugin.httpClient.isAvailable();
+          if (!hasSpotlight) {
+            onProgress("spotlight_token_bm25: skip (daemon ou vaultRoot indispon\xEDveis)", 82);
+          }
+        } catch (e) {
+          console.warn("[zeus.multiplex] spotlight_token_bm25 skip:", e.message);
+        }
+        onProgress("build: co_citation (top-N backlinked)", 90);
+        try {
+          const topBacklinked = Array.from(backlinkCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 1e3).map(([p]) => p);
+          const targetSet = new Set(topBacklinked);
+          for (const src of Object.keys(resolved)) {
+            const inner = resolved[src] || {};
+            const targets = Object.keys(inner).filter((d) => targetSet.has(d));
+            if (targets.length < 2) continue;
+            const slice = targets.length > 20 ? targets.slice(0, 20) : targets;
+            const srcName = src.split("/").pop();
+            for (let i = 0; i < slice.length; i++) {
+              for (let j = i + 1; j < slice.length; j++) {
+                this.addEdge(slice[i], slice[j], "co_citation", `ambas citadas por ${srcName}`);
+                this.addEdge(slice[j], slice[i], "co_citation", `ambas citadas por ${srcName}`);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("[zeus.multiplex] co_citation failed:", e.message);
+        }
+        this._builtAt = (/* @__PURE__ */ new Date()).toISOString();
+        const elapsedMs = Date.now() - t0;
+        onProgress(`build: done ${this.edges.size} edges in ${elapsedMs}ms`, 100);
+        return { total: this.edges.size, elapsedMs, builtAt: this._builtAt };
+      }
+      // ---------------------------------------------------------------------------
+      // Persistence — JSONL: 1 edge per line
+      // ---------------------------------------------------------------------------
+      async persist() {
+        await universal2.adapterMkdir(this._adapter, this.dataPath);
+        const lines = [];
+        for (const edge of this.edges.values()) {
+          lines.push(JSON.stringify(edge));
+        }
+        await universal2.adapterWriteAtomic(this._adapter, this.jsonlPath, lines.join("\n"));
+        return { wrote: lines.length, path: this.jsonlPath };
+      }
+      async load() {
+        this.edges.clear();
+        if (!await universal2.adapterExists(this._adapter, this.jsonlPath)) {
+          return { loaded: 0, path: this.jsonlPath, exists: false };
+        }
+        const raw = await universal2.adapterRead(this._adapter, this.jsonlPath);
+        let n = 0;
+        for (const line of raw.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const e = JSON.parse(line);
+            if (!e || !e.src || !e.dst || !e.type) continue;
+            this.edges.set(_edgeKey(e.src, e.dst, e.type), e);
+            n++;
+          } catch (err) {
+          }
+        }
+        return { loaded: n, path: this.jsonlPath, exists: true };
+      }
+      // ---------------------------------------------------------------------------
+      // Query
+      // ---------------------------------------------------------------------------
+      /**
+       * neighbors(filePath, types) — devolve todas as edges out de filePath.
+       * Se `types` for array, filtra; null/undefined = todos os tipos.
+       */
+      neighbors(filePath, types = null) {
+        if (!filePath) return [];
+        const out = [];
+        const filter = Array.isArray(types) ? new Set(types) : null;
+        for (const edge of this.edges.values()) {
+          if (edge.src !== filePath) continue;
+          if (filter && !filter.has(edge.type)) continue;
+          out.push(edge);
+        }
+        return out;
+      }
+      /**
+       * neighborsByDst — agrupa neighbors por destino, somando weight e mergeando why
+       * por tipo. Útil para "qual a nota mais relacionada, somando todas as evidências?"
+       *
+       * @returns {Array<{dst, totalWeight, edges: edge[]}>}
+       */
+      neighborsByDst(filePath, types = null) {
+        const edges = this.neighbors(filePath, types);
+        const byDst = /* @__PURE__ */ new Map();
+        for (const e of edges) {
+          if (!byDst.has(e.dst)) byDst.set(e.dst, { dst: e.dst, totalWeight: 0, edges: [] });
+          const slot = byDst.get(e.dst);
+          slot.totalWeight += e.weight;
+          slot.edges.push(e);
+        }
+        const arr = Array.from(byDst.values());
+        arr.sort((a, b) => b.totalWeight - a.totalWeight);
+        return arr;
+      }
+      stats() {
+        const byType = {};
+        for (const t of EDGE_TYPES) byType[t] = 0;
+        for (const e of this.edges.values()) {
+          byType[e.type] = (byType[e.type] || 0) + 1;
+        }
+        return {
+          total: this.edges.size,
+          byType,
+          builtAt: this._builtAt
+        };
+      }
+    };
+    module2.exports = MultiplexGraph2;
+    module2.exports.EDGE_TYPES = EDGE_TYPES;
+    module2.exports.DEFAULT_WEIGHTS = DEFAULT_WEIGHTS;
+  }
+});
+
 // main.source.js
 function _zeusFindPluginDir() {
   let fs0, path0;
@@ -2913,6 +3508,7 @@ var PassportScheduler = require_passport_scheduler();
 var DaemonLifecycle = require_daemon_lifecycle();
 var HybridSearch = require_hybrid_search();
 var NativeWatcher = require_native_watcher();
+var MultiplexGraph = require_multiplex_graph();
 var VIEW_TYPE_SMART = "zeus-smart-view";
 var VIEW_TYPE_STATUS = "zeus-status-view";
 var DATA_DIR_NAME = "data";
@@ -3016,8 +3612,15 @@ var DEFAULT_SETTINGS = {
   // 'opt-in' = client envia header X-Zeus-Allow-Pcc:1; daemon decide caso a caso
   // 'auto'   = sempre permite roteamento para PCC quando on-device excede capacidade
   pccMode: "off",
-  pccVisualIndicator: true
+  pccVisualIndicator: true,
   // exibe ☁️PCC no status bar quando daemon roteou via PCC
+  // v1.8 — hybrid search MMR diversify + multiplex graph
+  hybridDiversityLambda: 0.5,
+  // λ ∈ [0,1] da MMR — 1=só relevância, 0=só diversidade
+  hybridDiversifyDefault: false,
+  // se ON, query() aplica MMR por padrão (lambda configurável acima)
+  multiplexAutoBuild: false
+  // se ON, build inicial roda no onload em background
 };
 function sha256(text) {
   if (universal.nodeCrypto && typeof universal.nodeCrypto.createHash === "function") {
@@ -4368,7 +4971,10 @@ var ZeusHybridSearchModal = class extends SuggestModal {
     this.lastQuery = q;
     const seq = ++this._querySeq;
     try {
-      const r = await this.plugin.hybrid.query(q, this.plugin.settings.maxResults || 30);
+      const r = await this.plugin.hybrid.query(q, this.plugin.settings.maxResults || 30, {
+        diversify: !!this.plugin.settings.hybridDiversifyDefault,
+        diversityLambda: this.plugin.settings.hybridDiversityLambda
+      });
       if (seq !== this._querySeq) return this.cached;
       this.cached = r;
       return r;
@@ -4419,6 +5025,46 @@ var ZeusHybridResultsModal = class extends SuggestModal {
     }
     meta.createSpan({ cls: "zeus-badge zeus-badge-sem", text: hit.score.toFixed(3) });
     el.createDiv({ cls: "zeus-result-path", text: hit.path });
+  }
+  async onChooseSuggestion(hit) {
+    const file = this.app.vault.getAbstractFileByPath(hit.path);
+    if (file instanceof TFile) await this.app.workspace.getLeaf().openFile(file);
+  }
+};
+var ZeusMultiplexNeighborsModal = class extends SuggestModal {
+  constructor(app, plugin, items, title) {
+    super(app);
+    this.plugin = plugin;
+    this.items = items;
+    this.setPlaceholder(title || "Zeus \u2014 vizinhos multiplex (com why)");
+  }
+  getSuggestions(q) {
+    if (!q) return this.items;
+    const qn = q.toLowerCase();
+    return this.items.filter((it) => (it.path || "").toLowerCase().includes(qn));
+  }
+  renderSuggestion(hit, el) {
+    el.empty();
+    el.addClass("zeus-result");
+    const head = el.createDiv({ cls: "zeus-result-head" });
+    const name = hit.path.replace(/\.md$/, "").split("/").pop();
+    head.createSpan({ cls: "zeus-result-title", text: name });
+    const meta = head.createSpan({ cls: "zeus-result-meta" });
+    for (const src of hit.sources || []) {
+      meta.createSpan({ cls: `zeus-badge zeus-badge-${src}`, text: src });
+    }
+    meta.createSpan({ cls: "zeus-badge zeus-badge-sem", text: "\u03A3w=" + (hit.score || 0).toFixed(2) });
+    el.createDiv({ cls: "zeus-result-path", text: hit.path });
+    if (Array.isArray(hit._edges)) {
+      const whyWrap = el.createDiv({ cls: "zeus-result-path" });
+      for (const edge of hit._edges) {
+        const whyText = edge.why && edge.why.length ? edge.why.slice(0, 2).join(" \xB7 ") : "";
+        const line = whyWrap.createDiv();
+        line.style.fontSize = "0.85em";
+        line.style.opacity = "0.8";
+        line.setText(`  ${edge.type} (w=${(edge.weight || 0).toFixed(2)}): ${whyText}`);
+      }
+    }
   }
   async onChooseSuggestion(hit) {
     const file = this.app.vault.getAbstractFileByPath(hit.path);
@@ -4956,6 +5602,36 @@ total PCC nesta sess\xE3o: ${s.totalUsageCount}`,
         8e3
       );
     }));
+    containerEl.createEl("h3", { text: "v1.8 \u2014 Hybrid diversify (MMR) + Multiplex graph (8 edge types)" });
+    const v18Desc = containerEl.createEl("p", { cls: "setting-item-description" });
+    v18Desc.appendText("5\xBA retriever BM25 (Okapi puro JS) j\xE1 est\xE1 ativo no hybrid-search \u2014 acha termo exato (sigla, processo, id) que a perna sem\xE2ntica perde. ");
+    v18Desc.appendText("MMR rerank opcional usa jaccard de sources como proxy de diversidade. Multiplex graph captura 8 evid\xEAncias (wikilink\xB7backlink\xB7entity\xB7date\xB7folder\xB7cosine\xB7spotlight\xB7co-citation) com `why` audit\xE1vel.");
+    new Setting(containerEl).setName("Diversify hybrid query (MMR) por padr\xE3o").setDesc("Quando ON, busca h\xEDbrida aplica MMR rerank antes de retornar \u2014 favorece resultados que v\xEAm de fontes diferentes (semantic+bm25+path vs 3 semanticos puros).").addToggle((t) => t.setValue(this.plugin.settings.hybridDiversifyDefault).onChange(async (v) => {
+      this.plugin.settings.hybridDiversifyDefault = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("MMR \u03BB (lambda) \u2014 relev\xE2ncia vs diversidade").setDesc('1.0 = s\xF3 relev\xE2ncia (sem MMR). 0.0 = s\xF3 diversidade (ignora score). Default 0.5 = balanceado. Aplica-se quando "diversify default" est\xE1 ON ou comandos passam opts.diversify.').addSlider((s) => s.setLimits(0, 1, 0.05).setValue(this.plugin.settings.hybridDiversityLambda).setDynamicTooltip().onChange(async (v) => {
+      this.plugin.settings.hybridDiversityLambda = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Auto-build multiplex no onload").setDesc('Quando ON, plugin constr\xF3i o grafo multiplex em background no startup. Default OFF \u2014 rode manualmente via comando "Zeus: construir grafo multiplex". Build pesa O(N\xB2) por entity/cosine.').addToggle((t) => t.setValue(this.plugin.settings.multiplexAutoBuild).onChange(async (v) => {
+      this.plugin.settings.multiplexAutoBuild = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Multiplex stats").setDesc('Snapshot do grafo carregado (load pregui\xE7oso \u2014 abre comando "vizinhos multiplex" para carregar).').addButton((b) => b.setButtonText("Stats").onClick(async () => {
+      try {
+        if (!this.plugin._multiplexLoaded) {
+          await this.plugin.multiplex.load();
+          this.plugin._multiplexLoaded = true;
+        }
+        const s = this.plugin.multiplex.stats();
+        const breakdown = Object.entries(s.byType).filter(([_, c]) => c > 0).map(([t, c]) => `${t}:${c}`).join(" \xB7 ");
+        new Notice(`Zeus multiplex: ${s.total} edges \xB7 ${breakdown || "(vazio)"}
+${s.builtAt ? "built " + s.builtAt : "(nunca buildado)"}`, 9e3);
+      } catch (e) {
+        new Notice("Zeus multiplex stats falhou: " + e.message, 5e3);
+      }
+    }));
     containerEl.createEl("h3", { text: "A\xE7\xF5es" });
     new Setting(containerEl).setName("Reindex completo").setDesc("Re-l\xEA o vault e recalcula embeddings. Mac only \u2014 outros devices apenas l\xEAem.").addButton((b) => b.setButtonText("Reindex").onClick(async () => {
       if (!isMac()) {
@@ -5012,6 +5688,8 @@ var ZeusPlugin = class extends Plugin {
       this.nativeGraph = new ZeusNativeGraphIntegration(this);
       this.hybrid = new HybridSearch(this);
       this.nativeWatcher = new NativeWatcher(this);
+      this.multiplex = new MultiplexGraph(this);
+      this._multiplexLoaded = false;
       const pluginDataPath = path && this.vaultRoot ? path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME) : universal.joinPath(this.manifest.dir, DATA_DIR_NAME);
       this.hierarchical = new HierarchicalProcessor(null, this.settings.hierarchicalThreshold);
       this.multiVector = new MultiVectorEmbedder(null, pluginDataPath);
@@ -5074,6 +5752,22 @@ var ZeusPlugin = class extends Plugin {
       });
       if (this.settings.schedulerEnabled) {
         this.scheduler.start();
+      }
+      if (this.settings.multiplexAutoBuild) {
+        setTimeout(async () => {
+          try {
+            console.log("[zeus.multiplex] auto-build starting\u2026");
+            await this.multiplex.buildFromVault((msg, pct) => {
+              if (pct % 25 === 0) console.log(`[zeus.multiplex] ${pct}%`, msg);
+            });
+            await this.multiplex.persist();
+            this._multiplexLoaded = true;
+            const s = this.multiplex.stats();
+            console.log("[zeus.multiplex] auto-build done:", s.total, "edges");
+          } catch (e) {
+            console.warn("[zeus.multiplex] auto-build failed:", e.message);
+          }
+        }, 5e3);
       }
       this.app.workspace.onLayoutReady(async () => {
         try {
@@ -5970,6 +6664,65 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
             n.hide();
             new Notice("Zeus graphify falhou: " + (e.message || String(e)).slice(0, 150));
           }
+        }
+      });
+      const _ensureMultiplexLoaded = async () => {
+        if (this._multiplexLoaded) return;
+        try {
+          const r = await this.multiplex.load();
+          this._multiplexLoaded = true;
+          console.log("[zeus.multiplex] loaded", r);
+        } catch (e) {
+          console.warn("[zeus.multiplex] load failed:", e.message);
+        }
+      };
+      this.addCommand({
+        id: "zeus-multiplex-build",
+        name: "Zeus: construir grafo multiplex (8 edge types)",
+        callback: async () => {
+          const n = new Notice("Zeus: construindo grafo multiplex (wikilink\xB7backlink\xB7entity\xB7date\xB7folder\xB7cosine\xB7spotlight\xB7co-citation)\u2026", 0);
+          try {
+            const r = await this.multiplex.buildFromVault((msg, pct) => {
+              n.setMessage(`Zeus multiplex (${pct}%): ${msg}`);
+            });
+            const persisted = await this.multiplex.persist();
+            this._multiplexLoaded = true;
+            n.hide();
+            const stats = this.multiplex.stats();
+            const breakdown = Object.entries(stats.byType).filter(([_, c]) => c > 0).map(([t, c]) => `${t}:${c}`).join(" \xB7 ");
+            new Notice(`Zeus multiplex: ${r.total} edges em ${r.elapsedMs}ms \xB7 ${breakdown} \xB7 persistido em ${persisted.path}`, 9e3);
+          } catch (e) {
+            n.hide();
+            new Notice("Zeus multiplex build falhou: " + (e.message || String(e)).slice(0, 200));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-multiplex-neighbors",
+        name: "Zeus: vizinhos multiplex desta nota (com why)",
+        callback: async () => {
+          const file = this.app.workspace.getActiveFile();
+          if (!file) {
+            new Notice("Zeus: sem arquivo ativo");
+            return;
+          }
+          await _ensureMultiplexLoaded();
+          if (!this.multiplex.edges || this.multiplex.edges.size === 0) {
+            new Notice('Zeus multiplex: grafo vazio \u2014 rode "Zeus: construir grafo multiplex" primeiro', 6e3);
+            return;
+          }
+          const groups = this.multiplex.neighborsByDst(file.path);
+          if (!groups.length) {
+            new Notice(`Zeus multiplex: nenhum vizinho para ${file.basename}`, 5e3);
+            return;
+          }
+          const items = groups.slice(0, 30).map((g) => ({
+            path: g.dst,
+            score: g.totalWeight,
+            sources: Array.from(new Set(g.edges.map((e) => e.type))),
+            _edges: g.edges
+          }));
+          new ZeusMultiplexNeighborsModal(this.app, this, items, `Vizinhos multiplex de ${file.basename}`).open();
         }
       });
       this._deriveSpotlightDomain = async () => {

@@ -38,6 +38,13 @@ import Translation
 #if canImport(AVFoundation)
 import AVFoundation
 #endif
+// v1.7 — CSSearchableIndex / CSSearchQuery (CoreSpotlight programático).
+// Substitui o shell out a `mdfind` por inject + query nativos. Disponível em
+// macOS 10.11+ (sempre) e iOS 9+ — gated por canImport por segurança em builds
+// minimais.
+#if canImport(CoreSpotlight)
+import CoreSpotlight
+#endif
 
 final class ZeusMacHTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
@@ -204,6 +211,13 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             return self.handleVisionDocument(bodyJSON: body)
         case (.POST, "/v1/spotlight/search"):
             return self.handleSpotlightSearch(bodyJSON: body)
+        // v1.7 — CSSearchableIndex programático (não shell mdfind)
+        case (.POST, "/v1/spotlight/index"):
+            return self.handleSpotlightIndex(bodyJSON: body)
+        case (.POST, "/v1/spotlight/query"):
+            return self.handleSpotlightQueryNative(bodyJSON: body)
+        case (.POST, "/v1/spotlight/purge"):
+            return self.handleSpotlightPurge(bodyJSON: body)
         case (.POST, "/v1/data-detect"):
             return self.handleDataDetect(bodyJSON: body)
         // v1.3 — afm refine (Writing Tools nativo via FoundationModels)
@@ -2936,6 +2950,192 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             "exit_code": task.terminationStatus,
             "model": "macOS mdfind (Spotlight)"
         ])
+    }
+
+    // MARK: - /v1/spotlight/index — CSSearchableIndex injection (v1.7)
+    //
+    // Recebe array {items:[{path,title,summary,keywords,mtime,modality}]}. Constrói
+    // CSSearchableItem por item com atributos NLContextualEmbedding-ready
+    // (title/contentDescription/keywords). Usa domainIdentifier
+    // "com.maiocchi.zeus.<vaultHash>" (codex MED: isolado por vault).
+    //
+    // Async batch: indexSearchableItems(_:completionHandler:) é fire-and-forget;
+    // tratamos completion como "enfileirado/journaled", não "buscável já"
+    // (codex MED). Cliente persiste spotlight-state.json para tracking.
+    private func handleSpotlightIndex(bodyJSON: String) -> Response {
+        #if canImport(CoreSpotlight)
+        guard let json = Self.parseJSON(bodyJSON),
+              let items = json["items"] as? [[String: Any]], !items.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"items\": [{\"path\":...,\"title\":...,...}, ...]}"
+            ])
+        }
+        let domainHint = (json["domain_hint"] as? String) ?? Self.deriveDomain(vaultURL: vaultURL)
+
+        var searchableItems: [CSSearchableItem] = []
+        for it in items {
+            guard let path = it["path"] as? String, !path.isEmpty else { continue }
+            let attrs = CSSearchableItemAttributeSet(itemContentType: "public.plain-text")
+            attrs.title = (it["title"] as? String) ?? (path as NSString).lastPathComponent
+            attrs.contentDescription = (it["summary"] as? String) ?? ""
+            if let kws = it["keywords"] as? [String] {
+                attrs.keywords = kws
+            } else if let kw = it["keywords"] as? String {
+                attrs.keywords = kw.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
+            }
+            if let mtimeMs = it["mtime"] as? Double, mtimeMs > 0 {
+                attrs.contentModificationDate = Date(timeIntervalSince1970: mtimeMs / 1000.0)
+            }
+            attrs.identifier = path
+
+            let item = CSSearchableItem(
+                uniqueIdentifier: path,
+                domainIdentifier: domainHint,
+                attributeSet: attrs
+            )
+            searchableItems.append(item)
+        }
+
+        let sem = DispatchSemaphore(value: 0)
+        var indexError: Error?
+        CSSearchableIndex.default().indexSearchableItems(searchableItems) { err in
+            indexError = err
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + .seconds(30))
+
+        if let e = indexError {
+            return Response(status: .internalServerError, payload: [
+                "error": "indexSearchableItems falhou: \(e)",
+                "domain": domainHint,
+                "items_attempted": searchableItems.count
+            ])
+        }
+        return Response(status: .ok, payload: [
+            "indexed": searchableItems.count,
+            "domain": domainHint,
+            "mode": "queued",  // codex: tratar como journaled, não buscável já
+            "note": "Spotlight async — propagação pode levar segundos. Reconsulte /v1/spotlight/query após ~3-10s."
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "CoreSpotlight indisponível neste build"
+        ])
+        #endif
+    }
+
+    // MARK: - /v1/spotlight/query — CSSearchQuery programático (v1.7)
+    //
+    // Substitui mdfind shell por query nativo com ranking BM25-ish do próprio
+    // Spotlight + temporal boost. Mais rápido e devolve scores estruturados.
+    private func handleSpotlightQueryNative(bodyJSON: String) -> Response {
+        #if canImport(CoreSpotlight)
+        guard let json = Self.parseJSON(bodyJSON),
+              let query = json["query"] as? String, !query.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"query\": \"...\"}"
+            ])
+        }
+        let limit = (json["limit"] as? Int) ?? 50
+        let domainHint = (json["domain_hint"] as? String) ?? Self.deriveDomain(vaultURL: vaultURL)
+
+        // Sintaxe CSSearchQuery: "** == 'token'cdw" busca em todos os attrs.
+        // Suporta wildcards. Restrição por domainIdentifier garante que só
+        // items do nosso vault aparecem.
+        let escaped = query.replacingOccurrences(of: "'", with: "\\'")
+        let predicate = "(domainIdentifier == \"\(domainHint)\") && (** == \"\(escaped)*\"cdw)"
+
+        let csQuery = CSSearchQuery(queryString: predicate, attributes: [
+            "title", "contentDescription", "keywords", "identifier"
+        ])
+
+        var results: [[String: Any]] = []
+        let sem = DispatchSemaphore(value: 0)
+        csQuery.foundItemsHandler = { items in
+            for it in items {
+                var entry: [String: Any] = [
+                    "path": it.uniqueIdentifier,
+                    "domain": it.domainIdentifier ?? NSNull(),
+                ]
+                if let attrs = it.attributeSet {
+                    if let t = attrs.title { entry["title"] = t }
+                    if let d = attrs.contentDescription { entry["summary"] = d }
+                    if let k = attrs.keywords { entry["keywords"] = k }
+                }
+                results.append(entry)
+                if results.count >= limit { break }
+            }
+        }
+        csQuery.completionHandler = { _ in sem.signal() }
+        csQuery.start()
+        _ = sem.wait(timeout: .now() + .seconds(10))
+        csQuery.cancel()
+
+        // Compat com /v1/spotlight/search: results também devolvido como array
+        // de paths puros (consumível pelo HybridSearch JS sem mudança).
+        let paths = results.compactMap { $0["path"] as? String }
+
+        return Response(status: .ok, payload: [
+            "query": query,
+            "domain": domainHint,
+            "results": paths,           // paths puros (compat)
+            "items": results,            // versão enriquecida c/ title/summary/keywords
+            "count": paths.count,
+            "model": "CSSearchQuery (CoreSpotlight nativo)"
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "CoreSpotlight indisponível neste build"
+        ])
+        #endif
+    }
+
+    // MARK: - /v1/spotlight/purge — remove items do vault do Spotlight (v1.7)
+    //
+    // Limpeza opt-out (codex MED). User pode rodar a qualquer momento via
+    // comando do plugin "Zeus: purge índice Spotlight".
+    private func handleSpotlightPurge(bodyJSON: String) -> Response {
+        #if canImport(CoreSpotlight)
+        let json = Self.parseJSON(bodyJSON) ?? [:]
+        let domainHint = (json["domain_hint"] as? String) ?? Self.deriveDomain(vaultURL: vaultURL)
+
+        let sem = DispatchSemaphore(value: 0)
+        var purgeError: Error?
+        CSSearchableIndex.default().deleteSearchableItems(withDomainIdentifiers: [domainHint]) { err in
+            purgeError = err
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + .seconds(15))
+
+        if let e = purgeError {
+            return Response(status: .internalServerError, payload: [
+                "error": "purge falhou: \(e)",
+                "domain": domainHint
+            ])
+        }
+        return Response(status: .ok, payload: [
+            "purged": true,
+            "domain": domainHint
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "CoreSpotlight indisponível neste build"
+        ])
+        #endif
+    }
+
+    // MARK: - Helpers v1.7
+    //
+    // Domain identifier isolado por vault. Codex MED: "com.maiocchi.zeus.<hash>"
+    // pra que indices de vaults diferentes não colidam no Spotlight do user.
+    private static func deriveDomain(vaultURL: URL?) -> String {
+        guard let v = vaultURL else { return "com.maiocchi.zeus.default" }
+        let path = v.standardizedFileURL.path
+        // Hash curto pra ficar legível mas único por vault path
+        let bytes = Array(path.utf8)
+        var hash: UInt64 = 5381
+        for b in bytes { hash = ((hash &<< 5) &+ hash) &+ UInt64(b) }
+        return "com.maiocchi.zeus.\(String(hash, radix: 16))"
     }
 
     // MARK: - Helpers

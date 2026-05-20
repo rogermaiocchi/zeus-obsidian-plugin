@@ -3649,6 +3649,102 @@ class ZeusPlugin extends Plugin {
         }
       },
     });
+    // v1.7 — Spotlight CSSearchableIndex integration
+    this.addCommand({
+      id: 'zeus-spotlight-index',
+      name: 'Zeus: indexar vault no Spotlight (CSSearchableIndex)',
+      callback: async () => {
+        try {
+          if (!isMac()) { new Notice('Zeus Spotlight: apenas macOS'); return; }
+          const n = new Notice('Zeus: montando lote de items para CSSearchableIndex…', 0);
+          const files = this.app.vault.getMarkdownFiles();
+          // Carrega passports em memória (1x) para enriquecer items.
+          const passportMap = (this.passport && typeof this.passport.loadAll === 'function')
+            ? await this.passport.loadAll().catch(() => new Map())
+            : new Map();
+          const items = [];
+          for (const f of files) {
+            const passport = passportMap.get(f.path) || null;
+            const mtime = f.stat ? f.stat.mtime : Date.now();
+            items.push({
+              path: this.vaultRoot ? `${this.vaultRoot.replace(/\/$/, '')}/${f.path}` : f.path,
+              title: f.basename,
+              summary: (passport && (passport.one_line_summary || passport.summary)) || '',
+              keywords: (passport && Array.isArray(passport.concepts)) ? passport.concepts.slice(0, 12) : [],
+              mtime,
+              modality: 'md',
+            });
+          }
+          n.setMessage(`Zeus: enviando ${items.length} items para CSSearchableIndex…`);
+          const r = await this.httpClient.spotlightIndex(items);
+          n.hide();
+          if (r.indexed != null) {
+            new Notice(`Zeus Spotlight: ${r.indexed} items indexados · domain ${r.domain}`, 7000);
+            try {
+              const adapter = this.app.vault.adapter;
+              const stateRel = universal.joinPath(this.manifest.dir, 'data', 'spotlight-state.json');
+              await universal.adapterMkdir(adapter, universal.joinPath(this.manifest.dir, 'data'));
+              await universal.adapterWriteAtomic(adapter, stateRel, JSON.stringify({
+                last_indexed_at: new Date().toISOString(),
+                count: r.indexed,
+                domain: r.domain,
+                mode: r.mode || 'queued',
+              }, null, 2));
+            } catch (e) { console.warn('[zeus] spotlight-state persist failed', e.message); }
+          } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
+            new Notice('Zeus Spotlight: daemon bundled v1.0 não suporta /v1/spotlight/index. Rebuild via `node scripts/build-release.mjs` para ativar.', 9000);
+          } else {
+            new Notice('Zeus Spotlight: ' + (r.error || JSON.stringify(r).slice(0, 200)), 8000);
+          }
+        } catch (e) {
+          new Notice('Zeus Spotlight index falhou: ' + (e.message || String(e)).slice(0, 200), 8000);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-spotlight-purge',
+      name: 'Zeus: purge índice Spotlight do vault',
+      callback: async () => {
+        try {
+          if (!isMac()) { new Notice('Zeus Spotlight: apenas macOS'); return; }
+          const r = await this.httpClient.spotlightPurge();
+          if (r.purged) {
+            new Notice(`Zeus Spotlight purged · domain ${r.domain}`, 5000);
+          } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
+            new Notice('Zeus Spotlight purge: daemon bundled v1.0 não suporta. Rebuild necessário.', 7000);
+          } else {
+            new Notice('Zeus Spotlight purge: ' + (r.error || 'erro'), 6000);
+          }
+        } catch (e) {
+          new Notice('Zeus Spotlight purge falhou: ' + (e.message || String(e)).slice(0, 200), 7000);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-base-regenerate-rich',
+      name: 'Zeus: regenerar .base enriquecido (v1.7 schema)',
+      callback: async () => {
+        try {
+          const n = new Notice('Zeus: regenerando data/zeus-cards.base…', 0);
+          const r = await this.basesGen.regenerate();
+          n.hide();
+          if (r.written) {
+            const s = r.stats || {};
+            new Notice(
+              `Zeus .base: ${r.count} passports · summary=${s.withSummary || 0} · concepts=${s.withConcepts || 0} · domains=${(s.domainList || []).length}`,
+              6000,
+            );
+          } else {
+            new Notice('Zeus .base: data/passports.jsonl ausente — rode reindex primeiro', 6000);
+          }
+        } catch (e) {
+          new Notice('Zeus base regen falhou: ' + (e.message || String(e)).slice(0, 200), 7000);
+        }
+      },
+    });
+
     this.addCommand({
       id: 'zeus-native-watcher-status',
       name: 'Zeus: status do native-watcher (FSEvents iCloud)',

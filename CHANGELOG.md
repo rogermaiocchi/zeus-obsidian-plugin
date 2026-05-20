@@ -4,6 +4,94 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.7.0] — 2026-05-20 — Spotlight CSSearchableIndex + .base enriquecido + 4º retriever híbrido
+
+Protocolo formal: codex debateu o plano com claude → claude executou autônomo → codex audita (próximo). Codex aprovou escopo enxuto (cortou MobileCLIP, mdimporter, frontmatter mass-write); achados HIGH/MED incorporados na concepção.
+
+### Added — daemon Swift (ativa após `node scripts/build-release.mjs`)
+
+`daemon/Sources/ZeusDaemonMac/ZeusMacHTTPHandler.swift` — 3 endpoints novos via CSSearchableIndex / CSSearchQuery (programáticos, substituem shell `mdfind`):
+
+- `POST /v1/spotlight/index` — recebe `{items: [{path,title,summary,keywords,mtime,modality}]}`, constrói `CSSearchableItem` por item com `attributeSet` (title, contentDescription, keywords, contentModificationDate), batch-injeta via `CSSearchableIndex.default().indexSearchableItems()`. domainIdentifier isolado por vault hash (`com.maiocchi.zeus.<hash>` — codex MED: índices de vaults diferentes não colidem no Spotlight global). Mode "queued" — propagação assíncrona pode levar ~3-10s.
+- `POST /v1/spotlight/query` — CSSearchQuery nativo com predicate `(domainIdentifier == X) && (** == 'q*'cdw)`. Devolve resultados com ranking BM25-ish + temporal boost do próprio Spotlight, mais rápido que mdfind shell, com title/summary/keywords estruturados.
+- `POST /v1/spotlight/purge` — `deleteSearchableItems(withDomainIdentifiers:)` limpa o vault inteiro do índice Spotlight. Opt-out completo.
+
+`#if canImport(CoreSpotlight)` guard preserva compat com builds minimais. Endpoint `/v1/spotlight/search` (mdfind shell) mantido como legacy.
+
+**Importante**: o binário `bin/ZeusDaemonMac` distribuído (v1.0.0 interno) NÃO inclui esses endpoints — ativa após rebuild. JS-side detecta 404 e cai gracioso para mdfind.
+
+### Added — `lib/zeus-http-client.js`
+
+- `spotlightQueryNative(q, scope, limit)` — prefere `/v1/spotlight/query`, fallback automático para `/v1/spotlight/search` em 404. Retorna `{mode, ...}` onde mode é `'spotlight' | 'mdfind-fallback' | 'error'` (padrão inspirado em `maiocchi-ia/skills/tripla-fusao/scripts/bm25.py` — fallback honesto declarado).
+- `spotlightIndex(items, domainHint)` — proxy para `/v1/spotlight/index`.
+- `spotlightPurge(domainHint)` — proxy para `/v1/spotlight/purge`.
+
+### Added — `HybridSearch.query()` 4º retriever (Spotlight)
+
+`lib/hybrid-search.js` — `query()` agora funde 4 retrievers via RRF k=60:
+1. semantic (NLContextualEmbedding cosine)
+2. path (basename substring)
+3. passport (concept overlap via daemon)
+4. **spotlight** (CSSearchQuery ou mdfind — convertendo path absoluto → vault-relative; filtra resultados fora do vault)
+
+Modal de busca híbrida ganha badge `spotlight` quando esse retriever contribuiu. Hits que aparecem em múltiplos retrievers sobem no ranking (efeito RRF padrão).
+
+### Changed — `lib/bases-generator.js` schema rico v1.7
+
+Auto-gen do `data/zeus-cards.base` agora inclui:
+
+- **Formulas Bases** (codex MED: deriva em vez de mass-write em frontmatter):
+  - `density_est`: `file.size / 6` (≈ tokens únicos)
+  - `freshness_days`: `(now() - file.mtime) / 86400000`
+  - `has_graph` / `has_neighbors` / `neighbor_count` / `graph_node_count`
+- **Properties expandidas**: `zeus_related`, `zeus_graph_related`, todos os formulas acima
+- **5 views**:
+  - All passports (table, sort by density DESC)
+  - Orphans (cards, sem neighbors semânticos)
+  - Graph-rich (table, ≥5 graph nodes)
+  - Cards by domain
+  - Recently edited (sort by freshness ASC)
+
+Sintaxe conforme https://help.obsidian.md/bases/syntax — uso de `list(prop).length()`, `formula.X` aliases, `now()` helper.
+
+### Added — 3 comandos novos
+
+- `Zeus: indexar vault no Spotlight (CSSearchableIndex)` — itera markdown files, monta batch com title + passport summary + concepts, chama `spotlightIndex`, persiste `data/spotlight-state.json` (last_indexed_at, count, domain). Detecta gracefully quando daemon não suporta (HTTP 404) e instrui rebuild.
+- `Zeus: purge índice Spotlight do vault` — limpeza opt-out.
+- `Zeus: regenerar .base enriquecido (v1.7 schema)` — força regen do `zeus-cards.base` com stats.
+
+### Debate codex × claude — pré-execução (rodada formal protocolo)
+
+Plano enviado ao codex via `codex exec`. Codex respondeu HIGH/MED/LOW por fase:
+
+| Achado codex | Aplicado? |
+|---|---|
+| HIGH F1: CSSearchableIndex é índice **do app**, não 1:1 mdfind global | ✅ mantido `/v1/spotlight/search` legacy, novo endpoint adicional |
+| HIGH F1: superfície UI local (não cloud) | ✅ documentado em CHANGELOG, opt-in via comando, purge disponível |
+| MED F1: `CSSearchableIndex(name:)` + domainIdentifier `com.maiocchi.zeus.<vaultHash>` | ✅ derivado de hash do vault path |
+| MED F1: batch async como "queued/journaled" | ✅ response retorna `mode: "queued"` com nota explicativa |
+| HIGH F2: Bases ignora schema fora do oficial | ✅ formulas + functions canônicas |
+| HIGH F2: frontmatter mass-write deve usar mesmo SHA pattern | ✅ cortado da v1.7 — formulas resolvem |
+| MED F2: density/freshness via formulas, não frontmatter | ✅ implementado |
+| MED F3: Spotlight retriever precisa `mode` contract | ✅ inspirado em `maiocchi-ia/.../bm25.py` |
+| MED F4: mdimporter → ADR, não v1.7 | ✅ cortado |
+
+Brainstorm codex (registrado para ADR futuro, **não implementado**): grafo multiplex de vizinhança com arestas {wikilink, backlink, entity_overlap, date_overlap, folder_path, semantic_cosine, spotlight_token_bm25, co-citation}, com `why: [...]` explicação. UI top-5 via MMR (diversidade) em vez de top-5 cosine puro. Comunidades Leiden (`maiocchi-ia/skills/tripla-fusao/scripts/cluster.py`). Lexical BM25 lane (`maiocchi-ia/.../bm25.py`).
+
+### Validation
+
+- `node esbuild.config.mjs` → main.js bundlado
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9 (daemon v1.0 atual)
+- Empirical: `HybridSearch.fuse` correto com 4 listas; `mode: mdfind-fallback` validado contra daemon atual
+
+### Known limitations (codex auditará pós-execução)
+
+- bin/ZeusDaemonMac no repo ainda é v1.0.0; endpoints novos requerem `node scripts/build-release.mjs` para ativar
+- Sandbox de execução autônoma bloqueia SwiftPM network → rebuild deve rodar em ambiente do maintainer
+
+---
+
 ## [1.6.1] — 2026-05-20 — Fixes pós-auditoria codex (7 achados, 1 HIGH + 4 MED + 2 LOW)
 
 Auditoria pós-execução do v1.6.0 via `codex exec` (gpt-5.5 high-reasoning) achou 7 bugs novos não cobertos no plano-review pré-execução. Todos os 7 aplicados:

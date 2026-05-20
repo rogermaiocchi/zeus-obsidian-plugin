@@ -1213,6 +1213,33 @@ var require_zeus_http_client = __commonJS({
       async spotlightSearch(query, scope = null, limit = 50) {
         return await this._post("/v1/spotlight/search", { query, scope, limit }, 15e3);
       }
+      // v1.7 — Spotlight via CSSearchableIndex programático (requer daemon ≥ v1.7,
+      // ativa após `node scripts/build-release.mjs`). Cliente prefere este endpoint
+      // mas faz fallback gracioso para `/v1/spotlight/search` (mdfind shell) quando
+      // o daemon bundled ainda for v1.0.0 (HTTP 404).
+      //
+      // mode: 'spotlight' | 'stale' | 'unindexed' | 'mdfind-fallback' | 'error'
+      // (padrão inspirado em maiocchi-ia/skills/tripla-fusao/scripts/bm25.py
+      //  — fallback honesto declarado em vez de scores silenciosos vazios)
+      async spotlightQueryNative(query, scope = null, limit = 50) {
+        try {
+          const r = await this._post("/v1/spotlight/query", { query, scope, limit }, 15e3);
+          return { ...r, mode: "spotlight" };
+        } catch (e) {
+          try {
+            const r = await this.spotlightSearch(query, scope, limit);
+            return { ...r, mode: "mdfind-fallback", native_error: e.message.slice(0, 200) };
+          } catch (e2) {
+            return { mode: "error", error: e2.message, native_error: e.message, results: [] };
+          }
+        }
+      }
+      async spotlightIndex(items, domainHint = null) {
+        return await this._post("/v1/spotlight/index", { items, domain_hint: domainHint }, 6e4);
+      }
+      async spotlightPurge(domainHint = null) {
+        return await this._post("/v1/spotlight/purge", { domain_hint: domainHint }, 15e3);
+      }
       // ----- v0.9 new methods — Passport Index Architecture (PIA) -----
       // MCP-first surface for agent consumption with progressive disclosure.
       /**
@@ -1793,20 +1820,9 @@ var require_bases_generator = __commonJS({
       get jsonlPath() {
         return universal2.joinPath(this.dataPath, PASSPORTS_FILE);
       }
-      /**
-       * Regenerate zeus-cards.base from the canonical passports.jsonl in the data dir.
-       * Convenience wrapper used by plugin onload + commands.
-       */
       async regenerate() {
         return await this.generateBase(this.jsonlPath, this.basePath);
       }
-      /**
-       * Convert passports.jsonl into a YAML .base file.
-       *
-       * @param {string} jsonlPath
-       * @param {string} outputPath
-       * @returns {{written: boolean, count: number, path: string}}
-       */
       async generateBase(jsonlPath, outputPath) {
         if (!await universal2.adapterExists(this._adapter, jsonlPath)) {
           console.warn("[zeus][bases] passports.jsonl missing \u2014 skipping .base regen");
@@ -1815,42 +1831,82 @@ var require_bases_generator = __commonJS({
         const raw = await universal2.adapterRead(this._adapter, jsonlPath);
         const lines = raw.split("\n").filter((l) => l.trim());
         let count = 0;
+        let withSummary = 0;
+        let withConcepts = 0;
+        let withDomain = 0;
+        const domains = /* @__PURE__ */ new Set();
         for (const ln of lines) {
           try {
             const obj = JSON.parse(ln);
-            if (obj && obj.path) count++;
+            if (!obj || !obj.path) continue;
+            count++;
+            if (obj.one_line_summary || obj.summary) withSummary++;
+            if (Array.isArray(obj.concepts) && obj.concepts.length) withConcepts++;
+            if (obj.domain) {
+              withDomain++;
+              if (Array.isArray(obj.domain)) for (const d of obj.domain) domains.add(d);
+              else domains.add(String(obj.domain));
+            }
           } catch (e) {
           }
         }
         const generatedAt = (/* @__PURE__ */ new Date()).toISOString();
-        const yaml = this._renderYaml(count, generatedAt);
+        const stats = { count, withSummary, withConcepts, withDomain, domainList: [...domains].sort() };
+        const yaml = this._renderYaml(stats, generatedAt);
         await universal2.adapterWriteAtomic(this._adapter, outputPath, yaml);
-        return { written: true, count, path: outputPath };
+        return { written: true, count, stats, path: outputPath };
       }
-      _renderYaml(count, generatedAt) {
+      _renderYaml(stats, generatedAt) {
         return [
-          "# zeus-cards.base \u2014 auto-generated from passports.jsonl",
+          "# zeus-cards.base \u2014 auto-generated v1.7 (rich schema, formulas)",
           "# DO NOT EDIT MANUALLY \u2014 regenerated on each passport rebuild.",
           `# generated_at: ${generatedAt}`,
-          `# passport_count: ${count}`,
+          `# stats: ${stats.count} passports \xB7 summary=${stats.withSummary} \xB7 concepts=${stats.withConcepts} \xB7 domain=${stats.withDomain}`,
+          `# domains: ${stats.domainList.slice(0, 10).join(", ")}${stats.domainList.length > 10 ? " \u2026" : ""}`,
           "#",
-          "# Bases is a UI DERIVATIVE. Canonical source: data/passports.jsonl.",
+          "# Can\xF4nico: data/passports.jsonl. Bases \xE9 UI derivativa.",
           "",
           "filters:",
           "  and:",
           '    - file.ext == "md"',
           "",
+          "formulas:",
+          "  density_est:",
+          "    formula: file.size / 6",
+          "  freshness_days:",
+          "    formula: (now() - file.mtime) / 86400000",
+          "  has_graph:",
+          "    formula: list(zeus_graph_related).length() > 0",
+          "  has_neighbors:",
+          "    formula: list(zeus_related).length() > 0",
+          "  neighbor_count:",
+          "    formula: list(zeus_related).length()",
+          "  graph_node_count:",
+          "    formula: list(zeus_graph_related).length()",
+          "",
           "properties:",
           "  file.path:",
           "    displayName: Note",
-          "  zeus_concepts:",
-          "    displayName: Atomic concepts",
           "  zeus_summary:",
           "    displayName: Summary",
+          "  zeus_concepts:",
+          "    displayName: Concepts",
           "  zeus_domain:",
           "    displayName: Domain",
           "  zeus_difficulty:",
           "    displayName: Difficulty",
+          "  zeus_related:",
+          "    displayName: Semantic neighbors",
+          "  zeus_graph_related:",
+          "    displayName: Graph entities",
+          "  formula.density_est:",
+          "    displayName: Density ~tokens",
+          "  formula.freshness_days:",
+          "    displayName: Days since edit",
+          "  formula.neighbor_count:",
+          "    displayName: # neighbors",
+          "  formula.graph_node_count:",
+          "    displayName: # graph nodes",
           "",
           "views:",
           "  - type: table",
@@ -1858,12 +1914,42 @@ var require_bases_generator = __commonJS({
           "    order:",
           "      - file.path",
           "      - zeus_summary",
-          "      - zeus_concepts",
           "      - zeus_domain",
           "      - zeus_difficulty",
+          "      - formula.neighbor_count",
+          "      - formula.graph_node_count",
+          "      - formula.density_est",
+          "      - formula.freshness_days",
           "    sort:",
-          "      - property: file.path",
-          "        direction: ASC",
+          "      - property: formula.density_est",
+          "        direction: DESC",
+          "",
+          "  - type: cards",
+          "    name: Orphans (no semantic neighbors)",
+          "    filters:",
+          "      and:",
+          '        - file.ext == "md"',
+          "        - formula.has_neighbors == false",
+          "    order:",
+          "      - file.path",
+          "      - zeus_summary",
+          "      - formula.density_est",
+          "",
+          "  - type: table",
+          "    name: Graph-rich (\u22655 entities)",
+          "    filters:",
+          "      and:",
+          '        - file.ext == "md"',
+          "        - formula.graph_node_count >= 5",
+          "    order:",
+          "      - file.path",
+          "      - zeus_summary",
+          "      - formula.graph_node_count",
+          "      - formula.neighbor_count",
+          "    sort:",
+          "      - property: formula.graph_node_count",
+          "        direction: DESC",
+          "",
           "  - type: cards",
           "    name: Cards by domain",
           "    order:",
@@ -1871,6 +1957,16 @@ var require_bases_generator = __commonJS({
           "      - zeus_concepts",
           "      - zeus_difficulty",
           "    groupBy: zeus_domain",
+          "",
+          "  - type: table",
+          "    name: Recently edited",
+          "    order:",
+          "      - file.path",
+          "      - zeus_summary",
+          "      - formula.freshness_days",
+          "    sort:",
+          "      - property: formula.freshness_days",
+          "        direction: ASC",
           ""
         ].join("\n");
       }
@@ -2513,6 +2609,30 @@ var require_hybrid_search = __commonJS({
           }
         } catch (e) {
           console.warn("[zeus.hybrid] passport find failed", e.message);
+        }
+        try {
+          if (this.plugin.httpClient && this.plugin.vaultRoot) {
+            const r = await this.plugin.httpClient.spotlightQueryNative(
+              q,
+              this.plugin.vaultRoot,
+              topN * 2
+            );
+            this._lastSpotlightMode = r.mode;
+            const root = this.plugin.vaultRoot.endsWith("/") ? this.plugin.vaultRoot : this.plugin.vaultRoot + "/";
+            const list = [];
+            for (const raw of r.results || []) {
+              if (typeof raw !== "string") continue;
+              let rel = raw;
+              if (raw.startsWith(root)) rel = raw.slice(root.length);
+              if (rel.startsWith("/")) continue;
+              if (!rel.endsWith(".md")) continue;
+              list.push({ path: rel, source: "spotlight" });
+              if (list.length >= topN * 2) break;
+            }
+            if (list.length > 0) lists.push(list);
+          }
+        } catch (e) {
+          console.warn("[zeus.hybrid] spotlight retrieval failed", e.message);
         }
         return this.fuse(lists).slice(0, topN);
       }
@@ -5814,6 +5934,103 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
           } catch (e) {
             n.hide();
             new Notice("Zeus graphify falhou: " + (e.message || String(e)).slice(0, 150));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-spotlight-index",
+        name: "Zeus: indexar vault no Spotlight (CSSearchableIndex)",
+        callback: async () => {
+          try {
+            if (!isMac()) {
+              new Notice("Zeus Spotlight: apenas macOS");
+              return;
+            }
+            const n = new Notice("Zeus: montando lote de items para CSSearchableIndex\u2026", 0);
+            const files = this.app.vault.getMarkdownFiles();
+            const passportMap = this.passport && typeof this.passport.loadAll === "function" ? await this.passport.loadAll().catch(() => /* @__PURE__ */ new Map()) : /* @__PURE__ */ new Map();
+            const items = [];
+            for (const f of files) {
+              const passport = passportMap.get(f.path) || null;
+              const mtime = f.stat ? f.stat.mtime : Date.now();
+              items.push({
+                path: this.vaultRoot ? `${this.vaultRoot.replace(/\/$/, "")}/${f.path}` : f.path,
+                title: f.basename,
+                summary: passport && (passport.one_line_summary || passport.summary) || "",
+                keywords: passport && Array.isArray(passport.concepts) ? passport.concepts.slice(0, 12) : [],
+                mtime,
+                modality: "md"
+              });
+            }
+            n.setMessage(`Zeus: enviando ${items.length} items para CSSearchableIndex\u2026`);
+            const r = await this.httpClient.spotlightIndex(items);
+            n.hide();
+            if (r.indexed != null) {
+              new Notice(`Zeus Spotlight: ${r.indexed} items indexados \xB7 domain ${r.domain}`, 7e3);
+              try {
+                const adapter = this.app.vault.adapter;
+                const stateRel = universal.joinPath(this.manifest.dir, "data", "spotlight-state.json");
+                await universal.adapterMkdir(adapter, universal.joinPath(this.manifest.dir, "data"));
+                await universal.adapterWriteAtomic(adapter, stateRel, JSON.stringify({
+                  last_indexed_at: (/* @__PURE__ */ new Date()).toISOString(),
+                  count: r.indexed,
+                  domain: r.domain,
+                  mode: r.mode || "queued"
+                }, null, 2));
+              } catch (e) {
+                console.warn("[zeus] spotlight-state persist failed", e.message);
+              }
+            } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
+              new Notice("Zeus Spotlight: daemon bundled v1.0 n\xE3o suporta /v1/spotlight/index. Rebuild via `node scripts/build-release.mjs` para ativar.", 9e3);
+            } else {
+              new Notice("Zeus Spotlight: " + (r.error || JSON.stringify(r).slice(0, 200)), 8e3);
+            }
+          } catch (e) {
+            new Notice("Zeus Spotlight index falhou: " + (e.message || String(e)).slice(0, 200), 8e3);
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-spotlight-purge",
+        name: "Zeus: purge \xEDndice Spotlight do vault",
+        callback: async () => {
+          try {
+            if (!isMac()) {
+              new Notice("Zeus Spotlight: apenas macOS");
+              return;
+            }
+            const r = await this.httpClient.spotlightPurge();
+            if (r.purged) {
+              new Notice(`Zeus Spotlight purged \xB7 domain ${r.domain}`, 5e3);
+            } else if (r.error && /CoreSpotlight indisponível|HTTP 404/.test(String(r.error))) {
+              new Notice("Zeus Spotlight purge: daemon bundled v1.0 n\xE3o suporta. Rebuild necess\xE1rio.", 7e3);
+            } else {
+              new Notice("Zeus Spotlight purge: " + (r.error || "erro"), 6e3);
+            }
+          } catch (e) {
+            new Notice("Zeus Spotlight purge falhou: " + (e.message || String(e)).slice(0, 200), 7e3);
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-base-regenerate-rich",
+        name: "Zeus: regenerar .base enriquecido (v1.7 schema)",
+        callback: async () => {
+          try {
+            const n = new Notice("Zeus: regenerando data/zeus-cards.base\u2026", 0);
+            const r = await this.basesGen.regenerate();
+            n.hide();
+            if (r.written) {
+              const s = r.stats || {};
+              new Notice(
+                `Zeus .base: ${r.count} passports \xB7 summary=${s.withSummary || 0} \xB7 concepts=${s.withConcepts || 0} \xB7 domains=${(s.domainList || []).length}`,
+                6e3
+              );
+            } else {
+              new Notice("Zeus .base: data/passports.jsonl ausente \u2014 rode reindex primeiro", 6e3);
+            }
+          } catch (e) {
+            new Notice("Zeus base regen falhou: " + (e.message || String(e)).slice(0, 200), 7e3);
           }
         }
       });

@@ -21,3 +21,6 @@ node_modules/
 # Backups locais (nao versionar)
 *.bak
 main.js.backup-*
+
+# Estado interno de harness/agent (Claude Code, etc) — nao versionar
+.claude/

@@ -186,6 +186,8 @@ const NativeWatcher = require('./lib/native-watcher');                   // v1.6
 const MultiplexGraph = require('./lib/multiplex-graph');                 // v1.8: 8-edge-type multiplex graph (wikilink/backlink/entity/date/folder/cosine/spotlight/co-citation)
 const AutoIndexer = require('./lib/auto-indexer');                        // v1.10: orquestra rebuilds de TODAS as camadas via vault.on() automático
 const LeidenCommunities = require('./lib/leiden');                       // v1.9: community detection enxuto (local move + connectivity split + agregação) sobre multiplex
+const IoQueue = require('./lib/io-queue');                               // v1.11: fila iCloud-mediada para Mac consumir tarefas geradas em iOS (Feature H)
+const LexicalIosIndex = require('./lib/lexical-ios');                    // v1.11: BM25 persistido com stems pt-BR para iOS sem daemon (Feature I)
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -279,6 +281,11 @@ const DEFAULT_SETTINGS = {
   // nomes próprios) onde cosine sozinho falha.
   hybridBm25Enabled: true,
   multiplexAutoBuild: false,                // se ON, build inicial roda no onload em background
+  // v1.11 Feature I — lexical-ios (BM25 persistido com stems pt-BR). Default OFF
+  // porque vault grande pode levar 8-12s no iPad. Comando manual "Zeus: rebuild
+  // lexical-ios index" disponível pra trigger inicial. Incrementals rodam
+  // automaticamente via AutoIndexer ~30s após cada modify.
+  lexicalIosAutoBuild: false,
   // v1.10 — AutoIndexer: indexação automática nativa Apple (FSEvents Mac /
   // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
   // multiplex/leiden) com debounce + cooldown.
@@ -2900,19 +2907,32 @@ class ZeusPlugin extends Plugin {
     this.passport = new PassportIndex(this);
     this.basesGen = new BasesGenerator(this);
 
-    // v1.10 — AutoIndexer: orquestra TODAS as camadas via vault.on() automático.
-    // Engenharia Apple nativa: vault.on é wrapper Obsidian sobre FSEvents (Mac)
-    // / vault.adapter (iOS Capacitor). Sem polling, sem cron — só FS events.
-    // Debounces individuais + cooldown longo no multiplex (60s, N≥10 mods).
-    this.autoIndexer = new AutoIndexer(this);
-    if (this.settings.autoIndexEnabled !== false) {
-      try {
-        const ai = this.autoIndexer.start();
-        console.log('[zeus] auto-indexer:', ai);
-      } catch (e) {
-        console.warn('[zeus] auto-indexer start failed:', e.message);
-      }
+    // v1.11 Feature H — IoQueue: fila iCloud-mediada para Mac consumir tarefas
+    // geradas em iOS sem daemon. Precisa estar disponível ANTES do AutoIndexer
+    // (que enfileira quando passport.buildOne falha em iOS).
+    this.ioQueue = new IoQueue(this);
+
+    // v1.11 Feature I — LexicalIosIndex (BM25 persistido com stems pt-BR).
+    // Build full é opt-in via settings.lexicalIosAutoBuild OU comando manual.
+    // Incrementals rodam via AutoIndexer ~30s após modify.
+    this.lexicalIos = new LexicalIosIndex(this);
+    if (this.settings.lexicalIosAutoBuild) {
+      setTimeout(async () => {
+        try {
+          console.log('[zeus.lexical-ios] auto-build starting…');
+          const r = await this.lexicalIos.build((msg, pct) => {
+            if (pct % 25 === 0) console.log(`[zeus.lexical-ios] ${pct}%`, msg);
+          });
+          console.log('[zeus.lexical-ios] auto-build done:', r);
+        } catch (e) {
+          console.warn('[zeus.lexical-ios] auto-build failed:', e.message);
+        }
+      }, 8000);
     }
+
+    // v1.11.1 — codex HIGH #1: AutoIndexer movido para DEPOIS do coordinator setup.
+    // Antes, AutoIndexer.start() rodava sem coordinator.deviceId disponível —
+    // ioQueue.enqueue iOS detection (`/ios|ipad/i.test(deviceId)`) falhava silente.
 
     // v0.10.0 — Cross-device coordination (claim/release via iCloud-synced locks)
     this.coordinator = new DistributedCoordinator(this, {
@@ -2942,6 +2962,17 @@ class ZeusPlugin extends Plugin {
     // settings.deviceId fica em memória apenas — overrides do coordinator com o per-device.
     this.settings.deviceId = _localDeviceId;
     this.coordinator.deviceId = _localDeviceId;
+
+    // v1.11.1 — AutoIndexer (movido para cá após coordinator pronto, codex HIGH #1).
+    this.autoIndexer = new AutoIndexer(this);
+    if (this.settings.autoIndexEnabled !== false) {
+      try {
+        const ai = this.autoIndexer.start();
+        console.log('[zeus] auto-indexer:', ai);
+      } catch (e) {
+        console.warn('[zeus] auto-indexer start failed:', e.message);
+      }
+    }
     // IMPORTANTE: nunca persistir deviceId no data.json. Se já estiver lá (legado), limpar.
     if (_localDeviceId) {
       // Forçar deviceId vazio no que será salvo via loadData/saveSettings
@@ -2953,6 +2984,52 @@ class ZeusPlugin extends Plugin {
     });
     if (this.settings.schedulerEnabled) {
       this.scheduler.start();
+    }
+
+    // v1.11 Feature H — Mac-side ioQueue consumer: periodicamente (15min)
+    // verifica se há tasks deixadas por iOS via iCloud e processa via daemon.
+    // Boot consume após 20s (deixa daemon estabilizar + iCloud sync inicial).
+    if (isMac() && this.ioQueue) {
+      const consumeAllPending = async () => {
+        try {
+          const tasks = await this.ioQueue.list();
+          if (tasks.length === 0) return;
+          console.log('[zeus.io-queue] consumindo', tasks.length, 'tasks pendentes');
+          for (const task of tasks) {
+            await this.ioQueue.consume(task, async (t) => {
+              if (t.type === 'passport') {
+                if (!this.passport || typeof this.passport.buildOne !== 'function') {
+                  return { ok: false, error: 'passport API indisponível' };
+                }
+                // Mac processa com daemon FM via buildOne (que prefere daemon).
+                let absPath = t.path;
+                if (t.path && !t.path.startsWith('/') && this.vaultRoot) {
+                  absPath = this.vaultRoot.replace(/\/$/, '') + '/' + t.path;
+                }
+                try {
+                  // Verifica se passport já existe E sha bate — alreadyDone idempotente.
+                  const existing = await this.passport.getPassport(t.path);
+                  if (existing && existing.sha === t.sha && existing.source !== 'ios-local') {
+                    return { ok: true, alreadyDone: true };
+                  }
+                  await this.passport.buildOne(absPath, []);
+                  return { ok: true };
+                } catch (e) {
+                  return { ok: false, error: e.message };
+                }
+              }
+              // Outros types (embed, spotlight) — Mac-side TODO; por enquanto,
+              // marca alreadyDone pra remover da fila (Mac auto-indexer já cobre).
+              return { ok: true, alreadyDone: true };
+            });
+          }
+        } catch (e) {
+          console.warn('[zeus.io-queue] consume loop failed:', e.message);
+        }
+      };
+      setTimeout(consumeAllPending, 20000);
+      // Periódico — 15min, mesmo intervalo do PassportScheduler para alinhar.
+      this._ioQueueIntervalId = setInterval(consumeAllPending, 15 * 60 * 1000);
     }
 
     // v1.8 — Multiplex auto-build (opt-in via settings). Roda em background
@@ -4295,6 +4372,135 @@ class ZeusPlugin extends Plugin {
       },
     });
 
+    // ---------------- v1.11 Feature H — ioQueue commands ----------------
+    this.addCommand({
+      id: 'zeus-io-queue-consume',
+      name: 'Zeus: consumir fila iOS (Mac side)',
+      callback: async () => {
+        if (!this.ioQueue) { new Notice('Zeus: io-queue indisponível'); return; }
+        if (!isMac()) { new Notice('Zeus: io-queue consume só roda no Mac'); return; }
+        const n = new Notice('Zeus: consumindo fila iOS…', 0);
+        try {
+          const tasks = await this.ioQueue.list();
+          if (tasks.length === 0) {
+            n.hide();
+            new Notice('Zeus: fila vazia — nada a consumir');
+            return;
+          }
+          let consumed = 0, failed = 0;
+          for (const task of tasks) {
+            const r = await this.ioQueue.consume(task, async (t) => {
+              if (t.type !== 'passport') return { ok: true, alreadyDone: true };
+              if (!this.passport || typeof this.passport.buildOne !== 'function') {
+                return { ok: false, error: 'passport API indisponível' };
+              }
+              let absPath = t.path;
+              if (t.path && !t.path.startsWith('/') && this.vaultRoot) {
+                absPath = this.vaultRoot.replace(/\/$/, '') + '/' + t.path;
+              }
+              try {
+                const existing = await this.passport.getPassport(t.path);
+                if (existing && existing.sha === t.sha && existing.source !== 'ios-local') {
+                  return { ok: true, alreadyDone: true };
+                }
+                await this.passport.buildOne(absPath, []);
+                return { ok: true };
+              } catch (e) {
+                return { ok: false, error: e.message };
+              }
+            });
+            if (r.consumed) consumed++; else failed++;
+          }
+          n.hide();
+          new Notice(`Zeus: ${consumed} consumidos, ${failed} falhas (de ${tasks.length})`);
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus consume falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-io-queue-status',
+      name: 'Zeus: status fila iOS',
+      callback: async () => {
+        if (!this.ioQueue) { new Notice('Zeus: io-queue indisponível'); return; }
+        try {
+          const s = await this.ioQueue.status();
+          const breakdown = Object.entries(s.byType).map(([t, n]) => `${t}=${n}`).join(' ');
+          const oldest = s.oldest ? ` · oldest ${s.oldest}` : '';
+          new Notice(`Zeus fila: ${s.total} tasks (${breakdown || 'nenhum'})${oldest}`, 8000);
+          console.log('[zeus] io-queue status:', s);
+        } catch (e) {
+          new Notice('Zeus fila-status falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    // ---------------- v1.11 Feature I — lexical-ios commands ----------------
+    this.addCommand({
+      id: 'zeus-lexical-ios-rebuild',
+      name: 'Zeus: rebuild lexical-ios index',
+      callback: async () => {
+        if (!this.lexicalIos) { new Notice('Zeus: lexical-ios indisponível'); return; }
+        const n = new Notice('Zeus lexical-ios: build…', 0);
+        try {
+          const r = await this.lexicalIos.build(msg => n.setMessage('Zeus lexical-ios: ' + msg));
+          n.hide();
+          new Notice(`Zeus lexical-ios: ${r.N} notas, ${r.vocab} tokens (${r.elapsedMs}ms)`);
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus lexical-ios build falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-lexical-ios-search',
+      name: 'Zeus: busca lexical-ios',
+      callback: async () => {
+        const q = await this._zeusPromptText('Lexical-ios search:');
+        if (!q || !q.trim()) return;
+        if (!this.lexicalIos) { new Notice('Zeus: lexical-ios indisponível'); return; }
+        const n = new Notice('Zeus lexical-ios: buscando…', 0);
+        try {
+          const hits = await this.lexicalIos.search(q, 20);
+          n.hide();
+          if (!hits || hits.length === 0) {
+            new Notice('Zeus lexical-ios: nenhum resultado (rode rebuild primeiro?)');
+            return;
+          }
+          const top3 = hits.slice(0, 3).map(h =>
+            `${h.path} (score ${h.score.toFixed(2)}, ${h.matched_tokens.length} match)`,
+          ).join('\n');
+          new Notice(`Zeus lexical-ios: ${hits.length} hits\n${top3}`, 12000);
+          console.log('[zeus] lexical-ios hits:', hits);
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus lexical-ios search falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-lexical-ios-stats',
+      name: 'Zeus: status lexical-ios index',
+      callback: async () => {
+        if (!this.lexicalIos) { new Notice('Zeus: lexical-ios indisponível'); return; }
+        try {
+          const s = await this.lexicalIos.stats();
+          new Notice(
+            `Zeus lexical-ios: N=${s.N} · vocab=${s.vocab_size} · avgdl=${s.avgdl.toFixed(0)}\n` +
+            `last_built: ${s.last_built || 'never'}`,
+            10000,
+          );
+          console.log('[zeus] lexical-ios stats:', s);
+        } catch (e) {
+          new Notice('Zeus lexical-ios stats falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
     console.log(`[zeus] loaded v${this.manifest.version} — Apple-native search & connections`);
     trace('onload.complete');
     writeTrace(null);
@@ -4324,6 +4530,11 @@ class ZeusPlugin extends Plugin {
     }
     if (this.daemonLifecycle) {
       try { await this.daemonLifecycle.stop(); } catch (e) { console.warn('[zeus] daemon lifecycle stop:', e.message); }
+    }
+    // v1.11 Feature H — clear ioQueue Mac-side consumer interval
+    if (this._ioQueueIntervalId) {
+      try { clearInterval(this._ioQueueIntervalId); } catch { /* ignore */ }
+      this._ioQueueIntervalId = null;
     }
   }
 

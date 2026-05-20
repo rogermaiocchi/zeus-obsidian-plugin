@@ -4,6 +4,130 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.11.1] — 2026-05-20 — Fixes pós-auditoria codex v1.11 (3 HIGH + 4 MED)
+
+Codex auditou v1.11.0 e achou 13 issues (3 HIGH + 6 MED + 4 LOW-validados). Aplicados 3 HIGH + 4 MED críticos:
+
+- **HIGH #1**: AutoIndexer instanciado antes do `coordinator.deviceId` — detecção iOS silenciosamente falhava. Movido para depois do bloco coordinator setup.
+- **HIGH #2**: enqueue ioQueue só rodava em erro de buildOne. Agora enfileira PREVENTIVAMENTE quando `passport.source === 'ios-local'` em iOS → Mac reprocessa via FM.
+- **HIGH #3**: `lexical-ios.incremental()` com header null gravava docs sem header → search() retornava []. Extraído `_recomputeHeader()` que varre `_docs` e recompõe consistente.
+- **MED #4** (passport-ios): proper nouns capturavam `DR`/`LTDA`/`ABC`. Adicionado `PROPER_NOUN_STOPWORDS` (títulos PT-BR + siglas) + rejeita ALL-CAPS ≤4 chars sem dígitos. **Empírico**: `"O DR. Silva da LTDA"` → `[Silva]` (DR/LTDA filtrados).
+- **MED #5** (lexical-ios stemmer): `ação`/`ações` viravam `acao`/`acoe` (raízes diferentes). Pré-normalização de plurais irregulares: `coes$→cao`, `soes$→sao`, `oes$→ao`, `aes$→ae`. **Empírico**: `ação ações ações` → 3× `acao`.
+- **MED #6** (IDF stale): `_recomputeHeader()` varre `_docs` e refaz `{N, avgdl, idf}` consistente após incremental.
+- **MED #7** (race build×incremental): `_writePromise` mutex em `_persist()` (mesmo padrão MultiplexGraph v1.8.1).
+
+Deferred (design): claim CAS race (iCloud delay + TTL + SHA idempotent torna race raríssimo), io-queue idempotência delegada ao processor, SHA 16-hex (colisão improvável).
+
+Validation: build 383 KB · doctor 7/7 · smoke 9/9 · daemon LIVE 40 endpoints · stem PT-BR + proper nouns empíricos OK.
+
+---
+
+## [1.11.0] — 2026-05-20 — Cobertura iOS sem daemon (Features E + H + I)
+
+Fechamento dos 3 gaps HIGH apontados pela auditoria Codex de v1.10.4: passport extract puro JS, fila iCloud-mediada para Mac consumir, índice lexical persistido com stems pt-BR. Todas as features são opt-in via setting ou comando, com fallback gracioso quando daemon disponível.
+
+### Feature E — Passport iOS-native (JS puro, sem daemon FM)
+
+**Nova lib**: `lib/passport-ios.js` (~270 LOC). Extrai passport canônico (mesmo schema de `passports.jsonl`) a partir de conteúdo + `metadataCache` do Obsidian — funciona em iOS sandbox onde o daemon FM não é alcançável.
+
+Concept extraction (6 fontes, dedup case-insensitive, cap 12):
+1. `fm.tags` (array OU CSV string)
+2. `fm.aliases` (array OU string)
+3. Inline `#tags` via regex `/#[\wÀ-ſ\-]+/g` (cap 30)
+4. Headings H1-H3 via `metadataCache.getCache().headings`
+5. Wikilinks via `metadataCache.resolvedLinks` (target basenames)
+6. Capitalized proper nouns (regex `\b[A-ZÀ-Ý][\wÀ-ÿ\-]+\b` 2-24 chars, cap 15)
+
+Summary fallback: `fm.zeus_summary` → primeiras 2 sentenças do body (max 250 chars) → H1 + primeiro parágrafo. Domain: `fm.zeus_domain` → folder root normalizado. Difficulty: heurística por `char_count` (>10KB=4, >5KB=3, >2KB=2, else 1).
+
+**Patch** `lib/passport-index.js`:
+- `buildOne()` agora detecta daemon via `httpClient.isAvailable(1500)`; fallback automático para `_buildOneLocal()` quando indisponível ou extract falha. Persiste no MESMO `passports.jsonl` — só `model_versions.passport = 'zeus-ios-1.11.0'` e `source = 'ios-local'` diferem para auditoria.
+- Novo método `findByQueryLocal(query, opts)`: BM25 sobre `one_line_summary` + concept_overlap. Reusa `lib/bm25`. Score = `concept_overlap + 0.5 * bm25_score`.
+- `findByQuery()` fall back para `findByQueryLocal` quando daemon offline.
+- Novo `_vaultRelative(filePath)`: coage abs path → vault-rel para vault.adapter.
+
+**Trade-off**: qualidade ~60-70% vs FM extract (concepts heurísticos sem semântica profunda). Aceitável para vault em iOS-only — Mac sweep eventual via PassportScheduler corrige se daemon volta.
+
+### Feature H — IoQueue iCloud-mediada (Mac consome iOS-deferred)
+
+**Nova lib**: `lib/io-queue.js` (~210 LOC). Fila persistida em `data/ios-queue/<sha>.json` (1 task = 1 arquivo, sem read-modify-write fragil cross-device em iCloud sync).
+
+API:
+- `enqueue(task)`: idempotente — mesmo `(path, sha, type)` → mesmo file (sha do task payload).
+- `list()`: lista todos tasks pendentes.
+- `consume(task, processor)`: claim via `DistributedCoordinator` (reuso do lock TTL 60s), `processor(task)`, em sucesso/`alreadyDone` deleta o file. Em erro mantém para retry.
+- `size()` / `status()`: contagem + breakdown por type.
+
+**Wire**:
+- `main.source.js`: `this.ioQueue = new IoQueue(this)` em onload.
+- `lib/auto-indexer.js _runPassport`: quando `passport.buildOne()` falha em iOS (deviceId contém `ios|ipad`), enqueue task `{path, sha, type: 'passport'}`.
+- Mac-side onload: boot consume após 20s + interval 15min processando tasks via `passport.buildOne` (que prefere daemon FM). Idempotência via `getPassport(path)` checa `sha` antes de re-processar.
+
+**Comandos novos**:
+- `Zeus: consumir fila iOS (Mac side)` — manual consume loop.
+- `Zeus: status fila iOS` — Notice com size + breakdown por type + oldest.
+
+**Trade-off**: eventual consistency (iCloud sync 5-30s + 15min consume cadence = pior caso ~16min de latência). Aceitável — passports são recompute, não bloqueiam queries (que usam `findByQueryLocal` enquanto isso).
+
+### Feature I — LexicalIosIndex (BM25 persistido + stems pt-BR)
+
+**Nova lib**: `lib/lexical-ios.js` (~290 LOC). BM25 puro JS, posting list materializado em `data/lexical-ios.jsonl` (header + 1 linha por nota).
+
+Schema:
+```jsonl
+{"schema":"lexical-ios-v1","N":5234,"avgdl":127.3,"idf":{"token":idf,...},"last_built":"..."}
+{"path":"...","sha":"...","tokens":[{"token":"...","tf":N},...],"dl":234}
+```
+
+Stemming pt-BR leve (regex strip): `-ção`, `-são`, `-mente`, `-vel`, `-ável`, `-ível`, `-idade`, `-ar`, `-er`, `-ir`, `-ado/ida`, `-inho`, `-s`. Strip aplicado em ordem; preserva token se resultante < 3 chars. NFD para acentos. Tokenize idêntico a `lib/bm25` (interop léxico).
+
+API:
+- `build(onProgress)`: full rebuild. Vault ~5k notas → ~2-4s no Mac, ~8-12s no iPad.
+- `search(query, topN=30)`: BM25 sobre posting list. ~10-20ms no vault completo.
+- `incremental(path, sha?)`: upsert por path. Atualiza IDF best-effort (novos tokens recebem IDF=log(1+(N-1+0.5)/1.5); tokens existentes mantêm IDF antigo).
+- `stats()`: N, avgdl, vocab_size, last_built.
+
+**Patch** `lib/hybrid-search.js`:
+- Novo bit `lexicalIos = 1 << 6` em SOURCE_BITS (distinto do `bm25` in-memory para auditoria MMR).
+- 6º retriever em `query()`: invoca `this.plugin.lexicalIos.search(q, topN*2)` quando disponível. Complementa `bm25` in-memory (que cappa em 2000 notas) — em vault >2k notas o lexical-ios cobre as restantes.
+
+**Patch** `lib/auto-indexer.js`:
+- `DEBOUNCE.lexicalIos = 30000` (30s após modify).
+- `_runLexicalIos(path)`: chama `lexicalIos.incremental(path)`. Re-tokeniza + persiste em ~5-20ms.
+
+**Settings**:
+- `lexicalIosAutoBuild` (default `false`): se ON, build full inicial 8s após onload. Default OFF porque vault grande pode demorar; incrementals continuam funcionando sem build inicial (apenas notas tocadas após onload entram no índice).
+
+**Comandos novos**:
+- `Zeus: rebuild lexical-ios index` — full rebuild manual.
+- `Zeus: busca lexical-ios` — busca direta via modal (debug/observability; produção usa `hybrid.query()`).
+- `Zeus: status lexical-ios index` — N + vocab_size + last_built.
+
+**Trade-off**: incremental NÃO recomputa IDF global (custo O(vocab)). Tokens novos ganham IDF estimado conservador (df=1); query relevance para esses tokens é levemente subóptima. Workaround: comando manual `rebuild` periódico (1×/semana suficiente em vault estável).
+
+### Dim mismatch resolvido via model_versions separados
+
+Cross-device, `passports.jsonl` mistura entries de daemon FM e ios-local. Schema canônico mantido idêntico — só `model_versions.passport` distingue (`zeus-fm-X.Y` vs `zeus-ios-1.11.0`) e `source` (`daemon` vs `ios-local`). Consumers (MCP, BasesGenerator) operam transparente; auditoria forensic via `source` quando preciso.
+
+### Validation
+
+- `bun run build` → main.js 380 KB (esbuild OK, +0.6 KB vs v1.10.4)
+- `node --check` em todos files novos/modificados → OK
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9 asserts passam
+- Empirical tests (Mac, fora do Obsidian):
+  - passport-ios: 13/13 checks (6 fontes confirmadas + dedup + cap + summary + domain + difficulty + source + model_versions)
+  - io-queue: enqueue idempotent + list + consume + delete + alreadyDone (size 2 → 1 → 0 esperado)
+  - lexical-ios: build 5 notas/36 tokens → search "habeas corpus" 3 hits + "estudante universidade" 1 hit (testa stem) + incremental → query no novo conteúdo
+
+### Sem mudanças
+
+- `daemon/*`: não tocado (subagents anteriores).
+- `manifest.json` / `package.json`: bump fica com orchestrator (provavelmente para `1.11.0`).
+- `bin/ZeusDaemonMac`: não tocado.
+
+---
+
 ## [1.10.4] — 2026-05-20 — Cápsula Mac + iOS validada (audit cross-platform)
 
 User pediu "cápsula perfeita Mac + iOS". Audit completo do stack v1.5 → v1.10.3 contra ambiente Capacitor iOS realizado.

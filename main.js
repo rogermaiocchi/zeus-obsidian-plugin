@@ -1557,11 +1557,345 @@ var require_image_similarity = __commonJS({
   }
 });
 
+// lib/passport-ios.js
+var require_passport_ios = __commonJS({
+  "lib/passport-ios.js"(exports2, module2) {
+    "use strict";
+    var MODEL_VERSION = "zeus-ios-1.11.0";
+    var MAX_CONCEPTS = 12;
+    var MAX_INLINE_TAGS = 30;
+    var MAX_PROPER_NOUNS = 15;
+    var MIN_CONCEPT_LEN = 2;
+    var SUMMARY_MAX_CHARS = 250;
+    var INLINE_TAG_RE = /#[\wÀ-ſ\-]+/g;
+    var PROPER_NOUN_RE = /\b[A-ZÀ-Ý][\wÀ-ÿ\-]{1,23}\b/g;
+    var PROPER_NOUN_STOPWORDS = /* @__PURE__ */ new Set([
+      // títulos
+      "dr",
+      "dra",
+      "sr",
+      "sra",
+      "srta",
+      "exmo",
+      "exma",
+      "ilmo",
+      "ilma",
+      // siglas all-caps comuns (não-discriminantes)
+      "abc",
+      "cep",
+      "cnpj",
+      "cpf",
+      "dr",
+      "edt",
+      "gmt",
+      "iso",
+      "ltda",
+      "me",
+      "mei",
+      "ong",
+      "pdf",
+      "rg",
+      "rh",
+      "sa",
+      "sl",
+      "sp",
+      "rj",
+      "usa",
+      "utc",
+      "url",
+      "uti",
+      // demonstrativos/artigos capitalizados (início de frase)
+      "a",
+      "as",
+      "da",
+      "das",
+      "de",
+      "do",
+      "dos",
+      "e",
+      "em",
+      "no",
+      "na",
+      "nos",
+      "nas",
+      "o",
+      "os",
+      "um",
+      "uma",
+      "uns",
+      "umas",
+      "para",
+      "pelo",
+      "pela"
+    ]);
+    var FRONTMATTER_RE = /^---\n[\s\S]*?\n---\n/;
+    var SENTENCE_SPLIT_RE = /(?<=[.!?])\s+(?=[A-ZÀ-Ý])/;
+    function stripFrontmatter(content) {
+      if (!content || typeof content !== "string") return "";
+      return content.replace(FRONTMATTER_RE, "").trimStart();
+    }
+    function coerceArray(v) {
+      if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+      if (typeof v === "string") {
+        return v.split(",").map((s) => s.trim()).filter(Boolean);
+      }
+      return [];
+    }
+    function detectDomainByFolder(filePath) {
+      if (!filePath || typeof filePath !== "string") return ["unknown"];
+      const segments = filePath.split("/").filter(Boolean);
+      if (segments.length < 2) return ["root"];
+      const folder = segments[0];
+      const normalized = folder.replace(/^\d+[_\s-]*/, "").replace(/\s+/g, "-").toLowerCase();
+      return [normalized || folder];
+    }
+    function estimateDifficulty(charCount) {
+      if (charCount > 10240) return 4;
+      if (charCount > 5120) return 3;
+      if (charCount > 2048) return 2;
+      return 1;
+    }
+    function extractSummary(body, fm, headings) {
+      if (fm && typeof fm.zeus_summary === "string" && fm.zeus_summary.trim()) {
+        return fm.zeus_summary.trim().slice(0, SUMMARY_MAX_CHARS);
+      }
+      const trimmed = (body || "").trim();
+      if (trimmed.length > 0) {
+        const lines = trimmed.split("\n");
+        const proseLines = [];
+        let inCodeBlock = false;
+        for (const ln of lines) {
+          const t = ln.trim();
+          if (t.startsWith("```")) {
+            inCodeBlock = !inCodeBlock;
+            continue;
+          }
+          if (inCodeBlock) continue;
+          if (!t) continue;
+          if (t.startsWith("#")) continue;
+          if (t.startsWith("- ") || t.startsWith("* ")) continue;
+          if (/^\d+\.\s/.test(t)) continue;
+          if (t.startsWith(">")) continue;
+          if (t.startsWith("|")) continue;
+          proseLines.push(t);
+          if (proseLines.join(" ").length > SUMMARY_MAX_CHARS * 1.5) break;
+        }
+        if (proseLines.length > 0) {
+          const joined = proseLines.join(" ");
+          const sentences = joined.split(SENTENCE_SPLIT_RE).slice(0, 2);
+          const summary = sentences.join(" ").trim();
+          if (summary) return summary.slice(0, SUMMARY_MAX_CHARS);
+        }
+      }
+      const h1 = (headings || []).find((h) => h.level === 1);
+      if (h1) {
+        const prefix = h1.heading ? h1.heading.trim() + " \u2014 " : "";
+        const rest = (body || "").replace(/^#+\s.*$/m, "").trim().split("\n").find((l) => l.trim());
+        return (prefix + (rest || "").trim()).slice(0, SUMMARY_MAX_CHARS);
+      }
+      return "";
+    }
+    async function extractPassportLocal(filePath, fileContent, metadataCache) {
+      const content = typeof fileContent === "string" ? fileContent : "";
+      const body = stripFrontmatter(content);
+      const charCount = content.length;
+      let fileCache = null;
+      if (metadataCache && typeof metadataCache.getCache === "function") {
+        try {
+          fileCache = metadataCache.getCache(filePath);
+        } catch (e) {
+        }
+      }
+      const fm = fileCache && fileCache.frontmatter || {};
+      const headings = fileCache && fileCache.headings || [];
+      const conceptsBag = [];
+      for (const t of coerceArray(fm.tags)) {
+        conceptsBag.push(String(t).replace(/^#/, ""));
+      }
+      for (const a of coerceArray(fm.aliases)) {
+        conceptsBag.push(String(a));
+      }
+      const inlineMatches = body.match(INLINE_TAG_RE) || [];
+      for (let i = 0; i < Math.min(inlineMatches.length, MAX_INLINE_TAGS); i++) {
+        conceptsBag.push(inlineMatches[i].replace(/^#/, ""));
+      }
+      for (const h of headings) {
+        if (h && typeof h.level === "number" && h.level >= 1 && h.level <= 3 && h.heading) {
+          conceptsBag.push(String(h.heading).trim());
+        }
+      }
+      if (metadataCache && metadataCache.resolvedLinks && typeof metadataCache.resolvedLinks === "object") {
+        const outLinks = metadataCache.resolvedLinks[filePath];
+        if (outLinks && typeof outLinks === "object") {
+          for (const targetPath of Object.keys(outLinks)) {
+            const basename = targetPath.split("/").pop().replace(/\.md$/, "");
+            if (basename) conceptsBag.push(basename);
+          }
+        }
+      }
+      const properMatches = body.match(PROPER_NOUN_RE) || [];
+      let properCount = 0;
+      const properSeen = /* @__PURE__ */ new Set();
+      for (const pn of properMatches) {
+        if (properCount >= MAX_PROPER_NOUNS) break;
+        if (pn.length < MIN_CONCEPT_LEN || pn.length > 24) continue;
+        const lower = pn.toLowerCase();
+        if (PROPER_NOUN_STOPWORDS.has(lower)) continue;
+        if (properSeen.has(lower)) continue;
+        if (pn.length <= 4 && pn === pn.toUpperCase() && !/\d/.test(pn)) continue;
+        properSeen.add(lower);
+        conceptsBag.push(pn);
+        properCount++;
+      }
+      const seen = /* @__PURE__ */ new Set();
+      const concepts = [];
+      for (const raw of conceptsBag) {
+        const s = String(raw).trim();
+        if (s.length < MIN_CONCEPT_LEN) continue;
+        const key = s.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        concepts.push(s);
+        if (concepts.length >= MAX_CONCEPTS) break;
+      }
+      let domain = coerceArray(fm.zeus_domain);
+      if (domain.length === 0) domain = detectDomainByFolder(filePath);
+      const summary = extractSummary(body, fm, headings);
+      const difficulty = estimateDifficulty(charCount);
+      return {
+        path: filePath,
+        extracted_at: (/* @__PURE__ */ new Date()).toISOString(),
+        char_count: charCount,
+        concepts,
+        domain,
+        difficulty,
+        one_line_summary: summary,
+        model_versions: { passport: MODEL_VERSION },
+        source: "ios-local"
+      };
+    }
+    module2.exports = {
+      extractPassportLocal,
+      // Exports privados para testes
+      _stripFrontmatter: stripFrontmatter,
+      _coerceArray: coerceArray,
+      _detectDomainByFolder: detectDomainByFolder,
+      _estimateDifficulty: estimateDifficulty,
+      _extractSummary: extractSummary,
+      MODEL_VERSION
+    };
+  }
+});
+
+// lib/bm25.js
+var require_bm25 = __commonJS({
+  "lib/bm25.js"(exports2, module2) {
+    "use strict";
+    var _TOKEN = /[0-9a-zà-ÿ_-]{2,}/g;
+    var K1_DEFAULT = 1.5;
+    var B_DEFAULT = 0.75;
+    function tokenize(text) {
+      if (!text || typeof text !== "string") return [];
+      return text.toLowerCase().match(_TOKEN) || [];
+    }
+    function bm25Scores(corpus, queryTokens, k1 = K1_DEFAULT, b = B_DEFAULT) {
+      const N = corpus.length;
+      if (N === 0) return [];
+      if (!Array.isArray(queryTokens) || queryTokens.length === 0) {
+        return new Array(N).fill(0);
+      }
+      const docLens = new Array(N);
+      let totalLen = 0;
+      for (let i = 0; i < N; i++) {
+        const dl = corpus[i].length;
+        docLens[i] = dl;
+        totalLen += dl;
+      }
+      const avgdl = totalLen / N;
+      const df = /* @__PURE__ */ new Map();
+      for (let i = 0; i < N; i++) {
+        const seen = new Set(corpus[i]);
+        for (const term of seen) {
+          df.set(term, (df.get(term) || 0) + 1);
+        }
+      }
+      const idf = /* @__PURE__ */ new Map();
+      for (const [term, freq] of df.entries()) {
+        idf.set(term, Math.log(1 + (N - freq + 0.5) / (freq + 0.5)));
+      }
+      const querySet = new Set(queryTokens);
+      const scores = new Array(N).fill(0);
+      for (let i = 0; i < N; i++) {
+        const doc = corpus[i];
+        const docLen = docLens[i];
+        if (doc.length === 0) continue;
+        const tf = /* @__PURE__ */ new Map();
+        for (const term of doc) {
+          tf.set(term, (tf.get(term) || 0) + 1);
+        }
+        let score = 0;
+        for (const term of querySet) {
+          const freq = tf.get(term) || 0;
+          if (freq === 0) continue;
+          const denom = avgdl > 0 ? freq + k1 * (1 - b + b * docLen / avgdl) : freq;
+          score += (idf.get(term) || 0) * (freq * (k1 + 1)) / denom;
+        }
+        scores[i] = score;
+      }
+      return scores;
+    }
+    function rankNotes(notes, query, topN = 30, opts = {}) {
+      if (!Array.isArray(notes) || notes.length === 0) return [];
+      const queryTokens = tokenize(query);
+      if (queryTokens.length === 0) return [];
+      const k1 = opts.k1 != null ? opts.k1 : K1_DEFAULT;
+      const b = opts.b != null ? opts.b : B_DEFAULT;
+      const corpus = new Array(notes.length);
+      const docTokens = new Array(notes.length);
+      for (let i = 0; i < notes.length; i++) {
+        const tokens = tokenize(notes[i].text || "");
+        corpus[i] = tokens;
+        docTokens[i] = tokens;
+      }
+      const scores = bm25Scores(corpus, queryTokens, k1, b);
+      const ranked = [];
+      for (let i = 0; i < notes.length; i++) {
+        if (scores[i] <= 0) continue;
+        ranked.push({ path: notes[i].path, score: scores[i], tokens: docTokens[i] });
+      }
+      ranked.sort((a, b2) => b2.score - a.score);
+      return ranked.slice(0, topN);
+    }
+    module2.exports = {
+      tokenize,
+      bm25Scores,
+      rankNotes,
+      K1_DEFAULT,
+      B_DEFAULT
+    };
+    if (require.main === module2) {
+      const query = process.argv.slice(2).join(" ") || "habeas corpus";
+      console.log(`[bm25 demo] query=${JSON.stringify(query)}`);
+      const notes = [
+        { path: "doc-a.md", text: "O habeas corpus \xE9 rem\xE9dio constitucional contra pris\xE3o ilegal. Garantia fundamental do art. 5\xBA." },
+        { path: "doc-b.md", text: "Mandado de seguran\xE7a protege direito l\xEDquido e certo. Distinto do habeas corpus." },
+        { path: "doc-c.md", text: "Contratos administrativos seguem regime de direito p\xFAblico \u2014 Lei 14.133/2021." },
+        { path: "doc-d.md", text: "habeas habeas habeas \u2014 repeti\xE7\xE3o satura via k1=1.5." }
+      ];
+      const ranked = rankNotes(notes, query, 10);
+      console.log(JSON.stringify(ranked.map((r) => ({ path: r.path, score: +r.score.toFixed(4) })), null, 2));
+      console.log(`[bm25 demo] tokenize("Habeas Corpus, Lei 14.133"):`, tokenize("Habeas Corpus, Lei 14.133"));
+    }
+  }
+});
+
 // lib/passport-index.js
 var require_passport_index = __commonJS({
   "lib/passport-index.js"(exports2, module2) {
     "use strict";
     var universal2 = require_universal_fs();
+    var { extractPassportLocal } = require_passport_ios();
+    var bm25 = require_bm25();
     var PASSPORTS_FILE = "passports.jsonl";
     var DATA_DIR_NAME2 = "data";
     var PassportIndex2 = class {
@@ -1595,19 +1929,34 @@ var require_passport_index = __commonJS({
        * for cross-device staleness detection via PassportScheduler.
        */
       async buildOne(filePath, domainOptions = []) {
-        if (!this.plugin.httpClient) {
-          throw new Error("PassportIndex.buildOne: httpClient indispon\xEDvel");
+        let daemonReachable = false;
+        if (this.plugin.httpClient && typeof this.plugin.httpClient.isAvailable === "function") {
+          try {
+            daemonReachable = await this.plugin.httpClient.isAvailable(1500);
+          } catch (e) {
+            daemonReachable = false;
+          }
+        }
+        if (!daemonReachable) {
+          return await this._buildOneLocal(filePath);
         }
         let currentSha = null;
         try {
-          if (await universal2.adapterExists(this._adapter, filePath)) {
-            const content = await universal2.adapterRead(this._adapter, filePath);
+          const relForRead = this._vaultRelative(filePath);
+          if (relForRead && await universal2.adapterExists(this._adapter, relForRead)) {
+            const content = await universal2.adapterRead(this._adapter, relForRead);
             currentSha = await universal2.sha256Hex(content);
           }
         } catch (e) {
           console.warn("[zeus][passport] sha precompute failed for", filePath, e.message);
         }
-        const passport = await this.plugin.httpClient.passportExtract(filePath, domainOptions);
+        let passport;
+        try {
+          passport = await this.plugin.httpClient.passportExtract(filePath, domainOptions);
+        } catch (e) {
+          console.warn("[zeus][passport] daemon extract failed, fallback to ios-local:", e.message);
+          return await this._buildOneLocal(filePath);
+        }
         if (!passport || !passport.path) {
           throw new Error(`PassportIndex.buildOne: resposta inv\xE1lida para ${filePath}`);
         }
@@ -1623,6 +1972,61 @@ var require_passport_index = __commonJS({
           await this._updateManifestEntry(passport);
         } catch (e) {
           console.warn("[zeus][passport] manifest mirror failed:", e.message);
+        }
+        this._lastBuiltAt = (/* @__PURE__ */ new Date()).toISOString();
+        return passport;
+      }
+      /**
+       * v1.11 Feature E — Coage o filePath para vault-relative.
+       * AutoIndexer passa abs path no Mac (`/Users/.../vault/Note.md`); vault.adapter
+       * só aceita vault-relative. Se filePath for absoluto e começar com vaultRoot,
+       * tira o prefixo. Senão retorna como veio (assume relativo).
+       */
+      _vaultRelative(filePath) {
+        if (!filePath || typeof filePath !== "string") return filePath;
+        const root = this.plugin && this.plugin.vaultRoot;
+        if (root && filePath.startsWith(root)) {
+          const stripped = filePath.slice(root.length).replace(/^\/+/, "");
+          return stripped;
+        }
+        return filePath;
+      }
+      /**
+       * v1.11 Feature E — Build passport puramente local (sem daemon) via
+       * extractPassportLocal. Usado:
+       *   - iOS quando httpClient indisponível
+       *   - Mac quando daemon offline e usuário não quer bloquear
+       *
+       * Persiste no MESMO passports.jsonl que o caminho daemon — só
+       * model_versions.passport difere ('zeus-ios-1.11.0').
+       */
+      async _buildOneLocal(filePath) {
+        const relPath = this._vaultRelative(filePath);
+        if (!relPath) {
+          throw new Error("PassportIndex._buildOneLocal: filePath inv\xE1lido");
+        }
+        if (!await universal2.adapterExists(this._adapter, relPath)) {
+          throw new Error(`PassportIndex._buildOneLocal: arquivo n\xE3o existe: ${relPath}`);
+        }
+        const content = await universal2.adapterRead(this._adapter, relPath);
+        const metadataCache = this.plugin.app && this.plugin.app.metadataCache;
+        const passport = await extractPassportLocal(relPath, content, metadataCache);
+        try {
+          passport.sha = await universal2.sha256Hex(content);
+        } catch (e) {
+          console.warn("[zeus][passport] local sha failed:", e.message);
+        }
+        if (this.plugin.coordinator && this.plugin.coordinator.deviceId) {
+          passport.extracted_by = this.plugin.coordinator.deviceId;
+        }
+        passport.path = relPath;
+        const map = await this.loadAll();
+        map.set(passport.path, passport);
+        await this.saveAll(map);
+        try {
+          await this._updateManifestEntry(passport);
+        } catch (e) {
+          console.warn("[zeus][passport] manifest mirror failed (local):", e.message);
         }
         this._lastBuiltAt = (/* @__PURE__ */ new Date()).toISOString();
         return passport;
@@ -1771,8 +2175,16 @@ var require_passport_index = __commonJS({
        * @returns {Promise<Array<passport>>}
        */
       async findByQuery(query, options = {}) {
-        if (!this.plugin.httpClient) {
-          throw new Error("PassportIndex.findByQuery: httpClient indispon\xEDvel");
+        let daemonReachable = false;
+        if (this.plugin.httpClient && typeof this.plugin.httpClient.isAvailable === "function") {
+          try {
+            daemonReachable = await this.plugin.httpClient.isAvailable(1500);
+          } catch (e) {
+            daemonReachable = false;
+          }
+        }
+        if (!daemonReachable) {
+          return await this.findByQueryLocal(query, options);
         }
         const dataDir = this.dataPath;
         const opts = {
@@ -1782,8 +2194,84 @@ var require_passport_index = __commonJS({
           embeddingsPath: options.embeddingsPath || universal2.joinPath(dataDir, "embeddings.jsonl"),
           passportsPath: options.passportsPath || this.jsonlPath
         };
-        const resp = await this.plugin.httpClient.passportFind(query, opts);
-        return resp && resp.results || (Array.isArray(resp) ? resp : []);
+        try {
+          const resp = await this.plugin.httpClient.passportFind(query, opts);
+          return resp && resp.results || (Array.isArray(resp) ? resp : []);
+        } catch (e) {
+          console.warn("[zeus][passport] daemon find failed, fallback to local:", e.message);
+          return await this.findByQueryLocal(query, options);
+        }
+      }
+      /**
+       * v1.11 Feature E — busca local sobre passports.jsonl quando daemon não está
+       * disponível (iOS sandbox).
+       *
+       * Score = concept_overlap(query_tokens, p.concepts) +
+       *         bm25Score(query_tokens, p.one_line_summary || basename(p.path))
+       *
+       * Reusa lib/bm25 — tokenize idêntica, garante interop léxica com o retriever
+       * principal. concept_overlap conta tokens da query que aparecem como substring
+       * case-insensitive em algum concept do passport (Jaccard-like; pesa overlap
+       * sem inflar por concept-redundance).
+       *
+       * @param {string} query
+       * @param {object} options - { topN, minScore, conceptFilter }
+       * @returns {Promise<Array<passport>>}
+       */
+      async findByQueryLocal(query, options = {}) {
+        if (!query || typeof query !== "string" || !query.trim()) return [];
+        const topN = options.topN || 10;
+        const minScore = options.minScore != null ? options.minScore : 0;
+        const conceptFilter = options.conceptFilter ? new Set((Array.isArray(options.conceptFilter) ? options.conceptFilter : [options.conceptFilter]).map((s) => String(s).toLowerCase())) : null;
+        const map = await this.loadAll();
+        if (map.size === 0) return [];
+        const queryTokens = bm25.tokenize(query);
+        if (queryTokens.length === 0) return [];
+        const queryTokenSet = new Set(queryTokens);
+        const passports = Array.from(map.values());
+        const corpus = passports.map((p) => {
+          const summary = p.one_line_summary || p.summary || "";
+          const basename = (p.path || "").split("/").pop().replace(/\.md$/, "");
+          return bm25.tokenize(summary + " " + basename);
+        });
+        const bmScores = bm25.bm25Scores(corpus, queryTokens);
+        const scored = [];
+        for (let i = 0; i < passports.length; i++) {
+          const p = passports[i];
+          if (conceptFilter) {
+            const concepts2 = (p.concepts || []).map((c) => String(c).toLowerCase());
+            let hasMatch = false;
+            for (const c of concepts2) {
+              if (conceptFilter.has(c)) {
+                hasMatch = true;
+                break;
+              }
+            }
+            if (!hasMatch) continue;
+          }
+          let overlap = 0;
+          const concepts = p.concepts || [];
+          for (const c of concepts) {
+            const cLower = String(c).toLowerCase();
+            for (const qt of queryTokenSet) {
+              if (cLower === qt || cLower.includes(qt) || qt.includes(cLower)) {
+                overlap++;
+                break;
+              }
+            }
+          }
+          const score = overlap + 0.5 * bmScores[i];
+          if (score < minScore) continue;
+          scored.push({ passport: p, score, overlap, bm25: bmScores[i] });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        return scored.slice(0, topN).map((x) => ({
+          ...x.passport,
+          _score: x.score,
+          _overlap: x.overlap,
+          _bm25: x.bm25,
+          _source: "ios-local"
+        }));
       }
       /**
        * Lookup a single passport from in-memory cache (cheap).
@@ -2506,108 +2994,6 @@ var require_daemon_lifecycle = __commonJS({
   }
 });
 
-// lib/bm25.js
-var require_bm25 = __commonJS({
-  "lib/bm25.js"(exports2, module2) {
-    "use strict";
-    var _TOKEN = /[0-9a-zà-ÿ_-]{2,}/g;
-    var K1_DEFAULT = 1.5;
-    var B_DEFAULT = 0.75;
-    function tokenize(text) {
-      if (!text || typeof text !== "string") return [];
-      return text.toLowerCase().match(_TOKEN) || [];
-    }
-    function bm25Scores(corpus, queryTokens, k1 = K1_DEFAULT, b = B_DEFAULT) {
-      const N = corpus.length;
-      if (N === 0) return [];
-      if (!Array.isArray(queryTokens) || queryTokens.length === 0) {
-        return new Array(N).fill(0);
-      }
-      const docLens = new Array(N);
-      let totalLen = 0;
-      for (let i = 0; i < N; i++) {
-        const dl = corpus[i].length;
-        docLens[i] = dl;
-        totalLen += dl;
-      }
-      const avgdl = totalLen / N;
-      const df = /* @__PURE__ */ new Map();
-      for (let i = 0; i < N; i++) {
-        const seen = new Set(corpus[i]);
-        for (const term of seen) {
-          df.set(term, (df.get(term) || 0) + 1);
-        }
-      }
-      const idf = /* @__PURE__ */ new Map();
-      for (const [term, freq] of df.entries()) {
-        idf.set(term, Math.log(1 + (N - freq + 0.5) / (freq + 0.5)));
-      }
-      const querySet = new Set(queryTokens);
-      const scores = new Array(N).fill(0);
-      for (let i = 0; i < N; i++) {
-        const doc = corpus[i];
-        const docLen = docLens[i];
-        if (doc.length === 0) continue;
-        const tf = /* @__PURE__ */ new Map();
-        for (const term of doc) {
-          tf.set(term, (tf.get(term) || 0) + 1);
-        }
-        let score = 0;
-        for (const term of querySet) {
-          const freq = tf.get(term) || 0;
-          if (freq === 0) continue;
-          const denom = avgdl > 0 ? freq + k1 * (1 - b + b * docLen / avgdl) : freq;
-          score += (idf.get(term) || 0) * (freq * (k1 + 1)) / denom;
-        }
-        scores[i] = score;
-      }
-      return scores;
-    }
-    function rankNotes(notes, query, topN = 30, opts = {}) {
-      if (!Array.isArray(notes) || notes.length === 0) return [];
-      const queryTokens = tokenize(query);
-      if (queryTokens.length === 0) return [];
-      const k1 = opts.k1 != null ? opts.k1 : K1_DEFAULT;
-      const b = opts.b != null ? opts.b : B_DEFAULT;
-      const corpus = new Array(notes.length);
-      const docTokens = new Array(notes.length);
-      for (let i = 0; i < notes.length; i++) {
-        const tokens = tokenize(notes[i].text || "");
-        corpus[i] = tokens;
-        docTokens[i] = tokens;
-      }
-      const scores = bm25Scores(corpus, queryTokens, k1, b);
-      const ranked = [];
-      for (let i = 0; i < notes.length; i++) {
-        if (scores[i] <= 0) continue;
-        ranked.push({ path: notes[i].path, score: scores[i], tokens: docTokens[i] });
-      }
-      ranked.sort((a, b2) => b2.score - a.score);
-      return ranked.slice(0, topN);
-    }
-    module2.exports = {
-      tokenize,
-      bm25Scores,
-      rankNotes,
-      K1_DEFAULT,
-      B_DEFAULT
-    };
-    if (require.main === module2) {
-      const query = process.argv.slice(2).join(" ") || "habeas corpus";
-      console.log(`[bm25 demo] query=${JSON.stringify(query)}`);
-      const notes = [
-        { path: "doc-a.md", text: "O habeas corpus \xE9 rem\xE9dio constitucional contra pris\xE3o ilegal. Garantia fundamental do art. 5\xBA." },
-        { path: "doc-b.md", text: "Mandado de seguran\xE7a protege direito l\xEDquido e certo. Distinto do habeas corpus." },
-        { path: "doc-c.md", text: "Contratos administrativos seguem regime de direito p\xFAblico \u2014 Lei 14.133/2021." },
-        { path: "doc-d.md", text: "habeas habeas habeas \u2014 repeti\xE7\xE3o satura via k1=1.5." }
-      ];
-      const ranked = rankNotes(notes, query, 10);
-      console.log(JSON.stringify(ranked.map((r) => ({ path: r.path, score: +r.score.toFixed(4) })), null, 2));
-      console.log(`[bm25 demo] tokenize("Habeas Corpus, Lei 14.133"):`, tokenize("Habeas Corpus, Lei 14.133"));
-    }
-  }
-});
-
 // lib/hybrid-search.js
 var require_hybrid_search = __commonJS({
   "lib/hybrid-search.js"(exports2, module2) {
@@ -2619,7 +3005,11 @@ var require_hybrid_search = __commonJS({
       graph: 1 << 2,
       passport: 1 << 3,
       spotlight: 1 << 4,
-      bm25: 1 << 5
+      bm25: 1 << 5,
+      // v1.11 Feature I — lexical-ios é BM25 persistido (TF-IDF + stems pt-BR).
+      // Mantém bit próprio (distinto de bm25 in-memory) para auditoria do sourceMask
+      // sem confundir os dois retrievers durante MMR diversify.
+      lexicalIos: 1 << 6
     };
     var SOURCE_NAMES = Object.keys(SOURCE_BITS);
     function _maskToNames(mask) {
@@ -2954,6 +3344,16 @@ var require_hybrid_search = __commonJS({
           } catch (e) {
             console.warn("[zeus.hybrid] bm25 retrieval failed", e.message);
           }
+        }
+        try {
+          if (this.plugin.lexicalIos && typeof this.plugin.lexicalIos.search === "function") {
+            const lexHits = await this.plugin.lexicalIos.search(q, topN * 2);
+            if (lexHits && lexHits.length > 0) {
+              lists.push(lexHits.map((h) => ({ path: h.path, source: "lexicalIos" })));
+            }
+          }
+        } catch (e) {
+          console.warn("[zeus.hybrid] lexical-ios retrieval failed", e.message);
         }
         let fused = this.fuse(lists);
         if (opts.diversify) {
@@ -3476,7 +3876,10 @@ var require_auto_indexer = __commonJS({
       base: 1e4,
       spotlight: 15e3,
       multiplex: 6e4,
-      leiden: 3e4
+      leiden: 3e4,
+      // v1.11 Feature I — lexical-ios incremental ~30s após passport (em iOS,
+      // bm25 in-memory pode estar indisponível; este é o único sinal lexical).
+      lexicalIos: 3e4
     };
     var MULTIPLEX_MOD_THRESHOLD = 10;
     var AutoIndexer2 = class {
@@ -3537,6 +3940,7 @@ var require_auto_indexer = __commonJS({
           this._modCount = 0;
           this._schedule("multiplex", DEBOUNCE.multiplex, () => this._runMultiplex());
         }
+        this._schedule("lexicalIos:" + file.path, DEBOUNCE.lexicalIos, () => this._runLexicalIos(file.path));
       }
       _onDelete(file) {
         if (!file || !file.path || !file.path.endsWith(".md")) return;
@@ -3588,8 +3992,49 @@ var require_auto_indexer = __commonJS({
               absPath = this.plugin.vaultRoot.replace(/\/$/, "") + "/" + path2;
             }
             const passport = await p.buildOne(absPath, []);
-            return { passport: passport && passport.path, concepts: (passport && passport.concepts || []).length };
+            try {
+              if (passport && passport.source === "ios-local" && this.plugin.ioQueue && this.plugin.coordinator && this.plugin.coordinator.deviceId && /ios|ipad/i.test(this.plugin.coordinator.deviceId)) {
+                const relPath = path2 && path2.startsWith("/") && this.plugin.vaultRoot ? path2.slice(this.plugin.vaultRoot.length).replace(/^\/+/, "") : path2;
+                await this.plugin.ioQueue.enqueue({
+                  path: relPath,
+                  sha: passport.sha || "",
+                  type: "passport",
+                  payload: { reason: "ios-local-needs-fm-refine" },
+                  enqueued_at: (/* @__PURE__ */ new Date()).toISOString(),
+                  enqueued_by: this.plugin.coordinator.deviceId
+                });
+              }
+            } catch (eq) {
+              console.warn("[zeus.autoidx] ios passport enqueue failed:", eq.message);
+            }
+            return {
+              passport: passport && passport.path,
+              concepts: (passport && passport.concepts || []).length,
+              source: passport && passport.source || "daemon"
+            };
           } catch (e) {
+            if (this.plugin.ioQueue && this.plugin.coordinator && this.plugin.coordinator.deviceId && /ios|ipad/i.test(this.plugin.coordinator.deviceId)) {
+              try {
+                const relPath = path2 && path2.startsWith("/") && this.plugin.vaultRoot ? path2.slice(this.plugin.vaultRoot.length).replace(/^\/+/, "") : path2;
+                const adapter = this.plugin.app.vault.adapter;
+                const universal2 = require_universal_fs();
+                let sha = "";
+                try {
+                  if (await universal2.adapterExists(adapter, relPath)) {
+                    const c = await universal2.adapterRead(adapter, relPath);
+                    sha = await universal2.sha256Hex(c);
+                  }
+                } catch (e2) {
+                }
+                await this.plugin.ioQueue.enqueue({
+                  path: relPath,
+                  sha,
+                  type: "passport"
+                });
+              } catch (eq) {
+                console.warn("[zeus.autoidx] ioQueue.enqueue failed:", eq.message);
+              }
+            }
             return { skipped: "buildOne-failed", reason: (e.message || String(e)).slice(0, 80) };
           }
         }
@@ -3699,6 +4144,22 @@ var require_auto_indexer = __commonJS({
           nodes: r.communities.size,
           Q: Number(r.modularity.toFixed(4))
         };
+      }
+      // v1.11 Feature I — incremental rebuild do lexical-ios para a nota tocada.
+      // Gating:
+      //   - Só roda se this.plugin.lexicalIos estiver definido (opt-in via wire).
+      //   - lexicalIosAutoBuild controla SE o build inicial rodou — aqui só
+      //     incrementa, que é barato (~10ms).
+      async _runLexicalIos(path2) {
+        const lex = this.plugin.lexicalIos;
+        if (!lex) return { skipped: "no-lexical-ios" };
+        if (typeof lex.incremental !== "function") return { skipped: "no-incremental-api" };
+        try {
+          const r = await lex.incremental(path2);
+          return { updated: r.updated, reason: r.reason };
+        } catch (e) {
+          return { skipped: "incremental-failed", reason: (e.message || String(e)).slice(0, 80) };
+        }
       }
       // ---------------------------------------------------------------------------
       // Boot check — se data files estão stale vs vault, dispara rebuild
@@ -4178,6 +4639,539 @@ var require_leiden = __commonJS({
   }
 });
 
+// lib/io-queue.js
+var require_io_queue = __commonJS({
+  "lib/io-queue.js"(exports2, module2) {
+    "use strict";
+    var universal2 = require_universal_fs();
+    var QUEUE_DIR_NAME = "ios-queue";
+    var VALID_TYPES = /* @__PURE__ */ new Set(["passport", "embed", "spotlight"]);
+    var IoQueue2 = class {
+      /**
+       * @param {*} plugin Zeus plugin instance
+       */
+      constructor(plugin) {
+        this.plugin = plugin;
+      }
+      get _adapter() {
+        return this.plugin.app.vault.adapter;
+      }
+      get queueDir() {
+        return universal2.joinPath(this.plugin.manifest.dir, "data", QUEUE_DIR_NAME);
+      }
+      async _ensureDir() {
+        await universal2.adapterMkdir(this._adapter, universal2.joinPath(this.plugin.manifest.dir, "data"));
+        await universal2.adapterMkdir(this._adapter, this.queueDir);
+      }
+      /**
+       * SHA do payload identitário do task — garante idempotência.
+       * Stringify usa keys ordenadas para evitar variação por ordem de inserção.
+       * @param {{path:string, sha:string, type:string}} task
+       * @returns {Promise<string>} hex short (16 chars) — colisão prática ~zero
+       */
+      async _taskSha(task) {
+        const canonical = JSON.stringify({
+          path: task.path || "",
+          sha: task.sha || "",
+          type: task.type || ""
+        });
+        const hex = await universal2.sha256Hex(canonical);
+        return hex.slice(0, 16);
+      }
+      async _taskFilePath(task) {
+        const sha = await this._taskSha(task);
+        return universal2.joinPath(this.queueDir, sha + ".json");
+      }
+      /**
+       * Enfileira um task. Idempotente: mesmo (path, sha, type) → mesmo file.
+       *
+       * @param {{path:string, sha:string, type:string, payload?:object}} task
+       * @returns {Promise<{enqueued: boolean, taskSha: string, file: string, reason?: string}>}
+       */
+      async enqueue(task) {
+        if (!task || typeof task !== "object") {
+          return { enqueued: false, reason: "task inv\xE1lido" };
+        }
+        if (!task.path || typeof task.path !== "string") {
+          return { enqueued: false, reason: "path ausente" };
+        }
+        if (!task.type || !VALID_TYPES.has(task.type)) {
+          return { enqueued: false, reason: `type inv\xE1lido (esperado: ${[...VALID_TYPES].join("|")})` };
+        }
+        if (!task.sha) {
+          task.sha = "";
+        }
+        await this._ensureDir();
+        const taskSha = await this._taskSha(task);
+        const file = universal2.joinPath(this.queueDir, taskSha + ".json");
+        const deviceId = this.plugin.coordinator && this.plugin.coordinator.deviceId || "unknown";
+        const fullTask = {
+          path: task.path,
+          sha: task.sha,
+          type: task.type,
+          payload: task.payload || null,
+          enqueued_at: task.enqueued_at || (/* @__PURE__ */ new Date()).toISOString(),
+          enqueued_by: task.enqueued_by || deviceId,
+          task_sha: taskSha
+        };
+        await universal2.adapterWriteAtomic(this._adapter, file, JSON.stringify(fullTask));
+        return { enqueued: true, taskSha, file };
+      }
+      /**
+       * Lista todos os tasks pendentes na fila.
+       * @returns {Promise<Array<object>>}
+       */
+      async list() {
+        await this._ensureDir();
+        const listing = await universal2.adapterList(this._adapter, this.queueDir);
+        const entries = listing && listing.files || [];
+        const out = [];
+        for (const f of entries) {
+          if (!f.endsWith(".json")) continue;
+          try {
+            const raw = await universal2.adapterRead(this._adapter, f);
+            const task = JSON.parse(raw);
+            task._file = f;
+            out.push(task);
+          } catch (e) {
+            console.warn("[zeus][io-queue] skip malformed task:", f, e.message);
+          }
+        }
+        return out;
+      }
+      /**
+       * Consome UM task: claim via DistributedCoordinator → processor(task) →
+       * delete file em sucesso.
+       *
+       * Idempotente:
+       *   - Se task já foi processada (output existe), apenas deleta o file.
+       *     Caller (processor) é responsável por sinalizar isso via `{ alreadyDone: true }`.
+       *   - Se claim falha (outro device pegou), pula e retorna `{ consumed: false, reason }`.
+       *   - Em erro do processor, file fica na fila para retry.
+       *
+       * @param {object} task
+       * @param {(task) => Promise<{ok: boolean, alreadyDone?: boolean, error?: string}>} processor
+       * @returns {Promise<{consumed: boolean, reason?: string, result?: any}>}
+       */
+      async consume(task, processor) {
+        if (!task || !task.path) {
+          return { consumed: false, reason: "task inv\xE1lido" };
+        }
+        if (typeof processor !== "function") {
+          return { consumed: false, reason: "processor n\xE3o \xE9 fun\xE7\xE3o" };
+        }
+        const coord = this.plugin.coordinator;
+        let claimed = false;
+        if (coord) {
+          try {
+            const claim = await coord.claim(task.path);
+            if (!claim.claimed) {
+              return { consumed: false, reason: `claim held by ${claim.current_holder}` };
+            }
+            claimed = true;
+          } catch (e) {
+            console.warn("[zeus][io-queue] claim failed:", e.message);
+          }
+        }
+        let result;
+        try {
+          result = await processor(task);
+        } catch (e) {
+          result = { ok: false, error: e.message || String(e) };
+        } finally {
+          if (claimed && coord) {
+            try {
+              await coord.release(task.path);
+            } catch (e) {
+            }
+          }
+        }
+        if (result && (result.ok || result.alreadyDone)) {
+          const file = task._file || await this._taskFilePath(task);
+          try {
+            await universal2.adapterRemove(this._adapter, file);
+          } catch (e) {
+            console.warn("[zeus][io-queue] remove task file failed:", file, e.message);
+          }
+          return { consumed: true, result };
+        }
+        return { consumed: false, reason: result && result.error || "processor n\xE3o-OK", result };
+      }
+      /**
+       * Conta tasks pendentes.
+       * @returns {Promise<number>}
+       */
+      async size() {
+        await this._ensureDir();
+        const listing = await universal2.adapterList(this._adapter, this.queueDir);
+        const entries = listing && listing.files || [];
+        return entries.filter((f) => f.endsWith(".json")).length;
+      }
+      /**
+       * Status agregado: total + breakdown por type.
+       * @returns {Promise<{total:number, byType:object, oldest:string|null}>}
+       */
+      async status() {
+        const tasks = await this.list();
+        const byType = {};
+        let oldest = null;
+        for (const t of tasks) {
+          const ty = t.type || "unknown";
+          byType[ty] = (byType[ty] || 0) + 1;
+          if (t.enqueued_at && (!oldest || t.enqueued_at < oldest)) {
+            oldest = t.enqueued_at;
+          }
+        }
+        return { total: tasks.length, byType, oldest };
+      }
+    };
+    module2.exports = IoQueue2;
+  }
+});
+
+// lib/lexical-ios.js
+var require_lexical_ios = __commonJS({
+  "lib/lexical-ios.js"(exports2, module2) {
+    "use strict";
+    var universal2 = require_universal_fs();
+    var bm25Lib = require_bm25();
+    var FILE_NAME = "lexical-ios.jsonl";
+    var DATA_DIR_NAME2 = "data";
+    var SCHEMA_VERSION = "lexical-ios-v1";
+    var K1 = 1.5;
+    var B = 0.75;
+    var PT_SUFFIXES = [
+      // Adjetivos/advérbios
+      /(?:mente)$/,
+      // rapidamente → rapida
+      /(?:idade|edade)$/,
+      // universidade → univers
+      /(?:vel|vel)$/,
+      // amável → amá
+      /(?:ável|ível|ável)$/,
+      // readável → read
+      // Substantivos
+      /(?:ção|cao|ções|coes)$/,
+      // ação → a
+      /(?:são|sao|sões|soes)$/,
+      // visão → vi
+      // Verbos infinitivos
+      /(?:ar|er|ir)$/,
+      // estudar → estud
+      // Particípios
+      /(?:ado|ido|ada|ida)$/,
+      // estudado → estud
+      // Diminutivo (heurístico — pode over-stem; deixar last)
+      /(?:inho|inha|inhos|inhas)$/,
+      // Plural simples (mantido last)
+      /(?:s)$/
+    ];
+    function normalizeAndStem(token) {
+      if (!token || typeof token !== "string") return null;
+      let t = token.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+      if (t.length < 2) return null;
+      if (t.length >= 4) {
+        t = t.replace(/coes$/, "cao");
+        t = t.replace(/soes$/, "sao");
+        t = t.replace(/oes$/, "ao");
+        t = t.replace(/aes$/, "ae");
+      }
+      for (const re of PT_SUFFIXES) {
+        const stripped = t.replace(re, "");
+        if (stripped.length >= 3 && stripped.length < t.length) {
+          t = stripped;
+          break;
+        }
+      }
+      if (t.length < 2) return null;
+      return t;
+    }
+    function tokenizeAndStem(text) {
+      const raw = bm25Lib.tokenize(text);
+      const out = [];
+      for (const t of raw) {
+        const norm = normalizeAndStem(t);
+        if (norm) out.push(norm);
+      }
+      return out;
+    }
+    function buildTokenArray(tokens) {
+      const counts = /* @__PURE__ */ new Map();
+      for (const t of tokens) counts.set(t, (counts.get(t) || 0) + 1);
+      const arr = Array.from(counts.entries()).map(([token, tf]) => ({ token, tf }));
+      arr.sort((a, b) => b.tf - a.tf);
+      return arr.slice(0, 200);
+    }
+    var LexicalIosIndex2 = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+        this._docs = /* @__PURE__ */ new Map();
+        this._header = null;
+        this._writePromise = null;
+        this._loaded = false;
+      }
+      get _adapter() {
+        return this.plugin.app.vault.adapter;
+      }
+      get dataPath() {
+        return universal2.joinPath(this.plugin.manifest.dir, DATA_DIR_NAME2);
+      }
+      get jsonlPath() {
+        return universal2.joinPath(this.dataPath, FILE_NAME);
+      }
+      async _ensureDir() {
+        await universal2.adapterMkdir(this._adapter, this.dataPath);
+      }
+      /**
+       * Carrega o índice do disco para memória (lazy — só na primeira chamada).
+       */
+      async _load() {
+        if (this._loaded) return;
+        this._docs = /* @__PURE__ */ new Map();
+        this._header = null;
+        if (!await universal2.adapterExists(this._adapter, this.jsonlPath)) {
+          this._loaded = true;
+          return;
+        }
+        try {
+          const raw = await universal2.adapterRead(this._adapter, this.jsonlPath);
+          const lines = raw.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            const ln = lines[i].trim();
+            if (!ln) continue;
+            try {
+              const obj = JSON.parse(ln);
+              if (i === 0 && obj.schema === SCHEMA_VERSION) {
+                this._header = obj;
+              } else if (obj.path) {
+                this._docs.set(obj.path, obj);
+              }
+            } catch (e) {
+              console.warn("[zeus][lexical-ios] skip bad line", i, e.message);
+            }
+          }
+        } catch (e) {
+          console.warn("[zeus][lexical-ios] load failed:", e.message);
+        }
+        this._loaded = true;
+      }
+      /**
+       * Persiste o índice in-memory para disco (header + 1 linha por doc).
+       */
+      async _persist() {
+        if (this._writePromise) await this._writePromise.catch(() => {
+        });
+        this._writePromise = (async () => {
+          try {
+            await this._ensureDir();
+            const lines = [];
+            if (this._header) lines.push(JSON.stringify(this._header));
+            for (const doc of this._docs.values()) {
+              lines.push(JSON.stringify(doc));
+            }
+            await universal2.adapterWriteAtomic(this._adapter, this.jsonlPath, lines.join("\n"));
+          } finally {
+            this._writePromise = null;
+          }
+        })();
+        return this._writePromise;
+      }
+      /**
+       * Build full index: itera todas notas .md, tokeniza+stem, recomputa header
+       * (N, avgdl, IDF global).
+       *
+       * @param {(msg:string, pct?:number) => void} onProgress
+       * @returns {Promise<{N:number, vocab:number, elapsedMs:number}>}
+       */
+      async build(onProgress = () => {
+      }) {
+        const start = Date.now();
+        await this._load();
+        onProgress("enumerando notas\u2026", 0);
+        let notes = [];
+        if (this.plugin.app && this.plugin.app.vault && this.plugin.app.vault.getMarkdownFiles) {
+          notes = this.plugin.app.vault.getMarkdownFiles().map((f) => f.path);
+        } else {
+          const all = await universal2.adapterWalk(this._adapter, "");
+          notes = all.filter((p) => p.endsWith(".md"));
+        }
+        onProgress(`tokenizando ${notes.length} notas\u2026`, 5);
+        this._docs = /* @__PURE__ */ new Map();
+        let totalLen = 0;
+        const df = /* @__PURE__ */ new Map();
+        for (let i = 0; i < notes.length; i++) {
+          const path2 = notes[i];
+          if (i % 100 === 0) {
+            onProgress(`tokenize ${i}/${notes.length}`, Math.round(5 + 90 * i / notes.length));
+          }
+          let content = "";
+          try {
+            content = await universal2.adapterRead(this._adapter, path2);
+          } catch (e) {
+            console.warn("[zeus][lexical-ios] read fail", path2, e.message);
+            continue;
+          }
+          const tokens = tokenizeAndStem(content);
+          if (tokens.length === 0) continue;
+          const tokArr = buildTokenArray(tokens);
+          const sha = await universal2.sha256Hex(content);
+          this._docs.set(path2, { path: path2, sha, tokens: tokArr, dl: tokens.length });
+          totalLen += tokens.length;
+          const seen = /* @__PURE__ */ new Set();
+          for (const t of tokens) seen.add(t);
+          for (const t of seen) df.set(t, (df.get(t) || 0) + 1);
+        }
+        const N = this._docs.size;
+        const avgdl = N > 0 ? totalLen / N : 0;
+        const idf = {};
+        for (const [token, freq] of df.entries()) {
+          idf[token] = Math.log(1 + (N - freq + 0.5) / (freq + 0.5));
+        }
+        this._header = {
+          schema: SCHEMA_VERSION,
+          N,
+          avgdl,
+          idf,
+          last_built: (/* @__PURE__ */ new Date()).toISOString()
+        };
+        onProgress("persistindo\u2026", 95);
+        await this._persist();
+        const elapsed = Date.now() - start;
+        onProgress(`done \u2014 ${N} notas, ${Object.keys(idf).length} tokens \xFAnicos (${elapsed}ms)`, 100);
+        return { N, vocab: Object.keys(idf).length, elapsedMs: elapsed };
+      }
+      /**
+       * Search BM25 sobre o índice persistido.
+       *
+       * @param {string} query
+       * @param {number} [topN=30]
+       * @returns {Promise<Array<{path:string, score:number, matched_tokens:string[]}>>}
+       */
+      async search(query, topN = 30) {
+        await this._load();
+        if (!this._header || this._docs.size === 0) return [];
+        if (!query || typeof query !== "string" || !query.trim()) return [];
+        const qTokens = tokenizeAndStem(query);
+        if (qTokens.length === 0) return [];
+        const qSet = new Set(qTokens);
+        const avgdl = this._header.avgdl || 0;
+        const idfMap = this._header.idf || {};
+        const results = [];
+        for (const doc of this._docs.values()) {
+          const tfMap = /* @__PURE__ */ new Map();
+          for (const { token, tf } of doc.tokens || []) {
+            if (qSet.has(token)) tfMap.set(token, tf);
+          }
+          if (tfMap.size === 0) continue;
+          let score = 0;
+          const matched = [];
+          for (const qt of qSet) {
+            const freq = tfMap.get(qt) || 0;
+            if (freq === 0) continue;
+            const idf = idfMap[qt] || 0;
+            if (idf === 0) continue;
+            const dl = doc.dl || 0;
+            const denom = avgdl > 0 ? freq + K1 * (1 - B + B * dl / avgdl) : freq;
+            score += idf * (freq * (K1 + 1)) / denom;
+            matched.push(qt);
+          }
+          if (score > 0) {
+            results.push({ path: doc.path, score, matched_tokens: matched });
+          }
+        }
+        results.sort((a, b) => b.score - a.score);
+        return results.slice(0, topN);
+      }
+      /**
+       * Atualização incremental: re-tokeniza UMA nota, atualiza posting list e
+       * recalcula df (delta) + persiste.
+       *
+       * NOTA: recalcular IDF global a cada incremental é caro (O(vocab)). Em vez,
+       * marcamos o header como "stale-incremental" e o consumer pode chamar
+       * recomputeIdf() em background. Para queries-críticas, prefere rebuild.
+       *
+       * @param {string} path
+       * @param {string|null} sha (opcional — se ausente, recomputa)
+       * @returns {Promise<{updated:boolean, reason?:string}>}
+       */
+      async incremental(path2, sha = null) {
+        await this._load();
+        if (!path2 || !path2.endsWith(".md")) return { updated: false, reason: "not-md" };
+        let content;
+        try {
+          content = await universal2.adapterRead(this._adapter, path2);
+        } catch (e) {
+          if (this._docs.has(path2)) {
+            this._docs.delete(path2);
+            await this._persist();
+            return { updated: true, reason: "deleted" };
+          }
+          return { updated: false, reason: e.message };
+        }
+        const currentSha = sha || await universal2.sha256Hex(content);
+        const existing = this._docs.get(path2);
+        if (existing && existing.sha === currentSha) {
+          return { updated: false, reason: "sha unchanged" };
+        }
+        const tokens = tokenizeAndStem(content);
+        const tokArr = buildTokenArray(tokens);
+        this._docs.set(path2, { path: path2, sha: currentSha, tokens: tokArr, dl: tokens.length });
+        this._recomputeHeader();
+        await this._persist();
+        return { updated: true };
+      }
+      // v1.11.1 codex MED #6: _recomputeHeader varre _docs e refaz idf/avgdl/N
+      // do zero. Garante consistência sem necessitar build() periódico. O(D × T_avg)
+      // mas em vault típico (~1k notas, ~200 tokens cada) é <50ms.
+      _recomputeHeader() {
+        const N = this._docs.size;
+        if (N === 0) {
+          this._header = { schema: "lexical-ios-v1", N: 0, avgdl: 0, idf: {}, last_built: (/* @__PURE__ */ new Date()).toISOString() };
+          return;
+        }
+        let totalLen = 0;
+        const df = /* @__PURE__ */ new Map();
+        for (const doc of this._docs.values()) {
+          totalLen += doc.dl || 0;
+          const seen = /* @__PURE__ */ new Set();
+          for (const [token] of doc.tokens || []) {
+            if (seen.has(token)) continue;
+            seen.add(token);
+            df.set(token, (df.get(token) || 0) + 1);
+          }
+        }
+        const idf = {};
+        for (const [t, dfCount] of df) {
+          idf[t] = Math.log(1 + (N - dfCount + 0.5) / (dfCount + 0.5));
+        }
+        this._header = {
+          schema: "lexical-ios-v1",
+          N,
+          avgdl: totalLen / N,
+          idf,
+          last_built: (/* @__PURE__ */ new Date()).toISOString()
+        };
+      }
+      /**
+       * Stats agregados: N, avgdl, vocab, last_built.
+       * @returns {Promise<{N:number, avgdl:number, vocab_size:number, last_built:string|null}>}
+       */
+      async stats() {
+        await this._load();
+        return {
+          N: this._docs.size,
+          avgdl: this._header ? this._header.avgdl : 0,
+          vocab_size: this._header && this._header.idf ? Object.keys(this._header.idf).length : 0,
+          last_built: this._header ? this._header.last_built : null
+        };
+      }
+    };
+    module2.exports = LexicalIosIndex2;
+    module2.exports._tokenizeAndStem = tokenizeAndStem;
+    module2.exports._normalizeAndStem = normalizeAndStem;
+  }
+});
+
 // main.source.js
 function _zeusFindPluginDir() {
   let fs0, path0;
@@ -4294,6 +5288,8 @@ var NativeWatcher = require_native_watcher();
 var MultiplexGraph = require_multiplex_graph();
 var AutoIndexer = require_auto_indexer();
 var LeidenCommunities = require_leiden();
+var IoQueue = require_io_queue();
+var LexicalIosIndex = require_lexical_ios();
 var VIEW_TYPE_SMART = "zeus-smart-view";
 var VIEW_TYPE_STATUS = "zeus-status-view";
 var DATA_DIR_NAME = "data";
@@ -4411,6 +5407,11 @@ var DEFAULT_SETTINGS = {
   hybridBm25Enabled: true,
   multiplexAutoBuild: false,
   // se ON, build inicial roda no onload em background
+  // v1.11 Feature I — lexical-ios (BM25 persistido com stems pt-BR). Default OFF
+  // porque vault grande pode levar 8-12s no iPad. Comando manual "Zeus: rebuild
+  // lexical-ios index" disponível pra trigger inicial. Incrementals rodam
+  // automaticamente via AutoIndexer ~30s após cada modify.
+  lexicalIosAutoBuild: false,
   // v1.10 — AutoIndexer: indexação automática nativa Apple (FSEvents Mac /
   // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
   // multiplex/leiden) com debounce + cooldown.
@@ -6553,14 +7554,20 @@ var ZeusPlugin = class extends Plugin {
       this.imageSimilarity = new ImageSimilaritySearch(this);
       this.passport = new PassportIndex(this);
       this.basesGen = new BasesGenerator(this);
-      this.autoIndexer = new AutoIndexer(this);
-      if (this.settings.autoIndexEnabled !== false) {
-        try {
-          const ai = this.autoIndexer.start();
-          console.log("[zeus] auto-indexer:", ai);
-        } catch (e) {
-          console.warn("[zeus] auto-indexer start failed:", e.message);
-        }
+      this.ioQueue = new IoQueue(this);
+      this.lexicalIos = new LexicalIosIndex(this);
+      if (this.settings.lexicalIosAutoBuild) {
+        setTimeout(async () => {
+          try {
+            console.log("[zeus.lexical-ios] auto-build starting\u2026");
+            const r = await this.lexicalIos.build((msg, pct) => {
+              if (pct % 25 === 0) console.log(`[zeus.lexical-ios] ${pct}%`, msg);
+            });
+            console.log("[zeus.lexical-ios] auto-build done:", r);
+          } catch (e) {
+            console.warn("[zeus.lexical-ios] auto-build failed:", e.message);
+          }
+        }, 8e3);
       }
       this.coordinator = new DistributedCoordinator(this, {
         deviceId: this.settings.deviceId || void 0,
@@ -6586,6 +7593,15 @@ var ZeusPlugin = class extends Plugin {
       }
       this.settings.deviceId = _localDeviceId;
       this.coordinator.deviceId = _localDeviceId;
+      this.autoIndexer = new AutoIndexer(this);
+      if (this.settings.autoIndexEnabled !== false) {
+        try {
+          const ai = this.autoIndexer.start();
+          console.log("[zeus] auto-indexer:", ai);
+        } catch (e) {
+          console.warn("[zeus] auto-indexer start failed:", e.message);
+        }
+      }
       if (_localDeviceId) {
       }
       this.scheduler = new PassportScheduler(this, {
@@ -6593,6 +7609,43 @@ var ZeusPlugin = class extends Plugin {
       });
       if (this.settings.schedulerEnabled) {
         this.scheduler.start();
+      }
+      if (isMac() && this.ioQueue) {
+        const consumeAllPending = async () => {
+          try {
+            const tasks = await this.ioQueue.list();
+            if (tasks.length === 0) return;
+            console.log("[zeus.io-queue] consumindo", tasks.length, "tasks pendentes");
+            for (const task of tasks) {
+              await this.ioQueue.consume(task, async (t) => {
+                if (t.type === "passport") {
+                  if (!this.passport || typeof this.passport.buildOne !== "function") {
+                    return { ok: false, error: "passport API indispon\xEDvel" };
+                  }
+                  let absPath = t.path;
+                  if (t.path && !t.path.startsWith("/") && this.vaultRoot) {
+                    absPath = this.vaultRoot.replace(/\/$/, "") + "/" + t.path;
+                  }
+                  try {
+                    const existing = await this.passport.getPassport(t.path);
+                    if (existing && existing.sha === t.sha && existing.source !== "ios-local") {
+                      return { ok: true, alreadyDone: true };
+                    }
+                    await this.passport.buildOne(absPath, []);
+                    return { ok: true };
+                  } catch (e) {
+                    return { ok: false, error: e.message };
+                  }
+                }
+                return { ok: true, alreadyDone: true };
+              });
+            }
+          } catch (e) {
+            console.warn("[zeus.io-queue] consume loop failed:", e.message);
+          }
+        };
+        setTimeout(consumeAllPending, 2e4);
+        this._ioQueueIntervalId = setInterval(consumeAllPending, 15 * 60 * 1e3);
       }
       if (this.settings.multiplexAutoBuild) {
         setTimeout(async () => {
@@ -7916,6 +8969,148 @@ breakdown: ${s.sizeBreakdown || "(vazio)"}`,
           }
         }
       });
+      this.addCommand({
+        id: "zeus-io-queue-consume",
+        name: "Zeus: consumir fila iOS (Mac side)",
+        callback: async () => {
+          if (!this.ioQueue) {
+            new Notice("Zeus: io-queue indispon\xEDvel");
+            return;
+          }
+          if (!isMac()) {
+            new Notice("Zeus: io-queue consume s\xF3 roda no Mac");
+            return;
+          }
+          const n = new Notice("Zeus: consumindo fila iOS\u2026", 0);
+          try {
+            const tasks = await this.ioQueue.list();
+            if (tasks.length === 0) {
+              n.hide();
+              new Notice("Zeus: fila vazia \u2014 nada a consumir");
+              return;
+            }
+            let consumed = 0, failed = 0;
+            for (const task of tasks) {
+              const r = await this.ioQueue.consume(task, async (t) => {
+                if (t.type !== "passport") return { ok: true, alreadyDone: true };
+                if (!this.passport || typeof this.passport.buildOne !== "function") {
+                  return { ok: false, error: "passport API indispon\xEDvel" };
+                }
+                let absPath = t.path;
+                if (t.path && !t.path.startsWith("/") && this.vaultRoot) {
+                  absPath = this.vaultRoot.replace(/\/$/, "") + "/" + t.path;
+                }
+                try {
+                  const existing = await this.passport.getPassport(t.path);
+                  if (existing && existing.sha === t.sha && existing.source !== "ios-local") {
+                    return { ok: true, alreadyDone: true };
+                  }
+                  await this.passport.buildOne(absPath, []);
+                  return { ok: true };
+                } catch (e) {
+                  return { ok: false, error: e.message };
+                }
+              });
+              if (r.consumed) consumed++;
+              else failed++;
+            }
+            n.hide();
+            new Notice(`Zeus: ${consumed} consumidos, ${failed} falhas (de ${tasks.length})`);
+          } catch (e) {
+            n.hide();
+            new Notice("Zeus consume falhou: " + e.message.slice(0, 200));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-io-queue-status",
+        name: "Zeus: status fila iOS",
+        callback: async () => {
+          if (!this.ioQueue) {
+            new Notice("Zeus: io-queue indispon\xEDvel");
+            return;
+          }
+          try {
+            const s = await this.ioQueue.status();
+            const breakdown = Object.entries(s.byType).map(([t, n]) => `${t}=${n}`).join(" ");
+            const oldest = s.oldest ? ` \xB7 oldest ${s.oldest}` : "";
+            new Notice(`Zeus fila: ${s.total} tasks (${breakdown || "nenhum"})${oldest}`, 8e3);
+            console.log("[zeus] io-queue status:", s);
+          } catch (e) {
+            new Notice("Zeus fila-status falhou: " + e.message.slice(0, 150));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-lexical-ios-rebuild",
+        name: "Zeus: rebuild lexical-ios index",
+        callback: async () => {
+          if (!this.lexicalIos) {
+            new Notice("Zeus: lexical-ios indispon\xEDvel");
+            return;
+          }
+          const n = new Notice("Zeus lexical-ios: build\u2026", 0);
+          try {
+            const r = await this.lexicalIos.build((msg) => n.setMessage("Zeus lexical-ios: " + msg));
+            n.hide();
+            new Notice(`Zeus lexical-ios: ${r.N} notas, ${r.vocab} tokens (${r.elapsedMs}ms)`);
+          } catch (e) {
+            n.hide();
+            new Notice("Zeus lexical-ios build falhou: " + e.message.slice(0, 200));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-lexical-ios-search",
+        name: "Zeus: busca lexical-ios",
+        callback: async () => {
+          const q = await this._zeusPromptText("Lexical-ios search:");
+          if (!q || !q.trim()) return;
+          if (!this.lexicalIos) {
+            new Notice("Zeus: lexical-ios indispon\xEDvel");
+            return;
+          }
+          const n = new Notice("Zeus lexical-ios: buscando\u2026", 0);
+          try {
+            const hits = await this.lexicalIos.search(q, 20);
+            n.hide();
+            if (!hits || hits.length === 0) {
+              new Notice("Zeus lexical-ios: nenhum resultado (rode rebuild primeiro?)");
+              return;
+            }
+            const top3 = hits.slice(0, 3).map(
+              (h) => `${h.path} (score ${h.score.toFixed(2)}, ${h.matched_tokens.length} match)`
+            ).join("\n");
+            new Notice(`Zeus lexical-ios: ${hits.length} hits
+${top3}`, 12e3);
+            console.log("[zeus] lexical-ios hits:", hits);
+          } catch (e) {
+            n.hide();
+            new Notice("Zeus lexical-ios search falhou: " + e.message.slice(0, 200));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-lexical-ios-stats",
+        name: "Zeus: status lexical-ios index",
+        callback: async () => {
+          if (!this.lexicalIos) {
+            new Notice("Zeus: lexical-ios indispon\xEDvel");
+            return;
+          }
+          try {
+            const s = await this.lexicalIos.stats();
+            new Notice(
+              `Zeus lexical-ios: N=${s.N} \xB7 vocab=${s.vocab_size} \xB7 avgdl=${s.avgdl.toFixed(0)}
+last_built: ${s.last_built || "never"}`,
+              1e4
+            );
+            console.log("[zeus] lexical-ios stats:", s);
+          } catch (e) {
+            new Notice("Zeus lexical-ios stats falhou: " + e.message.slice(0, 150));
+          }
+        }
+      });
       console.log(`[zeus] loaded v${this.manifest.version} \u2014 Apple-native search & connections`);
       trace("onload.complete");
       writeTrace(null);
@@ -7960,6 +9155,13 @@ breakdown: ${s.sizeBreakdown || "(vazio)"}`,
       } catch (e) {
         console.warn("[zeus] daemon lifecycle stop:", e.message);
       }
+    }
+    if (this._ioQueueIntervalId) {
+      try {
+        clearInterval(this._ioQueueIntervalId);
+      } catch (e) {
+      }
+      this._ioQueueIntervalId = null;
     }
   }
   loadIndices() {

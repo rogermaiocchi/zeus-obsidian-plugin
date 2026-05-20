@@ -4,6 +4,114 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.13.2] — 2026-05-20 — Codex deferred #5 RESOLVED: Swift 6 strict concurrency
+
+User pediu "resolva com codex cli: 1 deferred com tracking". Codex deep audit anterior deferred Swift 6 strict concurrency em 6 sites de Spotlight handlers. Debate profundo aprovou **opção A+** (Sendable Box com NSLock).
+
+### Implementação Sendable Box pattern
+
+`fileprivate final class @unchecked Sendable` boxes em ambos arquivos Swift:
+
+```swift
+fileprivate final class SpotlightErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _error: Error?
+    func setError(_ e: Error?) { lock.lock(); defer { lock.unlock() }; _error = e }
+    func getError() -> Error? { lock.lock(); defer { lock.unlock() }; return _error }
+}
+
+fileprivate final class SpotlightItemsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _items: [[String: Any]] = []
+    func append/count/snapshot...
+}
+```
+
+### 6 sites refatorados
+
+`AegisHTTPHandlers.swift` (iOS): handleSpotlightIndex / QueryNative / Purge.
+`ZeusMacHTTPHandler.swift` (Mac): mesmos 3 handlers.
+
+Padrão antigo:
+```swift
+let sem = DispatchSemaphore(value: 0)
+var indexError: Error?           // ← Swift 6 strict warning
+api.something { err in
+    indexError = err              // ← captured var mutation
+    sem.signal()
+}
+if let e = indexError { ... }
+```
+
+Padrão novo (Swift 6 safe):
+```swift
+let sem = DispatchSemaphore(value: 0)
+let errBox = SpotlightErrorBox()  // ← @unchecked Sendable + NSLock
+api.something { err in
+    errBox.setError(err)          // ← thread-safe access
+    sem.signal()
+}
+if let e = errBox.getError() { ... }
+```
+
+### Decisão A+ vs alternativas (codex debate)
+
+- **B (withCheckedContinuation cascade)**: exigiria tornar route()/handleRequest() async — Approachable Concurrency vision do Swift desencoraja essa propagação transitiva
+- **F (nonisolated(unsafe))**: Swift 5.10 only; daemon hoje Swift 5.9
+- **D (actor wrapper)**: mesmo problema async cascade
+- **A+ (Sendable Box + NSLock)**: refactor mínimo, mantém Response síncrono, **elimina race no timeout edge case** (callback chega após semaphore.wait expira — sem lock, handler já leu var stale)
+
+### Validation
+
+- `swift build -c release --product ZeusDaemonMac` → **Build complete (10.89s)** · bin/ZeusDaemonMac 7.0 MB
+- `swift build -c debug --target AegisDaemon` → **Build complete (3.87s)** iOS library
+- Apenas warnings legacy `CSSearchQuery(queryString:attributes:)` (esperados, sem mudança comportamental)
+- main.js bundle 395 KB
+- Doctor 9/9 OK · Smoke 9/9
+- Sem regressão Spotlight endpoints (LIVE 40 endpoints, index/query/purge OK)
+
+### Fontes (codex web search confirmou)
+
+- [Swift 5.10 release notes](https://www.swift.org/blog/swift-5.10-released/) — data-race safety + `@unchecked Sendable` opt-out canonical
+- [Approachable Concurrency Vision](https://github.com/swiftlang/swift-evolution/blob/main/visions/approachable-concurrency.md) — async cascade tax recognized
+- Pattern `@unchecked Sendable + lock` é padrão para sync bridges sobre API callback async (CSSearchableIndex.indexSearchableItems é exatamente essa categoria)
+
+### Tracking deferred ZERADO
+
+Codex deep audit (c2e96c0): 13 achados.
+- v1.13.1: aplicou 12 (4 HIGH + 6 MED + 2 LOW)
+- v1.13.2: fecha o último deferred #5
+
+**0 pendência codex em todo o stack v1.5 → v1.13.2.**
+
+---
+
+## [1.13.1] — 2026-05-20 — Codex deep audit fixes (4 HIGH + 6 MED + 2 LOW · 0% pendência)
+
+Auditoria completa do stack v1.5→v1.13 via codex CLI achou 13 issues. Aplicados 12; #5 (Swift 6 strict concurrency) deferred com tracking → resolvido em v1.13.2.
+
+**HIGH**:
+- #1 `lib/auto-indexer.js:362` — `leiden.persist()` sem `r` arg, communities.jsonl ficava stale. Fix: `persist(r)`.
+- #2 `lib/lexical-ios.js:399` — destructure `[token]` em array de `{token, tf}` objects → not iterable runtime crash. Fix: `{ token } = entry`.
+- #3 `main.source.js:4594` — onunload limpava `_passportRefreshTimers` (inexistente) ignorando _embedTimers/_audioTimers/_passportTimers/_graphSyncTimers reais. Fix: loop 5 maps + 4 timers standalone.
+- #4 `lib/io-queue.js` — privacy gate Clientes/** era só comentário. Fix: static `IoQueue.isPrivatePath()` + guard hard-enforced em enqueue.
+
+**MED**:
+- #6 AegisHTTPHandlers.swift — endpoints `/v1/mobileclip/*` não routavam → adicionado handleUnsupportedEndpoint stubs + GET status.
+- #7 `main.source.js` — `zeus-reindex` + `zeus-enrich-current` sem try/catch deixavam Notice preso. Fix: try/catch/finally.
+- #8 ZeusSearchModal — sem querySeq monotonic permitia stale autocomplete. Fix: seq counter.
+- #9 `build-release.mjs` — só imprimia "Para validar". Agora roda smoke por default (opt-out `--no-smoke`).
+- #10 `zeus-doctor.mjs` — sem cobertura Aegis target / bundle freshness. Fix: 7→9 layers.
+- #11 AegisHTTPHandlers.swift `deriveSpotlightDomain` — fallback default permitia colisão cross-vault. Fix: retorna nil → handler 400 com mensagem clara.
+
+**LOW**:
+- #12 docs "5-way" → "7-way" em manifest + hybrid-search.js (7 retrievers reais: semantic+path+graph+passport+spotlight+bm25+lexicalIos).
+- #13 ADR-009 stale — mantido como histórico.
+
+Validation: Daemon Swift rebuilt 7.0 MB · main.js 395 KB · Doctor 9/9 (era 7/7) · Smoke 9/9 · Empirical io-queue privacy + lexical-ios IDF OK.
+
+---
+
 ## [1.13.0] — 2026-05-20 — iOS CoreSpotlight via AegisDaemon (gap ❌ skip RESOLVIDO)
 
 User pediu "Resolva ❌ skip (sem Swift bridge)" — último gap iOS. Solução: **adicionar 3 handlers Spotlight no AegisDaemon iOS library** (já existente em `daemon/Sources/AegisDaemon/` desde v1.4.0). Quando app host iOS (Capivara OR MetassistemaApp-iOS) embarca AegisDaemon, plugin Capacitor chama loopback `127.0.0.1:2223/v1/spotlight/{index,query,purge}` exatamente como no Mac.

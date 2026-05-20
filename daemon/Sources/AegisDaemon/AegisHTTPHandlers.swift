@@ -49,6 +49,31 @@ import CoreSpotlight
 // Referência: docs/superpowers/specs/2026-05-14-aegis-device-intelligence-design.md
 // §Subsistemas futuros — Subsistema B (AegisFoundation).
 
+// v1.13.2 — Swift 6 strict concurrency safety boxes (codex audit deferred #5
+// resolved). Sync bridges sobre callback async Spotlight; acesso travado por
+// NSLock pra eliminar race no canto de timeout (callback chega após
+// semaphore.wait timeout → handler já leu Box).
+fileprivate final class SpotlightErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _error: Error?
+    func setError(_ e: Error?) { lock.lock(); defer { lock.unlock() }; _error = e }
+    func getError() -> Error? { lock.lock(); defer { lock.unlock() }; return _error }
+}
+
+fileprivate final class SpotlightItemsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _items: [[String: Any]] = []
+    func append(_ entries: [[String: Any]]) {
+        lock.lock(); defer { lock.unlock() }
+        _items.append(contentsOf: entries)
+    }
+    func count() -> Int { lock.lock(); defer { lock.unlock() }; return _items.count }
+    func snapshot() -> [[String: Any]] {
+        lock.lock(); defer { lock.unlock() }
+        return _items
+    }
+}
+
 final class AegisHTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
@@ -2260,9 +2285,11 @@ final class AegisHTTPHandler: ChannelInboundHandler {
 
         let index = CSSearchableIndex(name: domainHint)
         let sem = DispatchSemaphore(value: 0)
-        var indexError: Error?
+        // codex Swift 6 #5: Sendable Box ao invés de captured var (compatível
+        // com strict concurrency; lock garante happens-before contra timeout race).
+        let errBox = SpotlightErrorBox()
         index.indexSearchableItems(searchableItems) { err in
-            indexError = err
+            errBox.setError(err)
             sem.signal()
         }
         let waitResult = sem.wait(timeout: .now() + .seconds(30))
@@ -2274,7 +2301,7 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 "items_attempted": searchableItems.count
             ])
         }
-        if let e = indexError {
+        if let e = errBox.getError() {
             return Response(status: .internalServerError, payload: [
                 "error": "indexSearchableItems falhou: \(e)",
                 "domain": domainHint,
@@ -2316,10 +2343,15 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             "title", "contentDescription", "keywords", "identifier"
         ])
 
-        var results: [[String: Any]] = []
+        // codex Swift 6 #5: Sendable Box pra results — closure foundItemsHandler
+        // pode chamar concorrente (CSSearchQuery não garante serial), e lock
+        // dentro de append previne race no contador 'count >= limit'.
+        let resultsBox = SpotlightItemsBox()
         let sem = DispatchSemaphore(value: 0)
         csQuery.foundItemsHandler = { items in
+            var batch: [[String: Any]] = []
             for it in items {
+                if resultsBox.count() + batch.count >= limit { break }
                 var entry: [String: Any] = [
                     "path": it.uniqueIdentifier,
                     "domain": it.domainIdentifier ?? NSNull(),
@@ -2328,15 +2360,16 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 if let t = attrs.title { entry["title"] = t }
                 if let d = attrs.contentDescription { entry["summary"] = d }
                 if let k = attrs.keywords { entry["keywords"] = k }
-                results.append(entry)
-                if results.count >= limit { break }
+                batch.append(entry)
             }
+            if !batch.isEmpty { resultsBox.append(batch) }
         }
         csQuery.completionHandler = { _ in sem.signal() }
         csQuery.start()
         _ = sem.wait(timeout: .now() + .seconds(10))
         csQuery.cancel()
 
+        let results = resultsBox.snapshot()
         let paths = results.compactMap { $0["path"] as? String }
         return Response(status: .ok, payload: [
             "query": query,
@@ -2363,9 +2396,10 @@ final class AegisHTTPHandler: ChannelInboundHandler {
 
         let index = CSSearchableIndex(name: domainHint)
         let sem = DispatchSemaphore(value: 0)
-        var purgeError: Error?
+        // codex Swift 6 #5: Sendable Box (mesmo padrão handleSpotlightIndex)
+        let errBox = SpotlightErrorBox()
         index.deleteSearchableItems(withDomainIdentifiers: [domainHint]) { err in
-            purgeError = err
+            errBox.setError(err)
             sem.signal()
         }
         let waitResult = sem.wait(timeout: .now() + .seconds(15))
@@ -2376,7 +2410,7 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 "mode": "timeout"
             ])
         }
-        if let e = purgeError {
+        if let e = errBox.getError() {
             return Response(status: .internalServerError, payload: [
                 "error": "purge falhou: \(e)",
                 "domain": domainHint

@@ -15,7 +15,6 @@ data/
 
 # Swift daemon build artifacts
 daemon/.build/
-daemon/Package.resolved
 
 # Dependencias de build JS (esbuild)
 node_modules/

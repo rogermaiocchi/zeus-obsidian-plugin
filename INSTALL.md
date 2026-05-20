@@ -42,7 +42,7 @@ Cmd+P → `Zeus: buscar` — deve abrir o modal de busca. Digite duas letras par
 
 Console (Cmd+Opt+I) deve mostrar:
 ```
-[zeus] loaded v0.4.0 — 100% Apple-native
+[zeus] loaded v1.4.3 — Apple-native search & connections
 [zeus] afm binary resolved: /path/to/afm
 ```
 

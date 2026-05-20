@@ -1408,7 +1408,7 @@ var require_zeus_http_client = __commonJS({
         return await this._post("/v1/summarize", { text }, 6e4);
       }
       async graphExtract(text, maxNodes = 20, maxEdges = 30) {
-        return await this._post("/v1/graph-extract", { text, max_nodes: maxNodes, max_edges: maxEdges }, 6e4);
+        return await this._post("/v1/graph/extract", { text, max_nodes: maxNodes, max_edges: maxEdges }, 6e4);
       }
       async classify(text, options) {
         return await this._post("/v1/classify", { text, options }, 6e4);
@@ -5563,7 +5563,7 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
           console.log("[zeus] real-time rename:", oldPath, "\u2192", file.path);
         }
       }));
-      console.log("[zeus] loaded v0.11.2 \u2014 distributed coordinator + scheduler");
+      console.log(`[zeus] loaded v${this.manifest.version} \u2014 Apple-native search & connections`);
       trace("onload.complete");
       writeTrace(null);
     } catch (err) {

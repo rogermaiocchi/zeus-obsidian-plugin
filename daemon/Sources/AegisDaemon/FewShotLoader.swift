@@ -82,7 +82,7 @@ public enum FewShotOutputValue: Codable, Sendable {
 }
 
 /// Helper para JSON heterogêneo Codable em Swift.
-public struct AnyCodable: Codable, Sendable {
+public struct AnyCodable: Codable, @unchecked Sendable {
     public let value: Any
 
     public init(_ value: Any) { self.value = value }

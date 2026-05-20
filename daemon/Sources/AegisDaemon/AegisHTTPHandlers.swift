@@ -19,7 +19,7 @@ import ImageIO
 import FoundationModels
 #endif
 #if canImport(Speech)
-import Speech
+@preconcurrency import Speech
 #endif
 #if canImport(AVFoundation)
 import AVFoundation
@@ -136,12 +136,36 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             return self.handleEnrich(bodyJSON: body)
         case (.POST, "/v1/agent"):
             return self.handleAgent(bodyJSON: body)
+        case (.POST, "/v1/classify"):
+            return self.handleClassify(bodyJSON: body)
         case (.POST, "/v1/prompt"):
             return self.handlePrompt(bodyJSON: body)
         case (.POST, "/v1/vision/classify"):
             return self.handleVisionClassify(bodyJSON: body)
         case (.POST, "/v1/vision/landmarks"):
             return self.handleVisionLandmarks(bodyJSON: body)
+        case (.POST, "/v1/translate"):
+            return self.handleUnsupportedEndpoint("/v1/translate", reason: "Apple Translation ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/nl/tag"):
+            return self.handleUnsupportedEndpoint("/v1/nl/tag", reason: "NLTagger detalhado ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/nl/sentiment"):
+            return self.handleUnsupportedEndpoint("/v1/nl/sentiment", reason: "NLTagger sentiment ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/nl/language-detect"):
+            return self.handleUnsupportedEndpoint("/v1/nl/language-detect", reason: "NLLanguageRecognizer detalhado ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/vision/saliency"):
+            return self.handleUnsupportedEndpoint("/v1/vision/saliency", reason: "Vision saliency ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/vision/feature-print"):
+            return self.handleUnsupportedEndpoint("/v1/vision/feature-print", reason: "Vision feature-print ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/vision/aesthetics"):
+            return self.handleUnsupportedEndpoint("/v1/vision/aesthetics", reason: "Vision aesthetics ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/vision/barcode"):
+            return self.handleUnsupportedEndpoint("/v1/vision/barcode", reason: "Vision barcode ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/vision/document"):
+            return self.handleUnsupportedEndpoint("/v1/vision/document", reason: "Vision document layout ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/data-detect"):
+            return self.handleUnsupportedEndpoint("/v1/data-detect", reason: "NSDataDetector ainda não está portado no AegisDaemon standalone")
+        case (.POST, "/v1/spotlight/search"):
+            return self.handleUnsupportedEndpoint("/v1/spotlight/search", reason: "Spotlight search não está disponível no sandbox iOS standalone")
         case (.POST, "/v1/cmd"):
             return self.handleCmd(bodyJSON: body)
         case (.GET, "/v1/cmd"):
@@ -183,9 +207,14 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                     "GET /v1/health", "GET /v1/tools",
                     "POST /v1/embed", "POST /v1/ocr",
                     "POST /v1/summarize", "POST /v1/enrich",
-                    "POST /v1/agent", "POST /v1/prompt",
+                    "POST /v1/agent", "POST /v1/classify", "POST /v1/prompt",
                     "POST /v1/cmd",
                     "POST /v1/vision/classify", "POST /v1/vision/landmarks",
+                    "POST /v1/translate", "POST /v1/nl/tag", "POST /v1/nl/sentiment",
+                    "POST /v1/nl/language-detect", "POST /v1/vision/saliency",
+                    "POST /v1/vision/feature-print", "POST /v1/vision/aesthetics",
+                    "POST /v1/vision/barcode", "POST /v1/vision/document",
+                    "POST /v1/data-detect", "POST /v1/spotlight/search",
                     "POST /v1/passport/extract", "POST /v1/passport/batch-extract",
                     "POST /v1/passport/find", "POST /v1/content/get",
                     "POST /v1/passport/claim", "POST /v1/passport/release",
@@ -258,9 +287,14 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             "GET /v1/health", "GET /v1/tools",
             "POST /v1/embed", "POST /v1/ocr",
             "POST /v1/summarize", "POST /v1/enrich",
-            "POST /v1/agent", "POST /v1/prompt",
+            "POST /v1/agent", "POST /v1/classify", "POST /v1/prompt",
             "POST /v1/cmd",
             "POST /v1/vision/classify", "POST /v1/vision/landmarks",
+            "POST /v1/translate", "POST /v1/nl/tag", "POST /v1/nl/sentiment",
+            "POST /v1/nl/language-detect", "POST /v1/vision/saliency",
+            "POST /v1/vision/feature-print", "POST /v1/vision/aesthetics",
+            "POST /v1/vision/barcode", "POST /v1/vision/document",
+            "POST /v1/data-detect", "POST /v1/spotlight/search",
             "POST /v1/passport/extract", "POST /v1/passport/batch-extract",
             "POST /v1/passport/find", "POST /v1/content/get",
             "POST /v1/passport/claim", "POST /v1/passport/release",
@@ -299,7 +333,9 @@ final class AegisHTTPHandler: ChannelInboundHandler {
                 ["name": "enrich", "endpoint": "POST /v1/enrich", "input": "note_content + note_path",
                  "output": "suggested_links + tags + connections", "model": "FoundationModels"],
                 ["name": "agent", "endpoint": "POST /v1/agent", "input": "question + pattern",
-                 "output": "answer", "model": "AegisClaudeAgent (FoundationModels)"],
+                 "output": "answer", "model": "FoundationModels"],
+                ["name": "classify", "endpoint": "POST /v1/classify", "input": "text + options[]",
+                 "output": "label + confidence + reason", "model": "FoundationModels"],
                 ["name": "prompt", "endpoint": "POST /v1/prompt", "input": "instruction",
                  "output": "generated text", "model": "FoundationModels LanguageModelSession"],
                 ["name": "cmd", "endpoint": "POST /v1/cmd", "input": "cmd",
@@ -501,15 +537,14 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         Não inclua texto antes ou depois do JSON. Sem markdown fences. Apenas JSON puro.
         """
 
-        guard let agent = self.buildAgent() else {
-            return Response(status: .serviceUnavailable, payload: [
-                "error": "AegisClaudeAgent indisponível (FoundationModels não suportado nesta plataforma)",
-                "suggested_links": [],
-                "suggested_tags": [],
-                "connections": []
-            ])
-        }
-        let raw = agent.run(prompt: prompt)
+        let res = self.runFoundationModel(
+            instructions: "Você é um assistente on-device para enriquecimento de vault Obsidian. Responda somente JSON estrito.",
+            prompt: prompt,
+            maxTokens: 700,
+            extraPayload: ["task": "enrich", "note_path": notePath]
+        )
+        guard res.status == .ok else { return res }
+        let raw = String((res.payload["text"] as? String) ?? "")
 
         // Tentar extrair JSON do output.
         if let parsed = Self.extractJSON(from: raw) {
@@ -530,35 +565,43 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         guard let json = Self.parseJSON(bodyJSON),
               let question = json["question"] as? String, !question.isEmpty else {
             return Response(status: .badRequest, payload: [
-                "error": "body inválido: requer {\"question\": \"...\", \"pattern\": \"auto|react|plan-execute|reflexion\"}"
+                "error": "body inválido: requer {\"question\": \"...\", \"pattern\": \"auto|react|plan-execute|reflexion\", \"context\": [\"chunk1\",...]}"
             ])
         }
         let pattern = (json["pattern"] as? String) ?? "auto"
+        let contextDocs = (json["context"] as? [String]) ?? []
 
-        guard let agent = self.buildAgent() else {
-            return Response(status: .serviceUnavailable, payload: [
-                "error": "AegisClaudeAgent indisponível (FoundationModels não suportado nesta plataforma)"
-            ])
-        }
-        // Pattern hint anexado para o agent tentar seguir o estilo.
-        let finalPrompt: String
+        let patternHint: String
         switch pattern {
-        case "react":
-            finalPrompt = "[ReAct] Pense em voz alta, use ferramentas iterativamente.\n\n\(question)"
-        case "plan-execute":
-            finalPrompt = "[Plan-Execute] Primeiro plano completo, depois execute passos.\n\n\(question)"
-        case "reflexion":
-            finalPrompt = "[Reflexion] Após responder, reflita sobre erros e revise.\n\n\(question)"
-        default:
-            finalPrompt = question
+        case "react":        patternHint = "[ReAct] Pense em voz alta, use ferramentas iterativamente."
+        case "plan-execute": patternHint = "[Plan-Execute] Primeiro plano completo, depois execute passos."
+        case "reflexion":    patternHint = "[Reflexion] Após responder, reflita sobre erros e revise."
+        default:             patternHint = "Responda direta e objetivamente."
         }
 
-        let answer = agent.run(prompt: finalPrompt)
-        return Response(status: .ok, payload: [
-            "answer": answer,
-            "iterations": 1,
-            "pattern": pattern
-        ])
+        var assembled = ""
+        if !contextDocs.isEmpty {
+            assembled += "Contexto recuperado do vault (use APENAS este material, não invente):\n"
+            for (i, chunk) in contextDocs.enumerated() {
+                assembled += "[\(i + 1)] \(chunk)\n"
+            }
+            assembled += "\n"
+        }
+        assembled += "Pergunta:\n\(question)"
+
+        let res = self.runFoundationModel(
+            instructions: patternHint,
+            prompt: assembled,
+            maxTokens: 700,
+            extraPayload: ["task": "agent_query", "pattern": pattern]
+        )
+        if res.status == .ok, let txt = res.payload["text"] as? String {
+            var p = res.payload
+            p["answer"] = txt
+            p["iterations"] = 1
+            return Response(status: .ok, payload: p)
+        }
+        return res
     }
 
     // MARK: - /v1/ocr (Vision)
@@ -657,6 +700,44 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             prompt: text,
             maxTokens: maxTokens,
             extraPayload: ["task": "summarize"]
+        )
+    }
+
+    // MARK: - /v1/classify (FoundationModels, seleção restrita de label)
+
+    private func handleClassify(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"options\": [\"...\"]}"
+            ])
+        }
+        let rawOptions = json["options"]
+        let labels: [String]
+        if let arr = rawOptions as? [String] {
+            labels = arr.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        } else if let arr = rawOptions as? [Any] {
+            labels = arr.compactMap { $0 as? String }.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        } else {
+            labels = []
+        }
+        guard !labels.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: options deve ser array não-vazio de labels"
+            ])
+        }
+
+        let instructions = """
+        Classifique o texto em exatamente uma das opções permitidas.
+        Responda APENAS com JSON estrito, sem markdown:
+        {"label":"<uma_opcao>","confidence":0.0,"reason":"curto"}
+        Opções permitidas: \(labels.joined(separator: ", "))
+        """
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: 120,
+            extraPayload: ["task": "classify", "options": labels]
         )
     }
 
@@ -1761,7 +1842,7 @@ final class AegisHTTPHandler: ChannelInboundHandler {
 
         #if canImport(Speech) && canImport(AVFoundation)
         let asset = AVURLAsset(url: url)
-        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        let durationSeconds = Self.durationSeconds(for: asset)
 
         // Engine SA (SpeechAnalyzer iOS 26+/macOS 26+) — tenta primeiro em "auto" ou "sa"
         if #available(iOS 26.0, macOS 26.0, *), engineRequested != "sf" {
@@ -2086,21 +2167,15 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         #endif
     }
 
-    // MARK: - Agent factory
-
-    /// Reusa AegisClaudeAgent (FoundationModels on-device). Sessão dedicada "http-agent".
-    private func buildAgent() -> AegisClaudeAgent? {
-        let sm = AegisSessionManager.shared
-        let session: NSManagedObject = sm.activeSession() ?? sm.createOrActivate(name: "http-agent")
-        let executor: (String) -> String = { _ in
-            // O HTTP path não expõe o AegisCommandExecutor diretamente — comandos do agent
-            // ficam restritos às tools nativas. Para aegis_cmd retornamos placeholder.
-            return "comandos aegis_cmd via HTTP não suportados — use o canal SSH"
-        }
-        return AegisClaudeAgent(session: session, autoYes: false, executor: executor)
-    }
-
     // MARK: - Helpers
+
+    private func handleUnsupportedEndpoint(_ endpoint: String, reason: String) -> Response {
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "unsupported_on_aegis_daemon",
+            "endpoint": endpoint,
+            "reason": reason
+        ])
+    }
 
     private static func parseJSON(_ s: String) -> [String: Any]? {
         guard let data = s.data(using: .utf8) else { return nil }
@@ -2115,6 +2190,19 @@ final class AegisHTTPHandler: ChannelInboundHandler {
               let end = raw.lastIndex(of: "}"), start < end else { return nil }
         let candidate = String(raw[start...end])
         return parseJSON(candidate)
+    }
+
+    private static func durationSeconds(for asset: AVURLAsset) -> Double {
+        let sem = DispatchSemaphore(value: 0)
+        var seconds = Double.nan
+        Task {
+            if let duration = try? await asset.load(.duration) {
+                seconds = CMTimeGetSeconds(duration)
+            }
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + .seconds(5))
+        return seconds
     }
 
     private func writeJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, dict: [String: Any]) {
@@ -2253,5 +2341,65 @@ private final class AegisCommandExecutorBridge {
             Via SSH (porta 2222): acesso completo ao AegisLocalBridge + todos os comandos
             """
         }
+    }
+}
+
+private struct CapivaraDeviceProfile {
+    let displayLabel: String
+    let hardwareModel: String
+    let contextLine: String
+    let capabilitiesSummary: String
+
+    static var current: CapivaraDeviceProfile {
+        let process = ProcessInfo.processInfo
+        return CapivaraDeviceProfile(
+            displayLabel: process.hostName,
+            hardwareModel: ProcessInfo.processInfo.environment["HW_MODEL"] ?? "standalone",
+            contextLine: "\(process.operatingSystemVersionString) | \(process.processorCount) cores",
+            capabilitiesSummary: "AegisDaemon standalone: HTTP, NL/Vision/FM quando disponíveis; integrações app-host opcionais usam fallback local."
+        )
+    }
+}
+
+private enum AegisNativeTools {
+    static func deviceAudit() -> String {
+        let process = ProcessInfo.processInfo
+        return "Device audit: \(process.hostName) | \(process.operatingSystemVersionString) | uptime \(Int(process.systemUptime))s"
+    }
+
+    static func networkStatus() -> String {
+        return "Network status: HTTP daemon ativo; diagnóstico detalhado requer integração do app host."
+    }
+
+    static func spotlightSearch(query: String) -> String {
+        return "Spotlight indisponível no fallback standalone para query: \(query)"
+    }
+
+    static func healthRead(metric: String) -> String {
+        return "HealthKit indisponível no fallback standalone para métrica: \(metric)"
+    }
+
+    static func contactsSearch(query: String) -> String {
+        return "Contacts indisponível no fallback standalone para query: \(query)"
+    }
+
+    static func calendarQuery(query: String) -> String {
+        return "Calendar indisponível no fallback standalone para query: \(query)"
+    }
+
+    static func remindersQuery(query: String) -> String {
+        return "Reminders indisponível no fallback standalone para query: \(query)"
+    }
+
+    static func photosInfo(query: String) -> String {
+        return "Photos indisponível no fallback standalone para query: \(query)"
+    }
+}
+
+private actor AegisLocalBridge {
+    static let shared = AegisLocalBridge()
+
+    func execute(_ command: String) async -> String {
+        return "AegisLocalBridge indisponível no fallback standalone para comando: \(command)"
     }
 }

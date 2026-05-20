@@ -2,7 +2,7 @@
 
 > Substitui Omnisearch + Smart Connections com pipeline 100% Apple-native: Foundation Models, Vision, NaturalLanguage, CoreSpotlight. Indexação no Mac, leitura cross-device via iCloud + Tailscale.
 
-**Status:** `v1.2.0` — estável, em produção diária cross-device (Mac mini · MacBook Air · iPad · iPhone). Status bar com métricas de tokens economizados e **Apple Cloud Private (PCC) end-to-end**: plugin opt-in → daemon Swift honra `X-Zeus-Allow-Pcc` com heurística calibrada → response devolve `X-Zeus-Pcc-Used: 1`. Ver [CHANGELOG](CHANGELOG.md).
+**Status:** `v1.4.3` — estável, em produção diária cross-device (Mac mini · MacBook Air · iPad · iPhone). Status bar com métricas de tokens economizados e **Apple Cloud Private (PCC) end-to-end**: plugin opt-in → daemon Swift honra `X-Zeus-Allow-Pcc` com heurística calibrada → response devolve `X-Zeus-Pcc-Used: 1`. Ver [CHANGELOG](CHANGELOG.md).
 
 ## Convenção ecumênica de prefixos
 
@@ -68,8 +68,8 @@ Ver [INSTALL.md](INSTALL.md).
 ## Estrutura unificada (plugin + daemon)
 
 ```
-zeus-obsidian-plugin/                       ← repo PIA (private GitHub)
-├── manifest.json                           ← Obsidian plugin manifest (v0.9.0)
+zeus-obsidian-plugin/                       ← repo PIA
+├── manifest.json                           ← Obsidian plugin manifest (v1.4.3)
 ├── main.js                                 ← Plain ES2020, ~2165 LOC
 ├── styles.css                              ← Claude-style minimalist
 ├── README.md                               ← este arquivo
@@ -121,7 +121,7 @@ zeus-obsidian-plugin/                       ← repo PIA (private GitHub)
 
 ## Versão
 
-`0.4.0` — multi-modal Apple-native pipeline + HyDE + Knowledge Graph view + naming ecumênico.
+`1.4.3` — multi-modal Apple-native pipeline + HyDE + Knowledge Graph view + naming ecumênico, com paridade Mac↔iOS via daemon HTTP.
 
 ## Roadmap aberto — Swift/Python/Rust helpers em `bin/`
 

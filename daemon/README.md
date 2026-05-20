@@ -43,7 +43,7 @@ Backend Swift do plugin Zeus. **Auto-adapta a cada device do mesh Apple** (Mac m
 - `POST /v1/enrich` — FM com 4 vault tools, suggested_links + connections
 - `POST /v1/agent` — react/plan-execute/reflexion patterns
 - `POST /v1/classify` — Generable classification
-- `POST /v1/graph-extract` — knowledge graph nodes+edges
+- `POST /v1/graph/extract` — knowledge graph nodes+edges
 
 ### Camada Vision (todos os devices, sem ANE-gate)
 - `POST /v1/ocr` — VNRecognizeTextRequest (aocr) layout-aware
@@ -115,7 +115,7 @@ Primeiro que responde `200` em `/v1/health` é usado. Zero-config por device.
 |---|---|---|
 | ZeusDaemonMac | 0.5.0 | 2026-05-14 |
 | AegisDaemon HTTP (iOS) | 0.3.0 | 2026-05-14 |
-| Plugin Obsidian | 0.9.0 | 2026-05-14 |
+| Plugin Obsidian | 1.4.3 | 2026-05-20 |
 
 ## Estrutura
 

@@ -135,7 +135,7 @@ function _zeusFindPluginDir() {
     if (isValid(c)) return c;
   }
 
-  // v1.4.3-ios: sem fs (Capacitor) nao da pra VALIDAR caminhos — todas as 5
+  // v1.4.3: sem fs (Capacitor) nao da pra VALIDAR caminhos — todas as 5
   // estrategias acima usam fs0.existsSync, que nao existe no iOS. Retorna o
   // caminho deterministico do sandbox iOS; o require() de pluginRequire confirma.
   if (!fs0) {
@@ -3453,7 +3453,7 @@ class ZeusPlugin extends Plugin {
       }
     }));
 
-    console.log('[zeus] loaded v0.11.2 — distributed coordinator + scheduler');
+    console.log(`[zeus] loaded v${this.manifest.version} — Apple-native search & connections`);
     trace('onload.complete');
     writeTrace(null);
     } catch (err) {

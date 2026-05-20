@@ -33,7 +33,7 @@ import FoundationModels
 import Translation
 #endif
 #if canImport(Speech)
-import Speech
+@preconcurrency import Speech
 #endif
 #if canImport(AVFoundation)
 import AVFoundation
@@ -165,6 +165,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             return self.handleSummarize(bodyJSON: body, pcc: pcc)
         case (.POST, "/v1/enrich"):
             return self.handleEnrich(bodyJSON: body, pcc: pcc)
+        case (.POST, "/v1/classify"):
+            return self.handleClassify(bodyJSON: body, pcc: pcc)
         case (.POST, "/v1/prompt"):
             return self.handlePrompt(bodyJSON: body, pcc: pcc)
         case (.POST, "/v1/vision/classify"):
@@ -229,7 +231,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 "available": [
                     "GET /v1/health", "GET /v1/tools",
                     "POST /v1/embed", "POST /v1/ocr",
-                    "POST /v1/summarize", "POST /v1/enrich",
+                    "POST /v1/summarize", "POST /v1/enrich", "POST /v1/classify",
                     "POST /v1/prompt", "POST /v1/cmd",
                     "POST /v1/vision/classify", "POST /v1/vision/landmarks",
                     "POST /v1/vision/saliency", "POST /v1/vision/feature-print",
@@ -241,7 +243,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
                     "POST /v1/data-detect", "POST /v1/spotlight/search",
                     "POST /v1/afm/refine",
-                    "POST /v1/asp/transcribe", "POST /v1/asp/vad"
+                    "POST /v1/asp/transcribe", "POST /v1/asp/vad",
+                    "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract",
+                    "POST /v1/agent"
                 ]
             ])
         }
@@ -275,7 +279,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let endpoints = [
             "GET /v1/health", "GET /v1/tools", "GET /v1/mcp",
             "POST /v1/embed", "POST /v1/ocr",
-            "POST /v1/summarize", "POST /v1/enrich",
+            "POST /v1/summarize", "POST /v1/enrich", "POST /v1/classify",
             "POST /v1/prompt", "POST /v1/cmd",
             "POST /v1/vision/classify", "POST /v1/vision/landmarks",
             "POST /v1/vision/saliency", "POST /v1/vision/feature-print",
@@ -345,6 +349,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                  "output": "summary", "model": "FoundationModels LanguageModelSession"],
                 ["name": "enrich", "endpoint": "POST /v1/enrich", "input": "note_content + note_path",
                  "output": "suggested_links + tags + connections", "model": "FoundationModels"],
+                ["name": "classify", "endpoint": "POST /v1/classify", "input": "text + options[]",
+                 "output": "label + confidence + reason", "model": "FoundationModels"],
                 ["name": "prompt", "endpoint": "POST /v1/prompt", "input": "instruction",
                  "output": "generated text", "model": "FoundationModels LanguageModelSession"],
                 ["name": "cmd", "endpoint": "POST /v1/cmd", "input": "cmd",
@@ -689,6 +695,45 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         return res
     }
 
+    // MARK: - /v1/classify (FoundationModels, constrained label selection)
+
+    private func handleClassify(bodyJSON: String, pcc: PccPermission = .off) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"options\": [\"...\"]}"
+            ])
+        }
+        let rawOptions = json["options"]
+        let labels: [String]
+        if let arr = rawOptions as? [String] {
+            labels = arr.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        } else if let arr = rawOptions as? [Any] {
+            labels = arr.compactMap { $0 as? String }.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        } else {
+            labels = []
+        }
+        guard !labels.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: options deve ser array não-vazio de labels"
+            ])
+        }
+
+        let instructions = """
+        Classifique o texto em exatamente uma das opções permitidas.
+        Responda APENAS com JSON estrito, sem markdown:
+        {"label":"<uma_opcao>","confidence":0.0,"reason":"curto"}
+        Opções permitidas: \(labels.joined(separator: ", "))
+        """
+        return self.runFoundationModel(
+            instructions: instructions,
+            prompt: text,
+            maxTokens: 120,
+            extraPayload: ["task": "classify", "options": labels],
+            pcc: pcc
+        )
+    }
+
     // MARK: - /v1/prompt (FoundationModels, free-form generation)
 
     private func handlePrompt(bodyJSON: String, pcc: PccPermission = .off) -> Response {
@@ -883,7 +928,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         #if canImport(Speech) && canImport(AVFoundation)
         // Duration via AVURLAsset (não bloqueia esperando frames).
         let asset = AVURLAsset(url: url)
-        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        let durationSeconds = Self.durationSeconds(for: asset)
 
         // Engine SA (SpeechAnalyzer macOS 26+) — tenta primeiro em mode "auto" ou "sa".
         if #available(macOS 26.0, *), engineRequested != "sf" {
@@ -925,7 +970,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let sem = DispatchSemaphore(value: 0)
         var resultText = ""
         var resultError: String? = nil
-        var onDeviceUsed = recognizer.supportsOnDeviceRecognition
+        let onDeviceUsed = recognizer.supportsOnDeviceRecognition
 
         let task = recognizer.recognitionTask(with: request) { (result, error) in
             if let err = error as NSError? {
@@ -2906,6 +2951,19 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
               let end = raw.lastIndex(of: "}"), start < end else { return nil }
         let candidate = String(raw[start...end])
         return parseJSON(candidate)
+    }
+
+    private static func durationSeconds(for asset: AVURLAsset) -> Double {
+        let sem = DispatchSemaphore(value: 0)
+        var seconds = Double.nan
+        Task {
+            if let duration = try? await asset.load(.duration) {
+                seconds = CMTimeGetSeconds(duration)
+            }
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + .seconds(5))
+        return seconds
     }
 
     private func writeJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, dict: [String: Any], pccUsed: Bool = false) {

@@ -40,6 +40,9 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOSSH", package: "swift-nio-ssh"),
                 .product(name: "NIOTransportServices", package: "swift-nio-transport-services")
+            ],
+            resources: [
+                .process("Resources")
             ]
         ),
         .executableTarget(

@@ -251,270 +251,6 @@ var require_universal_fs = __commonJS({
   }
 });
 
-// lib/afm-daemon.js
-var require_afm_daemon = __commonJS({
-  "lib/afm-daemon.js"(exports2, module2) {
-    "use strict";
-    var universal2 = require_universal_fs();
-    var spawn2 = universal2.nodeChildProcess ? universal2.nodeChildProcess.spawn : null;
-    var fs2 = universal2.nodeFs;
-    var DEFAULT_TIMEOUT_MS = 3e4;
-    var STARTUP_TIMEOUT_MS = 15e3;
-    var STOP_GRACE_MS = 2e3;
-    var AfmDaemon2 = class {
-      constructor(afmBinPath) {
-        if (!afmBinPath || typeof afmBinPath !== "string") {
-          throw new Error("AfmDaemon: afmBinPath (string) required");
-        }
-        this.binPath = afmBinPath;
-        this.proc = null;
-        this.alive = false;
-        this.starting = null;
-        this.nextId = 1;
-        this.pending = /* @__PURE__ */ new Map();
-        this.queue = [];
-        this.stdoutBuf = "";
-        this.tools = [];
-      }
-      isAlive() {
-        return this.alive && this.proc !== null;
-      }
-      // Generate next request id (monotonic, JSON-safe int).
-      _nextId() {
-        const id = this.nextId++;
-        if (this.nextId > 2147483647) this.nextId = 1;
-        return id;
-      }
-      // Internal: write a JSON-RPC frame to stdin (line-delimited).
-      _send(obj) {
-        if (!this.proc || !this.proc.stdin.writable) {
-          throw new Error("afm-daemon: stdin not writable");
-        }
-        this.proc.stdin.write(JSON.stringify(obj) + "\n");
-      }
-      // Internal: parse newline-delimited JSON from stdout buffer; dispatch to pending.
-      _onStdout(chunk) {
-        this.stdoutBuf += chunk.toString("utf8");
-        let nl;
-        while ((nl = this.stdoutBuf.indexOf("\n")) >= 0) {
-          const line = this.stdoutBuf.slice(0, nl).trim();
-          this.stdoutBuf = this.stdoutBuf.slice(nl + 1);
-          if (!line) continue;
-          let msg;
-          try {
-            msg = JSON.parse(line);
-          } catch (e) {
-            console.warn("[afm-daemon] non-JSON stdout line:", line.slice(0, 200));
-            continue;
-          }
-          this._dispatch(msg);
-        }
-      }
-      _dispatch(msg) {
-        if (msg.id === void 0 || msg.id === null) {
-          return;
-        }
-        const pend = this.pending.get(msg.id);
-        if (!pend) {
-          console.warn("[afm-daemon] response with unknown id:", msg.id);
-          return;
-        }
-        this.pending.delete(msg.id);
-        clearTimeout(pend.timer);
-        if (msg.error) {
-          const err = new Error(`afm-daemon JSON-RPC error ${msg.error.code}: ${msg.error.message}`);
-          err.code = msg.error.code;
-          err.data = msg.error.data;
-          pend.reject(err);
-        } else {
-          pend.resolve(msg.result);
-        }
-      }
-      // Reject every in-flight + queued call with `err`. Used on crash and stop().
-      _failAll(err) {
-        for (const [id, pend] of this.pending) {
-          clearTimeout(pend.timer);
-          pend.reject(err);
-        }
-        this.pending.clear();
-        for (const q of this.queue) q.reject(err);
-        this.queue = [];
-      }
-      // Spawn `afm serve`, attach listeners, wait for handshake (tools/list).
-      // Idempotent — safe to await multiple times.
-      async start() {
-        if (this.alive) return;
-        if (this.starting) return this.starting;
-        if (!spawn2 || !fs2) {
-          throw new Error("afm-daemon: child_process/fs unavailable on this platform (iOS sandbox). Use HTTP daemon via Tailscale.");
-        }
-        if (!fs2.existsSync(this.binPath)) {
-          throw new Error(`afm-daemon: binary not found at ${this.binPath}`);
-        }
-        this.starting = new Promise((resolve, reject) => {
-          let earlyExitStderr = "";
-          let resolvedStart = false;
-          let proc;
-          try {
-            proc = spawn2(this.binPath, ["serve"], { stdio: ["pipe", "pipe", "pipe"] });
-          } catch (e) {
-            reject(new Error(`afm-daemon: spawn failed: ${e.message}`));
-            return;
-          }
-          this.proc = proc;
-          proc.stdout.on("data", (d) => this._onStdout(d));
-          proc.stderr.on("data", (d) => {
-            const s = d.toString("utf8");
-            if (!resolvedStart) earlyExitStderr += s;
-            for (const line of s.split("\n")) {
-              if (line.trim()) console.warn("[afm-daemon]", line);
-            }
-          });
-          proc.on("error", (e) => {
-            this.alive = false;
-            if (!resolvedStart) {
-              resolvedStart = true;
-              reject(new Error(`afm-daemon: process error: ${e.message}`));
-            }
-            this._failAll(new Error(`afm-daemon: process error: ${e.message}`));
-          });
-          proc.on("exit", (code, signal) => {
-            this.alive = false;
-            this.proc = null;
-            const reason = signal ? `signal=${signal}` : `code=${code}`;
-            if (!resolvedStart) {
-              resolvedStart = true;
-              reject(new Error(
-                `afm-daemon: 'afm serve' exited before ready (${reason}). stderr: ${earlyExitStderr.slice(0, 400)}`
-              ));
-              return;
-            }
-            this._failAll(new Error(`afm-daemon: process exited (${reason})`));
-          });
-          this.alive = true;
-          const startupTimer = setTimeout(() => {
-            if (resolvedStart) return;
-            resolvedStart = true;
-            try {
-              proc.kill("SIGTERM");
-            } catch (_) {
-            }
-            reject(new Error(`afm-daemon: handshake timeout after ${STARTUP_TIMEOUT_MS}ms. stderr: ${earlyExitStderr.slice(0, 400)}`));
-          }, STARTUP_TIMEOUT_MS);
-          this._rawCall("tools/list", {}, STARTUP_TIMEOUT_MS).then((result) => {
-            clearTimeout(startupTimer);
-            if (resolvedStart) return;
-            resolvedStart = true;
-            const toolList = result && Array.isArray(result.tools) ? result.tools : [];
-            this.tools = toolList.map((t) => t && t.name).filter(Boolean);
-            console.info("[afm-daemon] ready \u2014", this.tools.length, "tools:", this.tools.join(", "));
-            if (!this.tools.includes("metafm_embed")) {
-              console.info("[afm-daemon] note: metafm_embed not exposed by serve; callers must fall back to direct spawn for embeddings.");
-            }
-            const q = this.queue;
-            this.queue = [];
-            for (const item of q) {
-              this._performCall(item.tool, item.params, item.timeout).then(item.resolve, item.reject);
-            }
-            resolve();
-          }).catch((e) => {
-            clearTimeout(startupTimer);
-            if (resolvedStart) return;
-            resolvedStart = true;
-            try {
-              proc.kill("SIGTERM");
-            } catch (_) {
-            }
-            reject(new Error(`afm-daemon: tools/list failed: ${e.message}`));
-          });
-        });
-        try {
-          await this.starting;
-        } finally {
-          this.starting = null;
-        }
-      }
-      // Send a JSON-RPC request and return a Promise for its result.
-      // `method` is the raw JSON-RPC method (e.g. 'tools/list' or 'tools/call').
-      _rawCall(method, params, timeoutMs) {
-        return new Promise((resolve, reject) => {
-          if (!this.alive || !this.proc) {
-            reject(new Error("afm-daemon: not alive"));
-            return;
-          }
-          const id = this._nextId();
-          const timer = setTimeout(() => {
-            if (this.pending.has(id)) {
-              this.pending.delete(id);
-              reject(new Error(`afm-daemon: timeout after ${timeoutMs}ms (method=${method}, id=${id})`));
-            }
-          }, timeoutMs);
-          this.pending.set(id, { resolve, reject, timer });
-          try {
-            this._send({ jsonrpc: "2.0", id, method, params });
-          } catch (e) {
-            clearTimeout(timer);
-            this.pending.delete(id);
-            reject(e);
-          }
-        });
-      }
-      // Internal: actually emit a tools/call once daemon is ready.
-      _performCall(toolName, params, timeoutMs) {
-        return this._rawCall("tools/call", { name: toolName, arguments: params || {} }, timeoutMs);
-      }
-      // Public: invoke an MCP tool by name. Auto-starts (and auto-restarts on crash).
-      async call(toolName, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
-        if (!toolName || typeof toolName !== "string") {
-          throw new Error("afm-daemon: toolName required");
-        }
-        if (!this.alive) {
-          await this.start();
-        }
-        if (this.starting) {
-          return new Promise((resolve, reject) => {
-            this.queue.push({ tool: toolName, params, timeout: timeoutMs, resolve, reject });
-          });
-        }
-        return this._performCall(toolName, params, timeoutMs);
-      }
-      // Graceful shutdown: SIGTERM, wait STOP_GRACE_MS, escalate to SIGKILL.
-      async stop() {
-        if (!this.proc) {
-          this.alive = false;
-          return;
-        }
-        const proc = this.proc;
-        this.alive = false;
-        this._failAll(new Error("afm-daemon: shutting down"));
-        return new Promise((resolve) => {
-          let done = false;
-          const finish = () => {
-            if (done) return;
-            done = true;
-            this.proc = null;
-            resolve();
-          };
-          proc.once("exit", finish);
-          try {
-            proc.kill("SIGTERM");
-          } catch (_) {
-          }
-          setTimeout(() => {
-            if (done) return;
-            try {
-              proc.kill("SIGKILL");
-            } catch (_) {
-            }
-            setTimeout(finish, 200);
-          }, STOP_GRACE_MS);
-        });
-      }
-    };
-    module2.exports = AfmDaemon2;
-  }
-});
-
 // lib/hierarchical.js
 var require_hierarchical = __commonJS({
   "lib/hierarchical.js"(exports2, module2) {
@@ -2442,107 +2178,173 @@ var require_passport_scheduler = __commonJS({
   }
 });
 
-// lib/python-worker.js
-var require_python_worker = __commonJS({
-  "lib/python-worker.js"(exports2, module2) {
+// lib/daemon-lifecycle.js
+var require_daemon_lifecycle = __commonJS({
+  "lib/daemon-lifecycle.js"(exports2, module2) {
     "use strict";
-    var path2 = null;
-    var fs2 = null;
-    var spawn2 = null;
-    try {
-      path2 = require("path");
-    } catch (_) {
-    }
-    try {
-      fs2 = require("fs");
-    } catch (_) {
-    }
-    try {
-      ({ spawn: spawn2 } = require("child_process"));
-    } catch (_) {
-    }
-    function resolveScript(pluginDir, scriptName) {
-      if (!path2 || !fs2) return null;
-      const candidates = [
-        path2.join(pluginDir, "bin", `${scriptName}.py`),
-        path2.join(pluginDir, "bin", scriptName)
-      ];
-      for (const c of candidates) {
-        if (fs2.existsSync(c)) return c;
+    var BINARY_NAME = "ZeusDaemonMac";
+    var DEFAULT_PORT = 2223;
+    var DEFAULT_HOST = "127.0.0.1";
+    var DaemonLifecycle2 = class {
+      constructor(plugin, options = {}) {
+        this.plugin = plugin;
+        this.port = options.port || DEFAULT_PORT;
+        this.host = options.host || DEFAULT_HOST;
+        this.url = `http://${this.host}:${this.port}`;
+        this.child = null;
+        this.spawnedByUs = false;
+        this.lastStatus = null;
       }
-      return null;
-    }
-    function runPythonWorker(pluginDir, scriptName, payload, opts = {}) {
-      return new Promise((resolve, reject) => {
-        if (!spawn2) {
-          return reject(new Error(
-            "python worker indispon\xEDvel neste dispositivo: child_process ausente (Obsidian mobile/iOS)"
-          ));
-        }
-        const scriptPath = resolveScript(pluginDir, scriptName);
-        if (!scriptPath) {
-          return reject(new Error(`python worker not found: bin/${scriptName}.py`));
-        }
-        const python = opts.python || "python3";
-        const timeoutMs = opts.timeoutMs || 3e4;
-        const child = spawn2(python, [scriptPath], {
-          stdio: ["pipe", "pipe", "pipe"],
-          env: { ...process.env, PYTHONUNBUFFERED: "1" }
-        });
-        let stdout = "";
-        let stderr = "";
-        let settled = false;
-        const timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          try {
-            child.kill("SIGKILL");
-          } catch (_) {
-          }
-          reject(new Error(`python worker timeout after ${timeoutMs}ms: ${scriptName}`));
-        }, timeoutMs);
-        child.stdout.on("data", (d) => {
-          stdout += d.toString();
-        });
-        child.stderr.on("data", (d) => {
-          stderr += d.toString();
-        });
-        child.on("error", (err) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(new Error(`python worker spawn failed: ${err.message}`));
-        });
-        child.on("close", (code) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          if (code !== 0) {
-            return reject(new Error(`python worker exit ${code}: ${stderr.trim() || stdout.trim()}`));
-          }
-          try {
-            const parsed = JSON.parse(stdout.trim());
-            resolve(parsed);
-          } catch (e) {
-            reject(new Error(`python worker invalid json: ${e.message}; stdout=${stdout.slice(0, 500)}`));
-          }
-        });
+      _fs() {
         try {
-          child.stdin.write(JSON.stringify(payload || {}));
-          child.stdin.end();
+          return require("fs");
         } catch (e) {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          try {
-            child.kill("SIGKILL");
-          } catch (_) {
-          }
-          reject(new Error(`python worker stdin write failed: ${e.message}`));
+          return null;
         }
-      });
-    }
-    module2.exports = { runPythonWorker, resolveScript };
+      }
+      _path() {
+        try {
+          return require("path");
+        } catch (e) {
+          return null;
+        }
+      }
+      _spawn() {
+        try {
+          return require("child_process").spawn;
+        } catch (e) {
+          return null;
+        }
+      }
+      _execFileSync() {
+        try {
+          return require("child_process").execFileSync;
+        } catch (e) {
+          return null;
+        }
+      }
+      binaryPath() {
+        const fs2 = this._fs();
+        const path2 = this._path();
+        if (!fs2 || !path2) return null;
+        const vaultRoot = this.plugin.vaultRoot;
+        if (!vaultRoot || !this.plugin.manifest || !this.plugin.manifest.dir) return null;
+        const candidate = path2.join(vaultRoot, this.plugin.manifest.dir, "bin", BINARY_NAME);
+        return fs2.existsSync(candidate) ? candidate : null;
+      }
+      async isHealthy(timeoutMs = 1500) {
+        const ZeusHttpClient2 = require_zeus_http_client();
+        const probe = new ZeusHttpClient2(this.url);
+        try {
+          return await probe.isAvailable(timeoutMs);
+        } catch (e) {
+          return false;
+        }
+      }
+      // Garante que o binário tem +x e sem quarantena (Gatekeeper).
+      // Idempotente — silencia falhas (codesign já é adhoc).
+      _prepareBinary(absPath) {
+        const fs2 = this._fs();
+        if (fs2) {
+          try {
+            fs2.chmodSync(absPath, 493);
+          } catch (e) {
+          }
+        }
+        const execFileSync = this._execFileSync();
+        if (execFileSync) {
+          try {
+            execFileSync("/usr/bin/xattr", ["-d", "com.apple.quarantine", absPath], { stdio: "ignore" });
+          } catch (e) {
+          }
+        }
+      }
+      async ensureRunning() {
+        if (await this.isHealthy(800)) {
+          this.lastStatus = { running: true, source: "pre-existing", url: this.url };
+          return this.lastStatus;
+        }
+        const spawn2 = this._spawn();
+        if (!spawn2) {
+          this.lastStatus = { running: false, source: "no-spawn", reason: "child_process unavailable (Capacitor / iOS)" };
+          return this.lastStatus;
+        }
+        const bin = this.binaryPath();
+        if (!bin) {
+          this.lastStatus = { running: false, source: "no-binary", reason: `${BINARY_NAME} ausente em bin/` };
+          return this.lastStatus;
+        }
+        this._prepareBinary(bin);
+        return new Promise((resolve) => {
+          let resolved = false;
+          const finish = (status) => {
+            if (!resolved) {
+              resolved = true;
+              this.lastStatus = status;
+              resolve(status);
+            }
+          };
+          let child;
+          try {
+            child = spawn2(bin, ["--port", String(this.port), "--host", this.host], {
+              stdio: "ignore",
+              detached: false,
+              env: Object.assign({}, process.env || {}, { ZEUS_SPAWN_PARENT: "obsidian" })
+            });
+          } catch (e) {
+            finish({ running: false, source: "spawn-error", reason: e.message });
+            return;
+          }
+          child.on("error", (err) => {
+            finish({ running: false, source: "spawn-error", reason: err.message });
+          });
+          child.on("exit", (code, signal) => {
+            if (this.child === child) {
+              this.child = null;
+              this.spawnedByUs = false;
+            }
+            if (!resolved) finish({ running: false, source: "spawn-exit", reason: `exit ${code} ${signal || ""}`.trim() });
+          });
+          this.child = child;
+          this.spawnedByUs = true;
+          const start = Date.now();
+          const poll = async () => {
+            if (resolved) return;
+            if (await this.isHealthy(600)) {
+              finish({ running: true, source: "spawned", pid: child.pid, url: this.url, latencyMs: Date.now() - start });
+              return;
+            }
+            if (Date.now() - start > 1e4) {
+              try {
+                child.kill("SIGTERM");
+              } catch (e) {
+              }
+              finish({ running: false, source: "spawn-timeout", reason: "sem /v1/health em 10s" });
+              return;
+            }
+            setTimeout(poll, 300);
+          };
+          setTimeout(poll, 250);
+        });
+      }
+      async stop({ graceMs = 2e3 } = {}) {
+        if (!this.spawnedByUs || !this.child) return { stopped: false, reason: "not-spawned-by-us" };
+        const child = this.child;
+        this.child = null;
+        this.spawnedByUs = false;
+        try {
+          child.kill("SIGTERM");
+        } catch (e) {
+        }
+        await new Promise((r) => setTimeout(r, graceMs));
+        try {
+          child.kill("SIGKILL");
+        } catch (e) {
+        }
+        return { stopped: true };
+      }
+    };
+    module2.exports = DaemonLifecycle2;
   }
 });
 
@@ -2648,7 +2450,6 @@ var universal = require_universal_fs();
 var path = universal.nodePath;
 var fs = universal.nodeFs;
 var spawn = universal.nodeChildProcess ? universal.nodeChildProcess.spawn : null;
-var AfmDaemon = require_afm_daemon();
 var HierarchicalProcessor = require_hierarchical();
 var MultiVectorEmbedder = require_multi_vector();
 var ZeusHttpClient = require_zeus_http_client();
@@ -2657,7 +2458,7 @@ var PassportIndex = require_passport_index();
 var BasesGenerator = require_bases_generator();
 var DistributedCoordinator = require_distributed_coordinator();
 var PassportScheduler = require_passport_scheduler();
-var PythonWorker = require_python_worker();
+var DaemonLifecycle = require_daemon_lifecycle();
 var VIEW_TYPE_SMART = "zeus-smart-view";
 var VIEW_TYPE_STATUS = "zeus-status-view";
 var DATA_DIR_NAME = "data";
@@ -2666,12 +2467,8 @@ var MANIFEST_FILE = "manifest.json";
 var OCR_CACHE_DIR = "aocr-cache";
 var IMAGE_FEAT_CACHE_DIR = "av-cache";
 var ENRICH_CACHE_DIR = "aia-enrich-cache";
-var AFM_BIN_NAMES = ["afm", "metafm"];
-var AFM_FALLBACK = "/Users/rogermaiocchi/.local/bin/metafm";
 var AUDIO_EXTENSIONS = /* @__PURE__ */ new Set(["m4a", "wav", "mp3"]);
 var DEFAULT_SETTINGS = {
-  afmPath: "",
-  // '' = auto-detect (bundled bin/afm > ~/.local/bin/metafm > metafm in PATH)
   indexOnStartup: true,
   indexOnSave: true,
   ocrEnabled: true,
@@ -2710,9 +2507,6 @@ var DEFAULT_SETTINGS = {
   // HyDE — disruptive query expansion
   hydeEnabled: false,
   // default OFF (adds ~3s latency per search); habilite p/ buscas complexas
-  // v0.5.0 — Persistent daemon (Fix 1)
-  afmDaemonEnabled: true,
-  // spawn `afm serve` once per session — elimina cold start ~30s
   // v0.5.0 — Hierarchical processor (Fix 2)
   hierarchicalThreshold: 1e4,
   // chars above which enrich delega para HierarchicalProcessor (NexusSum)
@@ -2793,76 +2587,19 @@ function cosine(a, b) {
 function normalizeForMatch(s) {
   return (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
 }
-function execMetafm(binPath, args, stdinText, timeoutMs = 6e4) {
-  return new Promise((resolve, reject) => {
-    if (!spawn) {
-      reject(new Error("execMetafm: child_process unavailable on this platform (iOS sandbox)"));
-      return;
-    }
-    const child = spawn(binPath, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error("metafm timeout"));
-    }, timeoutMs);
-    child.stdout.on("data", (d) => stdout += d.toString());
-    child.stderr.on("data", (d) => stderr += d.toString());
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`metafm exit ${code}: ${stderr.slice(0, 400)}`));
-    });
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-    if (stdinText) {
-      child.stdin.write(stdinText);
-      child.stdin.end();
-    } else {
-      child.stdin.end();
-    }
-  });
-}
 function isMac() {
   return universal.isMacLike();
 }
-async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs, spawnArgs, stdinText, timeoutMs) {
-  const preferDaemon = plugin.settings.daemonPreferredOverSpawn || !isMac();
-  if (preferDaemon && plugin.httpClient) {
-    try {
-      const reachable = await plugin.httpClient.isAvailable();
-      if (reachable && typeof plugin.httpClient[daemonMethod] === "function") {
-        return { source: "daemon", result: await plugin.httpClient[daemonMethod](...daemonArgs) };
-      }
-    } catch (e) {
-      console.warn(`[zeus] daemon ${daemonMethod} failed, falling back to spawn: ${e.message}`);
-    }
+async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs) {
+  if (!plugin.httpClient || typeof plugin.httpClient[daemonMethod] !== "function") {
+    throw new Error(`Daemon method indispon\xEDvel: ${daemonMethod}`);
   }
-  if (!isMac()) {
-    throw new Error(`Operation requires daemon (${daemonMethod}) but daemon is unreachable on this device (no spawn available)`);
+  const reachable = await plugin.httpClient.isAvailable();
+  if (!reachable) {
+    throw new Error(`Daemon HTTP fora do ar (${plugin.httpClient.baseUrl}) \u2014 ${daemonMethod} n\xE3o p\xF4de rodar`);
   }
-  const text = await execMetafm(plugin.afmBin, spawnArgs, stdinText, timeoutMs);
-  return { source: "spawn", result: text };
-}
-function resolveAfmBinary(plugin) {
-  if (!fs || !path) return "metafm";
-  if (plugin.settings.afmPath && fs.existsSync(plugin.settings.afmPath)) {
-    return plugin.settings.afmPath;
-  }
-  const vaultRoot = plugin.vaultRoot;
-  if (vaultRoot) {
-    const pluginDir = path.join(vaultRoot, plugin.manifest.dir);
-    for (const name of AFM_BIN_NAMES) {
-      const candidate = path.join(pluginDir, "bin", name);
-      if (fs.existsSync(candidate)) return candidate;
-    }
-  }
-  try {
-    if (fs.existsSync(AFM_FALLBACK)) return AFM_FALLBACK;
-  } catch (e) {
-  }
-  return "metafm";
+  const result = await plugin.httpClient[daemonMethod](...daemonArgs);
+  return { source: "daemon", result };
 }
 var TAILSCALE_MESH = [
   // Order matters — closest/fastest first
@@ -4367,11 +4104,9 @@ var ZeusSettingTab = class extends PluginSettingTab {
     desc.appendText(" (on-device, 512-dim) para ranqueamento + ");
     desc.createEl("strong", { text: "Vision OCR" });
     desc.appendText(" para PDFs/imagens. Sem BM25 pr\xF3prio, sem tokenizer pr\xF3prio, sem bge-micro-v2.");
-    new Setting(containerEl).setName("afm binary path").setDesc(`Apple Foundation Models CLI. Vazio = auto (bundled bin/afm > ~/.local/bin/metafm > $PATH). Resolved: ${this.plugin.afmBin}`).addText((t) => t.setValue(this.plugin.settings.afmPath || "").setPlaceholder("auto-detect").onChange(async (v) => {
-      this.plugin.settings.afmPath = v;
-      await this.plugin.saveSettings();
-      this.plugin.afmBin = resolveAfmBinary(this.plugin);
-    }));
+    const _lcStatus = this.plugin.daemonLifecycle && this.plugin.daemonLifecycle.lastStatus || null;
+    const _lcLabel = _lcStatus ? `${_lcStatus.running ? "ALIVE" : "DEAD"} (${_lcStatus.source}) \u2014 ${this.plugin.daemonLifecycle.url}` : "aguardando primeira verifica\xE7\xE3o";
+    new Setting(containerEl).setName("Daemon HTTP (bin/ZeusDaemonMac)").setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 n\xE3o responde. iOS consome via Tailscale/iCloud read-only. Estado: ${_lcLabel}`);
     containerEl.createEl("h3", { text: "Apple Vision multi-modal (av)" });
     new Setting(containerEl).setName("Image features extraction").setDesc("Para cada imagem indexada: aocr (texto) + av classify (categorias) + av landmarks (faces) + acs metadata (EXIF/GPS/data). Combinado \xE9 embeddado pelo afm.").addToggle((t) => t.setValue(this.plugin.settings.avImageFeatures).onChange(async (v) => {
       this.plugin.settings.avImageFeatures = v;
@@ -4640,8 +4375,7 @@ var ZeusPlugin = class extends Plugin {
       this.vaultRoot = this.app.vault.adapter && this.app.vault.adapter.basePath ? this.app.vault.adapter.basePath : null;
       this._manifestCache = null;
       this._embeddingsCache = null;
-      this.afmBin = resolveAfmBinary(this);
-      console.log("[zeus] platform:", universal.detectPlatform(), "| afm binary:", this.afmBin, "| vaultRoot:", this.vaultRoot || "(adapter-only)");
+      console.log("[zeus] platform:", universal.detectPlatform(), "| vaultRoot:", this.vaultRoot || "(adapter-only)");
       this.indexer = new ZeusIndexer(this);
       this.searcher = new ZeusSearcher(this);
       this.enricher = new ZeusEnricher(this);
@@ -4651,21 +4385,22 @@ var ZeusPlugin = class extends Plugin {
       this.graphExtractor = new ZeusGraphExtractor(this);
       this.nativeGraph = new ZeusNativeGraphIntegration(this);
       const pluginDataPath = path && this.vaultRoot ? path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME) : universal.joinPath(this.manifest.dir, DATA_DIR_NAME);
-      if (isMac() && this.settings.afmDaemonEnabled) {
-        try {
-          this.afmDaemon = new AfmDaemon(this.afmBin);
-          this.afmDaemon.start().catch((e) => console.warn("[zeus] afm-daemon start failed:", e.message));
-        } catch (e) {
-          console.warn("[zeus] afm-daemon construction skipped:", e.message);
-        }
-      }
-      this.hierarchical = new HierarchicalProcessor(this.afmBin, this.settings.hierarchicalThreshold);
-      this.multiVector = new MultiVectorEmbedder(this.afmBin, pluginDataPath);
+      this.hierarchical = new HierarchicalProcessor(null, this.settings.hierarchicalThreshold);
+      this.multiVector = new MultiVectorEmbedder(null, pluginDataPath);
       const _initialDaemonUrl = _zeusGetLocalDaemonUrl() || this.settings.zeusDaemonUrl;
       if (_initialDaemonUrl !== this.settings.zeusDaemonUrl) {
         console.log("[zeus] using per-device cached daemon URL:", _initialDaemonUrl, "(settings:", this.settings.zeusDaemonUrl, ")");
       }
       this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
+      this.daemonLifecycle = new DaemonLifecycle(this);
+      if (isMac()) {
+        try {
+          const status = await this.daemonLifecycle.ensureRunning();
+          console.log("[zeus] daemon lifecycle:", status);
+        } catch (e) {
+          console.warn("[zeus] daemon lifecycle ensureRunning failed:", e.message);
+        }
+      }
       this.imageSimilarity = new ImageSimilaritySearch(this);
       this.passport = new PassportIndex(this);
       this.basesGen = new BasesGenerator(this);
@@ -4843,15 +4578,16 @@ Ou desative "Permitir fallback remoto" para for\xE7ar modo strict on-device.`, 1
       });
       this.addCommand({
         id: "zeus-daemon-status",
-        name: "Zeus: status do afm daemon (Fix 1)",
+        name: "Zeus: status do daemon HTTP (lifecycle)",
         callback: () => {
-          if (!this.afmDaemon) {
-            new Notice("AfmDaemon n\xE3o instanciado (Mac only ou setting OFF)");
+          const lc = this.daemonLifecycle;
+          if (!lc) {
+            new Notice("DaemonLifecycle n\xE3o inicializado (iOS?)");
             return;
           }
-          const alive = this.afmDaemon.isAlive();
-          const tools = (this.afmDaemon.tools || []).length;
-          new Notice(`afm daemon: ${alive ? "ALIVE" : "DEAD"} \xB7 ${tools} tools discovered`);
+          const last = lc.lastStatus || { running: false, source: "unknown" };
+          const spawnedByUs = lc.spawnedByUs ? " (spawned by plugin)" : "";
+          new Notice(`Daemon ${last.running ? "ALIVE" : "DEAD"}: ${last.source}${spawnedByUs} \xB7 ${lc.url}`, 6e3);
         }
       });
       this.addCommand({
@@ -5333,42 +5069,6 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
           }
         }
       });
-      this.addCommand({
-        id: "zeus-python-worker-probe",
-        name: "Zeus: probe Python worker (apple-fm-sdk)",
-        callback: async () => {
-          try {
-            let nodePath = null;
-            try {
-              nodePath = require("path");
-            } catch (_) {
-            }
-            const adapter = this.app.vault.adapter;
-            const basePath = typeof adapter.getBasePath === "function" ? adapter.getBasePath() : adapter.basePath || "";
-            const pluginDir = this.manifest && this.manifest.dir ? nodePath ? nodePath.join(basePath, this.manifest.dir) : basePath + "/" + this.manifest.dir : null;
-            if (!pluginDir) {
-              new Notice("Zeus Python: plugin dir indispon\xEDvel");
-              return;
-            }
-            const out = await PythonWorker.runPythonWorker(
-              pluginDir,
-              "batch_eval",
-              { action: "version" },
-              { timeoutMs: 1e4 }
-            );
-            if (out && out.ok && out.result) {
-              const r = out.result;
-              const sdkLabel = r.apple_fm_sdk_available ? `apple-fm-sdk v${r.apple_fm_sdk_version}` : "apple-fm-sdk NOT INSTALLED";
-              const fmLabel = r.fm_on_device_available ? "FM on-device ON" : "FM on-device off";
-              new Notice(`Zeus Python: ${r.python} \xB7 ${sdkLabel} \xB7 ${fmLabel}`, 8e3);
-            } else {
-              new Notice("Zeus Python: " + (out && out.error || "erro desconhecido"), 6e3);
-            }
-          } catch (e) {
-            new Notice("Zeus Python falhou: " + (e.message || String(e)).slice(0, 200), 6e3);
-          }
-        }
-      });
       this.addRibbonIcon("sparkles", "Zeus search", () => new ZeusSearchModal(this.app, this).open());
       this.registerView(VIEW_TYPE_SMART, (leaf) => new ZeusSmartView(leaf, this));
       this.registerView(VIEW_TYPE_STATUS, (leaf) => new ZeusStatusView(leaf, this));
@@ -5587,11 +5287,11 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
       for (const t of this._passportRefreshTimers.values()) clearTimeout(t);
       this._passportRefreshTimers.clear();
     }
-    if (this.afmDaemon) {
+    if (this.daemonLifecycle) {
       try {
-        await this.afmDaemon.stop();
+        await this.daemonLifecycle.stop();
       } catch (e) {
-        console.warn("[zeus] daemon stop:", e.message);
+        console.warn("[zeus] daemon lifecycle stop:", e.message);
       }
     }
   }

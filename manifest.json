@@ -1,9 +1,9 @@
 {
   "id": "zeus",
   "name": "Zeus — Apple-native Search & Connections",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "minAppVersion": "1.5.0",
-  "description": "Multi-modal Apple ecosystem-native search & connections. v1.3 adiciona afm-refine (Writing Tools nativo via FoundationModels), asp-transcribe/asp-vad (SpeechAnalyzer + SpeechTranscriber macOS 26+) para indexar voice memos do vault, e python-worker-layer (apple-fm-sdk Python via child_process.spawn) para batch jobs offline. v1.4 traz paridade Mac↔iOS via endpoints /v1/refine (Writing Tools livre), /v1/hyde (Hypothetical Document Embeddings), /v1/graph/extract (extração de triplas) e /v1/agent com context RAG-style. Mantém Passport Index Architecture v1.2 token-efficient, Apple Cloud Private (PCC) opt-in end-to-end, camadas afm (Foundation Models), av (Vision: classify+OCR+landmarks+EXIF), anl (NLContextualEmbedding 512-dim), aia (Intelligence: enrich+agent+graph com chunking hierárquico NexusSum) e HyDE query expansion. Indexação no Mac via daemon SwiftNIO, leitura cross-device via iCloud + Tailscale.",
+  "description": "Drop-in autônomo: o plugin embarca o daemon Apple-nativo (bin/ZeusDaemonMac, arm64 codesigned adhoc) e o sobe sozinho quando 127.0.0.1:2223 não responde — sem swift build, sem launchctl manual, sem Python. iOS Capacitor degrada gracioso (read-only consumindo data/embeddings.jsonl syncado via iCloud). Pipeline 100% Apple: FoundationModels (afm), Vision (av), NaturalLanguage (anl 512-dim), Speech (asp), Translation, CoreSpotlight (acs). Endpoints /v1/embed, /v1/refine, /v1/hyde, /v1/graph/extract, /v1/agent, /v1/asp/transcribe, /v1/passport/*. PIA token-efficient, Apple Cloud Private (PCC) opt-in, chunking hierárquico NexusSum, HyDE query expansion.",
   "author": "Roger Maiocchi",
   "authorUrl": "https://maiocchi.adv.br",
   "isDesktopOnly": false

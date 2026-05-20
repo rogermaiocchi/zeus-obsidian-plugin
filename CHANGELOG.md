@@ -4,6 +4,59 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.5.0] — 2026-05-20 — Autonomia drop-in (daemon embarcado + dead code removido)
+
+Refatoração arquitetural inspirada no padrão [`ios-control-mcp`](https://github.com/rogermaiocchi/ios-control-mcp) (declarar deps + doctor + bootstrap + degradação graciosa). Plugin agora roda no Mac sem nenhuma instalação prévia — `swift build`, `launchctl`, `pip install` foram abolidos do caminho do usuário final.
+
+### Added — `bin/ZeusDaemonMac` bundlado
+
+- Binário arm64 (6.9 MB) codesigned adhoc, copiado para `bin/ZeusDaemonMac` e commitado no repo (`.gitignore` ajustado).
+- Maintainer regenera com `node scripts/build-release.mjs` (faz `swift build -c release` → `cp` → `chmod +x` → `xattr -d` → `codesign --sign -` → `node esbuild.config.mjs`).
+
+### Added — `lib/daemon-lifecycle.js` (auto-spawn)
+
+- Plugin no `onload()` chama `DaemonLifecycle.ensureRunning()`:
+  - Probe `/v1/health` em 127.0.0.1:2223 com timeout 800ms.
+  - Se já vivo (ex: LaunchAgent pré-existente) → status `pre-existing`, sem spawn.
+  - Se morto → `spawn(bin/ZeusDaemonMac, ['--port','2223','--host','127.0.0.1'])` detached:false (lifecycle amarrado ao Obsidian), polling de `/v1/health` por até 10s.
+- `onunload()` chama `stop({graceMs:2000})` → `SIGTERM` → `SIGKILL`.
+- iOS Capacitor (sem child_process) retorna `status: no-spawn` e degrada gracioso (plugin lê embeddings.jsonl syncado via iCloud).
+- Idempotente: nunca lança; só reporta `lastStatus`.
+
+### Added — `scripts/zeus-doctor.mjs` + `scripts/zeus-smoke.mjs`
+
+- Doctor verifica 7 layers: macOS version, `bin/ZeusDaemonMac` (existe + executável + tamanho), codesign (adhoc/Apple), `main.js`, `manifest.json`, `package.json`, daemon HTTP `/v1/health` (FM/NL/Vision/Speech flags). Exit 0/1/2 CI-friendly.
+- Smoke exercita endpoints críticos: `/v1/health` (3 asserts), `/v1/embed` (200 + dim=512), `/v1/tools` (count>0), `/v1/refine` (200 + non-empty). Validado 9/9 contra daemon v1.0.0 em produção.
+- Comandos `bun run doctor` + `bun run smoke` registrados no `package.json`.
+
+### Removed — dead code
+
+- `lib/python-worker.js` (~128 LOC) + `bin/batch_eval.py` + comando `zeus-python-worker-probe` (linha ~3185). Era probe stub `try/except apple_fm_sdk` sem callers reais.
+- `lib/afm-daemon.js` (333 LOC, JSON-RPC daemon legacy). Substituído pelo HTTP daemon em `lib/zeus-http-client.js` há várias versões; permanecia como caminho paralelo.
+- `scripts/install-afm.sh`. O binário CLI `afm/metafm` que ele tentava copiar **nunca existiu no disco** (`Package.swift` em `apple-intelligence` produz `MetassistemaAgent`, não `metafm`) — script estava quebrado em silêncio. Removido junto com `AFM_BIN_NAMES`, `AFM_FALLBACK`, `resolveAfmBinary`, `execMetafm`, setting `afmPath`, setting `afmDaemonEnabled`, `tryDaemonOrSpawn` (refatorado para daemon-only).
+- Settings UI: input "afm binary path" → substituído por display read-only do estado do `daemonLifecycle`.
+
+### Changed — `tryDaemonOrSpawn` agora é daemon-only
+
+Função preserva a assinatura `(plugin, daemonMethod, daemonArgs, ...)` e o shape de retorno `{source: 'daemon', result}` por compat com 9 callsites em `main.source.js`. Internamente lança se o daemon não responde — nada mais de spawn fallback. Reduziu ~80 LOC.
+
+### Changed — `HierarchicalProcessor` + `MultiVectorEmbedder` perdem dep `afmBin`
+
+Plugin construtor passa `null` para o argumento `afmBin`. Ambos os módulos têm caminho HTTP via `plugin.httpClient` que vinha sendo silenciosamente preferido. Mantém-se a assinatura por compat.
+
+### Validation
+
+- `node esbuild.config.mjs` → `main.js` 224 KB (parse OK)
+- `node scripts/zeus-doctor.mjs` → 7 OK / 0 WARN / 0 FAIL
+- `node scripts/zeus-smoke.mjs` → 9/9 asserts (health · embed dim=512 · tools count=12 · refine non-empty)
+- Daemon spawn lifecycle: verifica `lsof -ti:2223` antes/depois do plugin load → spawn confirmado, kill confirmado no unload
+
+### Migration path
+
+Usuários v1.4.x: nenhuma ação necessária. Settings `afmPath` e `afmDaemonEnabled` ficam órfãos em `data.json` (ignorados pelo runtime). LaunchAgent `com.maiocchi.zeusdaemon` se já instalado segue vivo e o plugin reaproveita (status `pre-existing`). Para desinstalar o LaunchAgent (não obrigatório): `launchctl bootout gui/$UID/com.maiocchi.zeusdaemon`.
+
+---
+
 ## [1.4.0] — 2026-05-16 — Paridade Mac ↔ iOS (port Fase 0 + Fase 2 do meta-projeto-aegis)
 
 Integra o trabalho `v1.0.0-zeus-port` do fork `meta-projeto-aegis` sobre o canônico v1.3.4, sem regressão das features v1.3.x (SFSpeechRecognizer dual-engine, real-time audio indexing, refine via Apple, `/v1/asp/transcribe`, `/v1/asp/vad`, `X-Zeus-Allow-Pcc`).

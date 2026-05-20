@@ -90,6 +90,19 @@ function main() {
 
   checkEndpointContracts();
 
+  // v1.5 — autonomia: validate bundled daemon binary
+  const daemonBin = join(root, 'bin/ZeusDaemonMac');
+  if (!existsSync(daemonBin)) {
+    throw new Error(`bin/ZeusDaemonMac ausente — rode: node scripts/build-release.mjs`);
+  }
+  const stat = statSync(daemonBin);
+  if (!(stat.mode & 0o111)) {
+    throw new Error(`bin/ZeusDaemonMac não é executável (mode ${stat.mode.toString(8)})`);
+  }
+  if (stat.size < 1_000_000) {
+    throw new Error(`bin/ZeusDaemonMac suspeito (${stat.size}B) — esperado >1MB`);
+  }
+
   run('swift', ['build', '-c', 'debug', '--product', 'ZeusDaemonMac'], { cwd: join(root, 'daemon') });
   run('swift', ['build', '-c', 'debug', '--target', 'AegisDaemon'], { cwd: join(root, 'daemon') });
 

@@ -172,7 +172,6 @@ const fs = universal.nodeFs;
 const spawn = universal.nodeChildProcess ? universal.nodeChildProcess.spawn : null;
 
 // v0.5.0 — modular extensions (parallel-built by subagents)
-const AfmDaemon = require('./lib/afm-daemon');             // Fix 1: JSON-RPC persistent daemon
 const HierarchicalProcessor = require('./lib/hierarchical'); // Fix 2: NexusSum-pattern long-doc enrich
 const MultiVectorEmbedder = require('./lib/multi-vector');   // Fix 4: 3×512=1536-dim effective coverage
 const ZeusHttpClient = require('./lib/zeus-http-client');    // v0.6: Aegis-pattern daemon HTTP transport (ADR-018)
@@ -181,7 +180,7 @@ const PassportIndex = require('./lib/passport-index');       // v0.9: Passport I
 const BasesGenerator = require('./lib/bases-generator');     // v0.9: Obsidian Bases UI derivative from passports.jsonl
 const DistributedCoordinator = require('./lib/distributed-coordinator'); // v0.10: cross-device claim/release via iCloud lock files
 const PassportScheduler = require('./lib/passport-scheduler');           // v0.10: background sweep for stale passports
-const PythonWorker = require('./lib/python-worker');                     // v1.3: Python worker layer (apple-fm-sdk via child_process.spawn)
+const DaemonLifecycle = require('./lib/daemon-lifecycle');               // v1.5: auto-spawn bin/ZeusDaemonMac (autonomia total Mac)
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -192,16 +191,14 @@ const OCR_CACHE_DIR = 'aocr-cache';            // ex-ocr-cache
 const IMAGE_FEAT_CACHE_DIR = 'av-cache';       // image features (classify + landmarks + EXIF)
 const ENRICH_CACHE_DIR = 'aia-enrich-cache';   // ex-enrich-cache (AIA = Apple Intelligence)
 
-// AFM binary resolution: prefer bundled bin/afm, fallback global metafm
-const AFM_BIN_NAMES = ['afm', 'metafm'];
-const AFM_FALLBACK = '/Users/rogermaiocchi/.local/bin/metafm';
+// v1.5 — CLI afm/metafm removido. Daemon HTTP (bin/ZeusDaemonMac) é a única
+// superfície de execução. iOS degrada gracioso quando daemon não é alcançável.
 
 // v1.3.3 — real-time audio indexing
 // Extensões processadas via /v1/asp/vad → /v1/asp/transcribe → /v1/embed
 const AUDIO_EXTENSIONS = new Set(['m4a', 'wav', 'mp3']);
 
 const DEFAULT_SETTINGS = {
-  afmPath: '',                    // '' = auto-detect (bundled bin/afm > ~/.local/bin/metafm > metafm in PATH)
   indexOnStartup: true,
   indexOnSave: true,
   ocrEnabled: true,
@@ -231,8 +228,6 @@ const DEFAULT_SETTINGS = {
   aocrPdfStructured: true,        // use --structured for layout-aware PDF (macOS 26+)
   // HyDE — disruptive query expansion
   hydeEnabled: false,             // default OFF (adds ~3s latency per search); habilite p/ buscas complexas
-  // v0.5.0 — Persistent daemon (Fix 1)
-  afmDaemonEnabled: true,         // spawn `afm serve` once per session — elimina cold start ~30s
   // v0.5.0 — Hierarchical processor (Fix 2)
   hierarchicalThreshold: 10000,   // chars above which enrich delega para HierarchicalProcessor (NexusSum)
   // v0.5.0 — Multi-vector embedding (Fix 4)
@@ -301,88 +296,29 @@ function normalizeForMatch(s) {
   return (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
 }
 
-function execMetafm(binPath, args, stdinText, timeoutMs = 60000) {
-  return new Promise((resolve, reject) => {
-    if (!spawn) {
-      reject(new Error('execMetafm: child_process unavailable on this platform (iOS sandbox)'));
-      return;
-    }
-    const child = spawn(binPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '';
-    const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('metafm timeout')); }, timeoutMs);
-    child.stdout.on('data', d => stdout += d.toString());
-    child.stderr.on('data', d => stderr += d.toString());
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`metafm exit ${code}: ${stderr.slice(0, 400)}`));
-    });
-    child.on('error', e => { clearTimeout(timer); reject(e); });
-    if (stdinText) {
-      child.stdin.write(stdinText);
-      child.stdin.end();
-    } else {
-      child.stdin.end();
-    }
-  });
-}
-
 function isMac() {
   // process.platform doesn't exist on iOS (Capacitor) — fallback to UA detection.
   return universal.isMacLike();
 }
 
 // =========================================================================
-// HTTP-first dispatcher (ADR-018 Aegis pattern, fase E++)
+// HTTP-only dispatcher (ADR-018 Aegis pattern, v1.5 — autonomous daemon)
 // -------------------------------------------------------------------------
-// Toda chamada que historicamente ia via `execMetafm` (child_process.spawn)
-// passa primeiro pelo daemon HTTP local quando `daemonPreferredOverSpawn`
-// está ON (default true em v0.6) OU quando estamos em iOS (sem spawn).
-// Se daemon não responde, faz fallback gracioso para spawn (Mac only).
+// Plugin v1.5 abandona o caminho child_process.spawn — toda operação Apple
+// passa pelo daemon HTTP local (bin/ZeusDaemonMac auto-spawned no Mac via
+// DaemonLifecycle, AegisDaemon embebido no host app no iOS). Retorna shape
+// { source, result } por compatibilidade com callsites legados.
 // -------------------------------------------------------------------------
-async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs, spawnArgs, stdinText, timeoutMs) {
-  const preferDaemon = plugin.settings.daemonPreferredOverSpawn || !isMac();
-  if (preferDaemon && plugin.httpClient) {
-    try {
-      const reachable = await plugin.httpClient.isAvailable();
-      if (reachable && typeof plugin.httpClient[daemonMethod] === 'function') {
-        return { source: 'daemon', result: await plugin.httpClient[daemonMethod](...daemonArgs) };
-      }
-    } catch (e) {
-      console.warn(`[zeus] daemon ${daemonMethod} failed, falling back to spawn: ${e.message}`);
-    }
+async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs /* spawnArgs, stdinText, timeoutMs ignorados */) {
+  if (!plugin.httpClient || typeof plugin.httpClient[daemonMethod] !== 'function') {
+    throw new Error(`Daemon method indisponível: ${daemonMethod}`);
   }
-  if (!isMac()) {
-    throw new Error(`Operation requires daemon (${daemonMethod}) but daemon is unreachable on this device (no spawn available)`);
+  const reachable = await plugin.httpClient.isAvailable();
+  if (!reachable) {
+    throw new Error(`Daemon HTTP fora do ar (${plugin.httpClient.baseUrl}) — ${daemonMethod} não pôde rodar`);
   }
-  const text = await execMetafm(plugin.afmBin, spawnArgs, stdinText, timeoutMs);
-  return { source: 'spawn', result: text };
-}
-
-// Resolve afm binary path: explicit setting > bundled bin/ > global ~/.local/bin/metafm > $PATH metafm
-// On iOS (no fs/path), returns the default 'metafm' string — caller should never invoke
-// it on iOS anyway (tryDaemonOrSpawn throws when no daemon is reachable).
-function resolveAfmBinary(plugin) {
-  if (!fs || !path) return 'metafm';
-  // 1. Explicit user setting
-  if (plugin.settings.afmPath && fs.existsSync(plugin.settings.afmPath)) {
-    return plugin.settings.afmPath;
-  }
-  // 2. Bundled in plugin dir: bin/afm
-  const vaultRoot = plugin.vaultRoot;
-  if (vaultRoot) {
-    const pluginDir = path.join(vaultRoot, plugin.manifest.dir);
-    for (const name of AFM_BIN_NAMES) {
-      const candidate = path.join(pluginDir, 'bin', name);
-      if (fs.existsSync(candidate)) return candidate;
-    }
-  }
-  // 3. Global fallback (Mac dev machines)
-  try {
-    if (fs.existsSync(AFM_FALLBACK)) return AFM_FALLBACK;
-  } catch {}
-  // 4. Last resort: rely on PATH lookup
-  return 'metafm';
+  const result = await plugin.httpClient[daemonMethod](...daemonArgs);
+  return { source: 'daemon', result };
 }
 
 // v0.6.1 — Adaptive daemon discovery: tries local loopback, then Tailscale mesh
@@ -2107,10 +2043,14 @@ class ZeusSettingTab extends PluginSettingTab {
     desc.createEl('strong', { text: 'Vision OCR' });
     desc.appendText(' para PDFs/imagens. Sem BM25 próprio, sem tokenizer próprio, sem bge-micro-v2.');
 
+    // v1.5 — Daemon HTTP (bin/ZeusDaemonMac) é a única superfície Apple. CLI removida.
+    const _lcStatus = (this.plugin.daemonLifecycle && this.plugin.daemonLifecycle.lastStatus) || null;
+    const _lcLabel = _lcStatus
+      ? `${_lcStatus.running ? 'ALIVE' : 'DEAD'} (${_lcStatus.source}) — ${this.plugin.daemonLifecycle.url}`
+      : 'aguardando primeira verificação';
     new Setting(containerEl)
-      .setName('afm binary path')
-      .setDesc(`Apple Foundation Models CLI. Vazio = auto (bundled bin/afm > ~/.local/bin/metafm > $PATH). Resolved: ${this.plugin.afmBin}`)
-      .addText(t => t.setValue(this.plugin.settings.afmPath || '').setPlaceholder('auto-detect').onChange(async v => { this.plugin.settings.afmPath = v; await this.plugin.saveSettings(); this.plugin.afmBin = resolveAfmBinary(this.plugin); }));
+      .setName('Daemon HTTP (bin/ZeusDaemonMac)')
+      .setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 não responde. iOS consome via Tailscale/iCloud read-only. Estado: ${_lcLabel}`);
 
     containerEl.createEl('h3', { text: 'Apple Vision multi-modal (av)' });
 
@@ -2496,8 +2436,7 @@ class ZeusPlugin extends Plugin {
     this.vaultRoot = this.app.vault.adapter && this.app.vault.adapter.basePath ? this.app.vault.adapter.basePath : null;
     this._manifestCache = null;
     this._embeddingsCache = null;
-    this.afmBin = resolveAfmBinary(this);
-    console.log('[zeus] platform:', universal.detectPlatform(), '| afm binary:', this.afmBin, '| vaultRoot:', this.vaultRoot || '(adapter-only)');
+    console.log('[zeus] platform:', universal.detectPlatform(), '| vaultRoot:', this.vaultRoot || '(adapter-only)');
     this.indexer = new ZeusIndexer(this);
     this.searcher = new ZeusSearcher(this);
     this.enricher = new ZeusEnricher(this);
@@ -2513,16 +2452,12 @@ class ZeusPlugin extends Plugin {
     const pluginDataPath = (path && this.vaultRoot)
       ? path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME)
       : universal.joinPath(this.manifest.dir, DATA_DIR_NAME);
-    if (isMac() && this.settings.afmDaemonEnabled) {
-      try {
-        this.afmDaemon = new AfmDaemon(this.afmBin);
-        this.afmDaemon.start().catch(e => console.warn('[zeus] afm-daemon start failed:', e.message));
-      } catch (e) {
-        console.warn('[zeus] afm-daemon construction skipped:', e.message);
-      }
-    }
-    this.hierarchical = new HierarchicalProcessor(this.afmBin, this.settings.hierarchicalThreshold);
-    this.multiVector = new MultiVectorEmbedder(this.afmBin, pluginDataPath);
+    // v1.5 — HierarchicalProcessor e MultiVectorEmbedder herdaram dependência
+    // de `afmBin` (spawn child_process). Mantemos a assinatura por compat —
+    // passamos null: ambos os módulos verificam o binário antes de invocar e
+    // caem para o daemon HTTP via `plugin.httpClient` no caminho moderno.
+    this.hierarchical = new HierarchicalProcessor(null, this.settings.hierarchicalThreshold);
+    this.multiVector = new MultiVectorEmbedder(null, pluginDataPath);
     // v0.6.0 — ADR-018 Aegis-pattern HTTP daemon client (works on ALL devices: Mac+iOS uniform)
     // v1.4.1 — Prefer per-device cached URL (localStorage, NÃO sincronizado via iCloud).
     // Isso garante que cada device (Mac mini, MacBook, iPad, iPhone) use a URL que
@@ -2532,6 +2467,21 @@ class ZeusPlugin extends Plugin {
       console.log('[zeus] using per-device cached daemon URL:', _initialDaemonUrl, '(settings:', this.settings.zeusDaemonUrl, ')');
     }
     this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
+
+    // v1.5 — Daemon lifecycle: se 127.0.0.1:2223 não responder, plugin sobe
+    // bin/ZeusDaemonMac sozinho (autonomia "drop-in" sem launchctl manual).
+    // iOS: child_process indisponível → status `no-spawn`, plugin segue em modo
+    // degradado read-only consumindo data/embeddings.jsonl syncado do Mac.
+    this.daemonLifecycle = new DaemonLifecycle(this);
+    if (isMac()) {
+      try {
+        const status = await this.daemonLifecycle.ensureRunning();
+        console.log('[zeus] daemon lifecycle:', status);
+      } catch (e) {
+        console.warn('[zeus] daemon lifecycle ensureRunning failed:', e.message);
+      }
+    }
+
     // v0.7.0 — image similarity search via feature-print cache
     this.imageSimilarity = new ImageSimilaritySearch(this);
     // v0.9.0 — Passport Index Architecture (PIA): MCP-first agent surface
@@ -2721,15 +2671,13 @@ class ZeusPlugin extends Plugin {
     });
     this.addCommand({
       id: 'zeus-daemon-status',
-      name: 'Zeus: status do afm daemon (Fix 1)',
+      name: 'Zeus: status do daemon HTTP (lifecycle)',
       callback: () => {
-        if (!this.afmDaemon) {
-          new Notice('AfmDaemon não instanciado (Mac only ou setting OFF)');
-          return;
-        }
-        const alive = this.afmDaemon.isAlive();
-        const tools = (this.afmDaemon.tools || []).length;
-        new Notice(`afm daemon: ${alive ? 'ALIVE' : 'DEAD'} · ${tools} tools discovered`);
+        const lc = this.daemonLifecycle;
+        if (!lc) { new Notice('DaemonLifecycle não inicializado (iOS?)'); return; }
+        const last = lc.lastStatus || { running: false, source: 'unknown' };
+        const spawnedByUs = lc.spawnedByUs ? ' (spawned by plugin)' : '';
+        new Notice(`Daemon ${last.running ? 'ALIVE' : 'DEAD'}: ${last.source}${spawnedByUs} · ${lc.url}`, 6000);
       },
     });
     this.addCommand({
@@ -3180,46 +3128,6 @@ class ZeusPlugin extends Plugin {
       },
     });
 
-    // v1.3 — Python worker layer probe (apple-fm-sdk via child_process.spawn)
-    this.addCommand({
-      id: 'zeus-python-worker-probe',
-      name: 'Zeus: probe Python worker (apple-fm-sdk)',
-      callback: async () => {
-        try {
-          let nodePath = null;
-          try { nodePath = require('path'); } catch (_) { /* v1.4.2-ios: sandbox */ }
-          const adapter = this.app.vault.adapter;
-          const basePath = typeof adapter.getBasePath === 'function'
-            ? adapter.getBasePath()
-            : (adapter.basePath || '');
-          const pluginDir = this.manifest && this.manifest.dir
-            ? (nodePath ? nodePath.join(basePath, this.manifest.dir) : basePath + '/' + this.manifest.dir)
-            : null;
-          if (!pluginDir) {
-            new Notice('Zeus Python: plugin dir indisponível');
-            return;
-          }
-          const out = await PythonWorker.runPythonWorker(
-            pluginDir,
-            'batch_eval',
-            { action: 'version' },
-            { timeoutMs: 10000 },
-          );
-          if (out && out.ok && out.result) {
-            const r = out.result;
-            const sdkLabel = r.apple_fm_sdk_available
-              ? `apple-fm-sdk v${r.apple_fm_sdk_version}`
-              : 'apple-fm-sdk NOT INSTALLED';
-            const fmLabel = r.fm_on_device_available ? 'FM on-device ON' : 'FM on-device off';
-            new Notice(`Zeus Python: ${r.python} · ${sdkLabel} · ${fmLabel}`, 8000);
-          } else {
-            new Notice('Zeus Python: ' + ((out && out.error) || 'erro desconhecido'), 6000);
-          }
-        } catch (e) {
-          new Notice('Zeus Python falhou: ' + (e.message || String(e)).slice(0, 200), 6000);
-        }
-      },
-    });
 
     this.addRibbonIcon('sparkles', 'Zeus search', () => new ZeusSearchModal(this.app, this).open());
 
@@ -3474,8 +3382,8 @@ class ZeusPlugin extends Plugin {
       for (const t of this._passportRefreshTimers.values()) clearTimeout(t);
       this._passportRefreshTimers.clear();
     }
-    if (this.afmDaemon) {
-      try { await this.afmDaemon.stop(); } catch (e) { console.warn('[zeus] daemon stop:', e.message); }
+    if (this.daemonLifecycle) {
+      try { await this.daemonLifecycle.stop(); } catch (e) { console.warn('[zeus] daemon lifecycle stop:', e.message); }
     }
   }
 

@@ -1,128 +1,68 @@
 # Zeus — Instalação
 
-## Pré-requisitos
+> v1.5 — autonomia drop-in. O plugin embarca o daemon Apple-nativo (`bin/ZeusDaemonMac`, arm64, codesigned adhoc). **Nenhum `swift build`, `bash install-*.sh` ou `pip install` é necessário do lado do usuário.**
 
-- macOS 26.0+ (Sequoia / Tahoe) — FoundationModels requer macOS 15.1+ e Apple Silicon
-- Swift 6.0+ (vem com Xcode Command Line Tools)
-- Obsidian 1.5+
+## Pré-requisitos do dispositivo
 
-## Passo 1 — Binary `afm`
+| Plataforma | Requisito | Onde valida |
+|---|---|---|
+| Apple Silicon Mac | macOS 26+ (Sequoia/Tahoe) com Apple Intelligence habilitado | System Settings → Apple Intelligence & Siri |
+| iPhone / iPad | iOS/iPadOS 17.4+ (read-only via iCloud) | n/a — plugin detecta sandbox e degrada gracioso |
+| Obsidian | 1.5+ | About → Version |
 
-O plugin precisa de um binary `afm` (Apple Foundation Models CLI). Três caminhos:
+Não há dependência externa. `swift`, Xcode, Python, Homebrew, Tailscale — todos opcionais.
 
-### Opção A — Bundled em `bin/` (recomendado para distribuição)
+## Instalação
 
-Se você já tem `metafm` compilado no Metassistema:
+1. Baixe o release `.zip` do plugin.
+2. Extraia em `<seu-vault>/.obsidian/plugins/zeus/` (deve conter `manifest.json`, `main.js`, `styles.css`, `bin/ZeusDaemonMac`).
+3. Settings → Community plugins → habilite **Zeus**.
+4. Cmd+P → `Zeus: reindexar vault completo` (primeira indexação).
 
-```bash
-cd <plugin-dir>
-bash scripts/install-afm.sh
-```
+Pronto. O plugin no Mac sobe `bin/ZeusDaemonMac` em foreground (porta 2223 loopback) e mata o processo quando o Obsidian fecha. Cmd+P → `Zeus: status do daemon HTTP` mostra o estado.
 
-Isso copia `metafm` do `Metassistema/50_Ferramentas/apple-intelligence/.build/release/metafm` para `bin/afm` no plugin dir.
+## Como o lifecycle funciona
 
-### Opção B — Global `~/.local/bin/metafm` (fallback automático)
+- **Daemon já vivo** (ex: você já tem LaunchAgent rodando) → plugin reaproveita. Não faz spawn, não interfere.
+- **Daemon ausente** → plugin spawna `bin/ZeusDaemonMac --port 2223 --host 127.0.0.1` no `onload()`, monitora `/v1/health` por até 10s. Sucesso → opera normal. Falha → degrada gracioso (Notice no Settings tab) e Obsidian continua funcional.
+- **iOS Capacitor** (sem `child_process`) → plugin nunca tenta spawn. Lê `data/embeddings.jsonl` syncado via iCloud do Mac. Busca cai para substring; semântica fica disponível quando o vault syncar do Mac.
 
-Se você já tem `metafm` em `~/.local/bin/`, o plugin detecta automaticamente — não precisa fazer nada.
+## Cross-device (opcional)
 
-### Opção C — Custom path
+Vault em iCloud Drive sincroniza automaticamente entre Mac e iPhone/iPad. Plugin instalado no Mac propaga `.obsidian/plugins/zeus/` para os outros devices. iOS lê os embeddings pré-computados pelo Mac.
 
-Settings → Zeus → afm binary path → digite o caminho absoluto.
+Para querer rodar a IA também no Mac de outro device (mesh), Settings → Zeus → "Tailscale fallback" e abra a porta 2223 no Tailscale do Mac canônico.
 
-## Passo 2 — Ativação
+## Verificação rápida
 
-1. Copie a pasta `zeus/` para `<seu-vault>/.obsidian/plugins/`
-2. Reinicie Obsidian (Cmd+Q + reabrir)
-3. Settings → Community plugins → habilite "Zeus — Apple-native Search & Connections"
-4. Cmd+P → `Zeus: reindexar vault completo` (primeira indexação)
+Cmd+P:
 
-## Passo 3 — Validação
-
-Cmd+P → `Zeus: buscar` — deve abrir o modal de busca. Digite duas letras para ativar.
-
-Console (Cmd+Opt+I) deve mostrar:
-```
-[zeus] loaded v1.4.3 — Apple-native search & connections
-[zeus] afm binary resolved: /path/to/afm
-```
-
-## Cross-device (iPhone / iPad)
-
-1. Vault deve estar em iCloud Drive (`~/Library/Mobile Documents/iCloud~md~obsidian/<vault>/`)
-2. Plugin instalado no Mac propaga via iCloud (`.obsidian/plugins/zeus/` sincroniza)
-3. No iPhone: Obsidian → Settings → Community plugins → ative Zeus
-4. iOS plugin lê `data/embeddings.jsonl` pré-computado pelo Mac
-5. Busca em iOS usa fallback substring (sem afm); Smart View mostra cosine neighbors
-
-## v0.6 — Mac daemon (Aegis-pattern HTTP, ADR-018)
-
-Para eliminar cold start ~30s e ter HyDE em ~100ms, instale o `ZeusDaemonMac` no Mac mini/MacBook:
-
-```bash
-cd /Users/rogermaiocchi/Metassistema/50_Ferramentas/apple-intelligence/ProjetoAegis
-./scripts/install-mac-daemon.sh
-```
-
-Isso:
-1. Rebuild via `swift build -c release --product ZeusDaemonMac`
-2. Copia binary para `~/.local/bin/zeusdaemon-mac`
-3. Instala LaunchAgent em `~/Library/LaunchAgents/com.maiocchi.zeusdaemon.plist`
-4. `launchctl bootstrap gui/$(id -u)` + `enable`
-5. Verifica via `curl http://127.0.0.1:2223/v1/health`
-
-Logs: `/tmp/zeusdaemon.out.log` + `/tmp/zeusdaemon.err.log`
-
-Stop: `launchctl bootout gui/$(id -u)/com.maiocchi.zeusdaemon`
-
-Após o daemon rodar:
-1. Obsidian Settings → Zeus → ative **"Prefer daemon over child_process"**
-2. Cmd+P → `Zeus: probe HTTP daemon` deve reportar `{status: ok, platform: macOS, nl_available: true, vision_available: true, fm_available: true}`
-3. HyDE queries agora respondem em ~100ms (vs ~30s antes)
-
-### v0.6 — iOS daemon (AegisDaemon HTTP extension)
-
-Já implementado no projeto Aegis (`Sources/AegisDaemon/AegisHTTPServer.swift` + `AegisHTTPHandlers.swift`). 
-
-**Status atual**: iOS xcodebuild bate em "multiple resources named 'PrivacyInfo.xcprivacy' in target 'MetassistemaAgent'" — colisão SwiftPM por adicionar ZeusDaemonMac target. Para resolver:
-
-```bash
-# Opção 1 — remover duplicata de PrivacyInfo.xcprivacy nos targets sobrepostos
-find ProjetoAegis -name PrivacyInfo.xcprivacy  # ver onde está duplicado
-# remover ou mover para target compartilhado
-
-# Opção 2 — separar Mac target em Package.swift próprio
-# (ZeusDaemonMac fica em SwiftPM isolado, MetassistemaApp iOS no .xcworkspace original)
-```
-
-Após corrigir, abra `MetassistemaApp.xcworkspace` no Xcode 26+, conecte iPhone via USB, Cmd+R. Daemon roda dentro do app — endpoints disponíveis em `http://127.0.0.1:2223/v1/{embed,enrich,agent,ocr,health}`.
-
-### v0.6 — Fase D consolidada (AegisClaudeAgent on-device)
-
-`AegisClaudeAgent.swift` foi refatorado para usar **FoundationModels.LanguageModelSession** em vez de `api.anthropic.com` remoto. Detalhes:
-- `SystemLanguageModel.default.availability` check com fallback message
-- ReAct loop em Swift via parsing de `TOOL_CALL: <name> {json}` markers no output do modelo
-- 13 ferramentas nativas preservadas (read_file, write_file, list_dir, spotlight_search, calendar_query, contacts_search, photos_search, health_read, reminders_query, device_audit, send_notification, configurator_cmd, aegis_cmd)
-- `claude.key` (Anthropic API key) e variável de ambiente `ANTHROPIC_API_KEY` não são mais usadas — pode deletar
-- Build iOS 26.4 SDK: **BUILD SUCCEEDED** (após corrigir issue PrivacyInfo do Mac target)
+- `Zeus: probe HTTP daemon` → `{status: ok, fm_available: true, ...}` — daemon respondendo
+- `Zeus: status do daemon HTTP` → `ALIVE (spawned by plugin) — http://127.0.0.1:2223`
+- `Zeus: buscar` → modal abre, digita 2+ letras
 
 ## Troubleshooting
 
-**"afm binary resolved: metafm" mas comandos falham:**
-Settings → Zeus → afm binary path → coloque caminho absoluto explícito.
+| Sintoma | Causa | Correção |
+|---|---|---|
+| `daemon: DEAD (no-binary)` | `bin/ZeusDaemonMac` ausente do zip extraído | Re-baixe o release; confira que `bin/ZeusDaemonMac` está presente e executável |
+| `daemon: DEAD (spawn-error)` com mensagem do Gatekeeper | Quarantine bit não removido | `xattr -d com.apple.quarantine <vault>/.obsidian/plugins/zeus/bin/ZeusDaemonMac` (plugin tenta automaticamente; falha apenas se permissão bloqueada) |
+| `fm_available: false` no `/v1/health` | Apple Intelligence não ativado ou macOS < 26 | System Settings → Apple Intelligence & Siri → habilitar; aguardar download dos modelos |
+| `pt-BR retorna texto vazio` em transcribe | Speech asset pt-BR não instalado | System Settings → General → Language & Region → adicionar pt-BR e usar Siri/Dictation 1x (asset baixa silenciosamente) |
+| Indexação inicial lenta | Vault grande + cold start FM (~30s primeira chamada) | Esperar; subsequentes são instantâneas (cache SHA) |
 
-**"Exceeded model context window size":**
-Limitação 4096 tokens do FoundationModels. Notas grandes/vault com muitos folders estouram. Mensagem aparece quando `enrich`/`agent`/`graph-extract` é chamado. Não afeta search principal (cosine).
+## Maintainer — regenerar `bin/ZeusDaemonMac`
 
-**Indexação muito lenta:**
-- Primeira run de embedding em vault grande pode levar minutos (cold start + N×batch)
-- Subsequentes são instantâneas (cache por SHA)
-- Reindex completo: Cmd+P → `Zeus: reindexar vault completo`
+Após alterar `daemon/Sources/ZeusDaemonMac/*.swift`:
 
-**Console erro `spawn ENOENT`:**
-Path do `afm` errado. Settings → Zeus → afm binary path → fixar.
+```
+node scripts/build-release.mjs
+```
+
+Roda `swift build -c release`, copia para `bin/ZeusDaemonMac`, codesign adhoc, strip quarantine, e rebuilda `main.js` via esbuild. Commit.
 
 ## Desinstalação
 
-1. Settings → Community plugins → desabilite Zeus
-2. Delete pasta `<vault>/.obsidian/plugins/zeus/`
-3. Cache em `data/` é deletado junto (não polui outros plugins)
+1. Settings → Community plugins → desabilite Zeus.
+2. Delete `<vault>/.obsidian/plugins/zeus/` (inclui o daemon binário — não polui outros plugins).
+3. Daemon spawned é morto no `onunload`; LaunchAgent (se você instalou separado) sobrevive — `launchctl bootout gui/$UID/com.maiocchi.zeusdaemon`.

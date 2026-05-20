@@ -1,8 +1,8 @@
 # Zeus — Apple Ecosystem-native Search & Connections for Obsidian
 
-> Substitui Omnisearch + Smart Connections com pipeline 100% Apple-native: Foundation Models, Vision, NaturalLanguage, CoreSpotlight. Indexação no Mac, leitura cross-device via iCloud + Tailscale.
+> Drop-in autônomo. Plugin embarca o daemon Apple-nativo (`bin/ZeusDaemonMac`, arm64 codesigned adhoc) e o sobe sozinho no `onload()`. Sem `swift build`, sem `launchctl`, sem Python. Pipeline 100% Apple: Foundation Models, Vision, NaturalLanguage, Speech, Translation, CoreSpotlight. iOS Capacitor degrada gracioso — leitura cross-device via iCloud.
 
-**Status:** `v1.4.3` — estável, em produção diária cross-device (Mac mini · MacBook Air · iPad · iPhone). Status bar com métricas de tokens economizados e **Apple Cloud Private (PCC) end-to-end**: plugin opt-in → daemon Swift honra `X-Zeus-Allow-Pcc` com heurística calibrada → response devolve `X-Zeus-Pcc-Used: 1`. Ver [CHANGELOG](CHANGELOG.md).
+**Status:** `v1.5.0` — autonomia drop-in. Daemon bundled de 6.9 MB roda em `127.0.0.1:2223` sob lifecycle do Obsidian (spawn no onload, kill no onunload). Smoke valida 9/9 asserts end-to-end. Doctor reporta 7 layers (`npm run doctor`). Ver [CHANGELOG](CHANGELOG.md).
 
 ## Convenção ecumênica de prefixos
 
@@ -121,7 +121,7 @@ zeus-obsidian-plugin/                       ← repo PIA
 
 ## Versão
 
-`1.4.3` — multi-modal Apple-native pipeline + HyDE + Knowledge Graph view + naming ecumênico, com paridade Mac↔iOS via daemon HTTP.
+`1.5.0` — autonomia drop-in. Daemon embarcado em `bin/ZeusDaemonMac` (6.9 MB arm64, codesigned adhoc), auto-spawn via `DaemonLifecycle`. CLI `afm/metafm` removida (era dead code). `lib/python-worker.js` removido (era probe sem callers). Pipeline 100% via daemon HTTP local. Verificável via `npm run doctor` (7 layers) e `npm run smoke` (9 asserts).
 
 ## Roadmap aberto — Swift/Python/Rust helpers em `bin/`
 

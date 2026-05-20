@@ -1,10 +1,9 @@
 # Runtime cache — gerado por reindex
 data/
 
-# Binary bundled — opcional commitar (depende da política do repo)
-# Descomente a linha abaixo para NÃO committar o binary (cada dev compila localmente):
-# bin/afm
-# bin/metafm
+# v1.5 — bin/ZeusDaemonMac é commitado (autonomia drop-in). Plugin pré-construído
+# inclui o daemon arm64 codesigned adhoc; usuário final não roda swift build.
+# Maintainer regenera com `node scripts/build-release.mjs` (Apple Silicon Mac).
 
 # macOS noise
 .DS_Store

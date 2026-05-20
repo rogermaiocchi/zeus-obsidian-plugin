@@ -3583,7 +3583,11 @@ var require_auto_indexer = __commonJS({
         if (!p) return { skipped: "no-passport" };
         if (typeof p.buildOne === "function") {
           try {
-            const passport = await p.buildOne(path2, []);
+            let absPath = path2;
+            if (path2 && !path2.startsWith("/") && this.plugin.vaultRoot) {
+              absPath = this.plugin.vaultRoot.replace(/\/$/, "") + "/" + path2;
+            }
+            const passport = await p.buildOne(absPath, []);
             return { passport: passport && passport.path, concepts: (passport && passport.concepts || []).length };
           } catch (e) {
             return { skipped: "buildOne-failed", reason: (e.message || String(e)).slice(0, 80) };

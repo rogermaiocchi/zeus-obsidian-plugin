@@ -165,4 +165,4 @@ O plugin descobre qualquer binary em `bin/` que retorne JSON `{vectors, dim, mod
 
 ## Autoria
 
-Roger Maiocchi · [maiocchi.adv.br](https://maiocchi.adv.br) · MIT License
+Roger Maiocchi · MIT License

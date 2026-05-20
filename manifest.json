@@ -1,7 +1,7 @@
 {
   "id": "zeus",
   "name": "Zeus — Apple-native Search & Connections",
-  "version": "1.10.0",
+  "version": "1.10.1",
   "minAppVersion": "1.5.0",
   "description": "Drop-in autônomo: o plugin embarca o daemon Apple-nativo (bin/ZeusDaemonMac, arm64 codesigned adhoc) e o sobe sozinho quando 127.0.0.1:2223 não responde — sem swift build, sem launchctl manual, sem Python. iOS Capacitor degrada gracioso (read-only consumindo data/embeddings.jsonl syncado via iCloud). Pipeline 100% Apple: FoundationModels (afm), Vision (av), NaturalLanguage (anl 512-dim), Speech (asp), Translation, CoreSpotlight (acs). Endpoints /v1/embed, /v1/refine, /v1/hyde, /v1/graph/extract, /v1/agent, /v1/asp/transcribe, /v1/passport/*. PIA token-efficient, Apple Cloud Private (PCC) opt-in, chunking hierárquico NexusSum, HyDE query expansion.",
   "author": "Roger Maiocchi",

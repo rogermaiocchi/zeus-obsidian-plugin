@@ -3650,6 +3650,22 @@ var require_auto_indexer = __commonJS({
         }
         try {
           const r = await this.plugin.httpClient.spotlightIndex(items, domainHint);
+          try {
+            const universal2 = require_universal_fs();
+            const stateRel = universal2.joinPath(this.plugin.manifest.dir, "data", "spotlight-state.json");
+            const adapter = this.plugin.app.vault.adapter;
+            const payload = {
+              last_indexed_at: (/* @__PURE__ */ new Date()).toISOString(),
+              count: r.indexed,
+              domain: r.domain,
+              mode: r.mode || "queued",
+              source: "auto-indexer-v1.10"
+            };
+            await universal2.adapterMkdir(adapter, universal2.joinPath(this.plugin.manifest.dir, "data"));
+            await universal2.adapterWriteAtomic(adapter, stateRel, JSON.stringify(payload, null, 2));
+          } catch (persistErr) {
+            console.warn("[zeus.autoidx] spotlight-state persist failed:", persistErr.message);
+          }
           return { indexed: r.indexed, domain: r.domain };
         } catch (e) {
           return { skipped: "daemon-error", reason: e.message.slice(0, 80) };

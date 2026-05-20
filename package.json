@@ -1,7 +1,7 @@
 {
   "name": "zeus-obsidian-plugin",
   "version": "1.4.3",
-  "private": true,
+  "private": false,
   "description": "Build setup for the Zeus Obsidian plugin — bundles main.source.js + lib/*.js into a single main.js for Obsidian mobile (iOS).",
   "scripts": {
     "build": "node esbuild.config.mjs"

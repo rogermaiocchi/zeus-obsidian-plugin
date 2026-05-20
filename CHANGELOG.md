@@ -4,6 +4,37 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.8.1] — 2026-05-20 — Fixes pós-auditoria codex v1.8 (5 MED + 2 LOW)
+
+Codex auditou v1.8.0 (subagent claude executou autônomo). 9 achados — **0 HIGH** (subagent fez bom trabalho), 5 MED, 4 LOW. Aplicados 5 MED + 2 LOW; 2 LOW deferidos como design decision.
+
+### Fixed — multiplex graph stale-data + concurrency
+- **MED #1** (`lib/multiplex-graph.js:168`): wikilink loop não filtrava `src` contra `allPaths`. Metadata cache pode reter notas apagadas/renomeadas. Adicionado guard `if (!allPaths.has(src)) continue`.
+- **MED #2**: passportMap e embeddings iteravam paths sem cross-check com vault atual. Agora filtra `allPaths.has(path)` em ambos. Embeddings multimodais (pdf/png/heic) excluídos de `semantic_cosine`.
+- **MED #4**: `buildFromVault` + `persist` ganham mutex (`_buildPromise`, `_persistPromise`) — mesmo padrão `DaemonLifecycle._startPromise` v1.5.1. Sem isso, auto-build + comando manual concorrentes corrompiam `this.edges`.
+
+### Fixed — BM25 retriever escopo
+- **MED #5** (`lib/hybrid-search.js:188`): BM25 corpus incluía pdf/png/heic do indexer multimodal. Agora `if (!p.endsWith('.md')) continue` — ranquear título de PDF por BM25 é ruído sem valor lexical.
+
+### Fixed — Multiplex lazy load em sisterNotes
+- **MED #3** (`lib/hybrid-search.js:285`): após restart Obsidian com `data/multiplex.jsonl` existente, `sisterNotes()` não carregava. Adicionado lazy `await mg.load()` quando `edges.size === 0 && !_multiplexLoadAttempted`.
+
+### Fixed — BM25 baseline opt-out + auto-build yield
+- **LOW #9**: novo setting `hybridBm25Enabled` (default `true`). User pode desligar pra compat estrita com v1.7.1 baseline. Recomendação ON.
+- **LOW #8** (auto-build O(N²) bloqueia UI): `_yield()` Promise via `setTimeout(0)` entre cada fase do `buildFromVault` (folder/date → entity → cosine → co_citation). 4 yields por build full.
+
+### Deferred — design decisions
+- LOW #6: caps `slice(0, N)` ordenam por iteration order. Aceito como contrato — registrar em `stats.truncated` se virar problema.
+- LOW #7: dedup directional `src|dst|type` infla `stats.total` em 2x para edges undirected. Mantido como contrato dirigido para simplificar `neighbors(src)` API.
+
+### Validation
+- `bun run build` → main.js OK
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9
+- Empirical: multiplex build vazio sem crash; mutex serializa builds concorrentes
+
+---
+
 ## [1.8.0] — 2026-05-20 — BM25 lexical lane + MMR diversify + Multiplex graph (8 edge types)
 
 Materializa o brainstorm registrado em v1.7.1: a perna léxica BM25 (porte JS puro do `~/Code/maiocchi-ia/skills/tripla-fusao/scripts/bm25.py`, IDF Okapi clássico +1 nunca-negativa, k1=1.5/b=0.75) entra como 5º retriever do `HybridSearch`; MMR rerank opcional troca top-N puro por diversidade de fontes (jaccard sobre sourceMask); grafo multiplex de 8 evidências com `why` auditável aterrissa em `data/multiplex.jsonl`. Codex aprovou escopo enxuto — deferidos: Leiden communities (v1.9), MobileCLIP CoreML (v2.0 labs, opt-in via download de modelo), mdimporter Spotlight companion plugin (futuramente em `daemon/MDImporters/`).

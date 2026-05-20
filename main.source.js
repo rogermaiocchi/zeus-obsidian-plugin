@@ -271,6 +271,11 @@ const DEFAULT_SETTINGS = {
   // v1.8 — hybrid search MMR diversify + multiplex graph
   hybridDiversityLambda: 0.5,               // λ ∈ [0,1] da MMR — 1=só relevância, 0=só diversidade
   hybridDiversifyDefault: false,            // se ON, query() aplica MMR por padrão (lambda configurável acima)
+  // codex LOW #9: v1.8 mudou baseline do query() incluindo BM25 default-on. Pra
+  // compat estrita com v1.7.1, user pode desligar via setting. Default ON é a
+  // recomendação — BM25 complementa semantic em casos lexicais (siglas, IDs,
+  // nomes próprios) onde cosine sozinho falha.
+  hybridBm25Enabled: true,
   multiplexAutoBuild: false,                // se ON, build inicial roda no onload em background
 };
 

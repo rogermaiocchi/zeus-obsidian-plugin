@@ -2723,6 +2723,7 @@ var require_hybrid_search = __commonJS({
           const canReadDoc = typeof searcher.readDoc === "function";
           for (const [p, e] of embs.entries()) {
             if (count >= maxCorpus) break;
+            if (!p || !p.endsWith(".md")) continue;
             let text = "";
             const title = e && e.title ? e.title : p.split("/").pop().replace(/\.md$/, "");
             if (canReadDoc) {
@@ -2802,6 +2803,14 @@ var require_hybrid_search = __commonJS({
         }
         try {
           const mg = this.plugin.multiplex;
+          if (mg && typeof mg.load === "function" && (!mg.edges || mg.edges.size === 0) && !this.plugin._multiplexLoaded && !this.plugin._multiplexLoadAttempted) {
+            this.plugin._multiplexLoadAttempted = true;
+            try {
+              const r = await mg.load();
+              if (r && r.read > 0) this.plugin._multiplexLoaded = true;
+            } catch (e) {
+            }
+          }
           if (mg && mg.edges && mg.edges.size > 0) {
             const byDst = mg.neighborsByDst(filePath);
             if (byDst.length > 0) {
@@ -2913,7 +2922,8 @@ var require_hybrid_search = __commonJS({
         } catch (e) {
           console.warn("[zeus.hybrid] spotlight retrieval failed", e.message);
         }
-        if (!opts.disableBm25) {
+        const bm25SettingEnabled = this.plugin.settings ? this.plugin.settings.hybridBm25Enabled !== false : true;
+        if (!opts.disableBm25 && bm25SettingEnabled) {
           try {
             const bm25Hits = this._bm25Retriever(q, topN * 2);
             if (bm25Hits.length > 0) lists.push(bm25Hits);
@@ -3160,11 +3170,28 @@ var require_multiplex_graph = __commonJS({
       }
       // ---------------------------------------------------------------------------
       // Build — coleta todas as 8 evidências do vault
+      //
+      // codex MED #4: mutex contra builds concorrentes. Auto-build setting + comando
+      // manual podem disparar simultaneamente. Sem lock, this.edges fica corrompido
+      // (clear() no meio + addEdge() concorrente). _buildPromise serializa.
       // ---------------------------------------------------------------------------
       async buildFromVault(onProgress = () => {
       }) {
+        if (this._buildPromise) return this._buildPromise;
+        this._buildPromise = (async () => {
+          try {
+            return await this._doBuildFromVault(onProgress);
+          } finally {
+            this._buildPromise = null;
+          }
+        })();
+        return this._buildPromise;
+      }
+      async _doBuildFromVault(onProgress = () => {
+      }) {
         const t0 = Date.now();
         this.edges.clear();
+        const _yield = () => new Promise((r) => setTimeout(r, 0));
         const app = this.plugin.app;
         const mdc = app.metadataCache;
         const files = (app.vault.getMarkdownFiles ? app.vault.getMarkdownFiles() : []) || [];
@@ -3173,6 +3200,7 @@ var require_multiplex_graph = __commonJS({
         const resolved = mdc && mdc.resolvedLinks || {};
         const backlinkCount = /* @__PURE__ */ new Map();
         for (const src of Object.keys(resolved)) {
+          if (!allPaths.has(src)) continue;
           const inner = resolved[src] || {};
           for (const dst of Object.keys(inner)) {
             if (!allPaths.has(dst)) continue;
@@ -3182,6 +3210,7 @@ var require_multiplex_graph = __commonJS({
             backlinkCount.set(dst, (backlinkCount.get(dst) || 0) + 1);
           }
         }
+        await _yield();
         onProgress("build: folder_path + date_overlap", 25);
         const byFolder = /* @__PURE__ */ new Map();
         const byDay = /* @__PURE__ */ new Map();
@@ -3215,12 +3244,14 @@ var require_multiplex_graph = __commonJS({
             }
           }
         }
+        await _yield();
         onProgress("build: entity_overlap (passports concepts)", 45);
         try {
           if (this.plugin.passport && typeof this.plugin.passport.loadAll === "function") {
             const passportMap = await this.plugin.passport.loadAll();
             const conceptIndex = /* @__PURE__ */ new Map();
             for (const [path2, p] of passportMap.entries()) {
+              if (!allPaths.has(path2)) continue;
               if (!Array.isArray(p.concepts)) continue;
               for (const c of p.concepts) {
                 const cl = String(c).toLowerCase();
@@ -3251,11 +3282,13 @@ var require_multiplex_graph = __commonJS({
         } catch (e) {
           console.warn("[zeus.multiplex] entity_overlap failed:", e.message);
         }
+        await _yield();
         onProgress("build: semantic_cosine (embeddings)", 65);
         try {
           const emb = this.plugin.searcher && this.plugin.searcher.embeddings || /* @__PURE__ */ new Map();
           const entries = [];
           for (const [p, e] of emb.entries()) {
+            if (!allPaths.has(p)) continue;
             if (e && Array.isArray(e.vec) && e.vec.length > 0) entries.push([p, e.vec]);
           }
           const MAX = 2e3;
@@ -3283,6 +3316,7 @@ var require_multiplex_graph = __commonJS({
         } catch (e) {
           console.warn("[zeus.multiplex] spotlight_token_bm25 skip:", e.message);
         }
+        await _yield();
         onProgress("build: co_citation (top-N backlinked)", 90);
         try {
           const topBacklinked = Array.from(backlinkCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 1e3).map(([p]) => p);
@@ -3310,8 +3344,22 @@ var require_multiplex_graph = __commonJS({
       }
       // ---------------------------------------------------------------------------
       // Persistence — JSONL: 1 edge per line
+      //
+      // codex MED #4: mutex em persist também (auto-build + persist manual
+      // concorrentes poderiam pisar no mesmo .tmp). _persistPromise serializa.
       // ---------------------------------------------------------------------------
       async persist() {
+        if (this._persistPromise) return this._persistPromise;
+        this._persistPromise = (async () => {
+          try {
+            return await this._doPersist();
+          } finally {
+            this._persistPromise = null;
+          }
+        })();
+        return this._persistPromise;
+      }
+      async _doPersist() {
         await universal2.adapterMkdir(this._adapter, this.dataPath);
         const lines = [];
         for (const edge of this.edges.values()) {
@@ -3619,6 +3667,11 @@ var DEFAULT_SETTINGS = {
   // λ ∈ [0,1] da MMR — 1=só relevância, 0=só diversidade
   hybridDiversifyDefault: false,
   // se ON, query() aplica MMR por padrão (lambda configurável acima)
+  // codex LOW #9: v1.8 mudou baseline do query() incluindo BM25 default-on. Pra
+  // compat estrita com v1.7.1, user pode desligar via setting. Default ON é a
+  // recomendação — BM25 complementa semantic em casos lexicais (siglas, IDs,
+  // nomes próprios) onde cosine sozinho falha.
+  hybridBm25Enabled: true,
   multiplexAutoBuild: false
   // se ON, build inicial roda no onload em background
 };

@@ -4194,6 +4194,179 @@ var require_auto_indexer = __commonJS({
   }
 });
 
+// lib/embed-ios.js
+var require_embed_ios = __commonJS({
+  "lib/embed-ios.js"(exports2, module2) {
+    "use strict";
+    var universal2 = require_universal_fs();
+    var EMBED_IOS_FILE = "embeddings-ios.jsonl";
+    var EMBED_IOS_DIM = 384;
+    var EMBED_IOS_MODEL = "Xenova/multilingual-e5-small";
+    var EMBED_MAC_DIM = 512;
+    var EMBED_MAC_MODEL = "apple-nlcontextual-pt-BR";
+    var EmbedIos = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+        this._entries = /* @__PURE__ */ new Map();
+        this._loaded = false;
+        this._writePromise = null;
+      }
+      get _adapter() {
+        return this.plugin.app.vault.adapter;
+      }
+      get dataPath() {
+        return universal2.joinPath(this.plugin.manifest.dir, "data");
+      }
+      get jsonlPath() {
+        return universal2.joinPath(this.dataPath, EMBED_IOS_FILE);
+      }
+      async load() {
+        if (this._loaded) return;
+        if (!await universal2.adapterExists(this._adapter, this.jsonlPath)) {
+          this._loaded = true;
+          return;
+        }
+        try {
+          const raw = await universal2.adapterRead(this._adapter, this.jsonlPath);
+          for (const line of raw.split("\n").filter(Boolean)) {
+            try {
+              const obj = JSON.parse(line);
+              if (!obj || !obj.path) continue;
+              if (obj.dim !== EMBED_IOS_DIM) {
+                console.warn("[zeus.embed-ios] skip linha dim mismatch:", obj.path, "dim=", obj.dim);
+                continue;
+              }
+              if (!Array.isArray(obj.vec) || obj.vec.length !== EMBED_IOS_DIM) {
+                console.warn("[zeus.embed-ios] skip linha vec inv\xE1lida:", obj.path);
+                continue;
+              }
+              this._entries.set(obj.path, obj);
+            } catch (e) {
+            }
+          }
+        } catch (e) {
+          console.warn("[zeus.embed-ios] load failed:", e.message);
+        }
+        this._loaded = true;
+      }
+      // Get entry por path (iOS-local 384-dim).
+      async get(path2) {
+        await this.load();
+        return this._entries.get(path2) || null;
+      }
+      // Persist atomic. Mutex serializa concorrentes (v1.8.1 pattern).
+      async _persist() {
+        if (this._writePromise) await this._writePromise.catch(() => {
+        });
+        this._writePromise = (async () => {
+          try {
+            await universal2.adapterMkdir(this._adapter, this.dataPath);
+            const lines = [];
+            for (const e of this._entries.values()) lines.push(JSON.stringify(e));
+            await universal2.adapterWriteAtomic(this._adapter, this.jsonlPath, lines.join("\n"));
+          } finally {
+            this._writePromise = null;
+          }
+        })();
+        return this._writePromise;
+      }
+      // Upsert entry. Validate schema + dim.
+      async upsert(entry) {
+        await this.load();
+        if (!entry || !entry.path) throw new Error("embed-ios.upsert: path obrigat\xF3rio");
+        if (entry.dim !== EMBED_IOS_DIM) throw new Error(`embed-ios.upsert: dim ${entry.dim} \u2260 ${EMBED_IOS_DIM}`);
+        if (!Array.isArray(entry.vec) || entry.vec.length !== EMBED_IOS_DIM) {
+          throw new Error("embed-ios.upsert: vec inv\xE1lido");
+        }
+        entry.schema = entry.schema || "zeus-embeddings-v1";
+        entry.model_id = entry.model_id || EMBED_IOS_MODEL;
+        entry.created_at = entry.created_at || (/* @__PURE__ */ new Date()).toISOString();
+        entry.source = entry.source || "transformers-ios";
+        this._entries.set(entry.path, entry);
+        await this._persist();
+        return { upserted: entry.path, total: this._entries.size };
+      }
+      // Removes entry (note deleted/renamed)
+      async remove(path2) {
+        await this.load();
+        if (this._entries.has(path2)) {
+          this._entries.delete(path2);
+          await this._persist();
+          return { removed: true };
+        }
+        return { removed: false };
+      }
+      // Stats
+      async stats() {
+        await this.load();
+        return {
+          schema: "zeus-embeddings-v1",
+          file: this.jsonlPath,
+          model_id: EMBED_IOS_MODEL,
+          dim: EMBED_IOS_DIM,
+          count: this._entries.size,
+          runtime_installed: await this._modelInstalled()
+        };
+      }
+      // Check se transformers.js + modelo estão instalados (cache local)
+      async _modelInstalled() {
+        return false;
+      }
+      /**
+       * Embed um texto via transformers.js (lazy-load).
+       * v1.12 ENTREGA: stub que retorna instrução acionável quando runtime ausente.
+       * v1.13 labs implementará lazy-import xenova/transformers + modelo fetch.
+       */
+      async embedText(text) {
+        if (!await this._modelInstalled()) {
+          throw new Error(
+            'embed-ios runtime n\xE3o instalado. Rode comando "Zeus: instalar modelo iOS embed". v1.12 ENTREGA \xE9 stub; runtime transformers.js completo em v1.13 labs (ADR-011).'
+          );
+        }
+        throw new Error("embed-ios.embedText: runtime n\xE3o implementado em v1.12");
+      }
+    };
+    var EmbedRelay = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+      }
+      /**
+       * Tenta embed via daemon HTTP (loopback Mac OU Tailscale relay iOS→Mac).
+       * Sucesso → retorna {ok: true, vec, dim, model, source}
+       * Falha → retorna {ok: false, reason}  (não lança — gracioso)
+       */
+      async tryEmbed(text) {
+        if (!this.plugin.httpClient) return { ok: false, reason: "no-httpClient" };
+        if (!text || text.length < 2) return { ok: false, reason: "text-too-short" };
+        try {
+          const available = await this.plugin.httpClient.isAvailable(1500);
+          if (!available) return { ok: false, reason: "daemon-unreachable" };
+          const r = await this.plugin.httpClient.embed(text);
+          const vec = r && r.vectors && r.vectors[0] || r && r.vector || null;
+          if (!Array.isArray(vec) || vec.length !== EMBED_MAC_DIM) {
+            return { ok: false, reason: `dim-mismatch: ${vec ? vec.length : "null"}` };
+          }
+          return {
+            ok: true,
+            vec,
+            dim: EMBED_MAC_DIM,
+            model: r && r.model || EMBED_MAC_MODEL,
+            source: "daemon-relay"
+          };
+        } catch (e) {
+          return { ok: false, reason: (e.message || String(e)).slice(0, 100) };
+        }
+      }
+    };
+    module2.exports = EmbedIos;
+    module2.exports.EmbedRelay = EmbedRelay;
+    module2.exports.EMBED_IOS_DIM = EMBED_IOS_DIM;
+    module2.exports.EMBED_IOS_MODEL = EMBED_IOS_MODEL;
+    module2.exports.EMBED_MAC_DIM = EMBED_MAC_DIM;
+    module2.exports.EMBED_MAC_MODEL = EMBED_MAC_MODEL;
+  }
+});
+
 // lib/leiden.js
 var require_leiden = __commonJS({
   "lib/leiden.js"(exports2, module2) {
@@ -5287,6 +5460,7 @@ var HybridSearch = require_hybrid_search();
 var NativeWatcher = require_native_watcher();
 var MultiplexGraph = require_multiplex_graph();
 var AutoIndexer = require_auto_indexer();
+var EmbedIosLib = require_embed_ios();
 var LeidenCommunities = require_leiden();
 var IoQueue = require_io_queue();
 var LexicalIosIndex = require_lexical_ios();
@@ -5416,6 +5590,14 @@ var DEFAULT_SETTINGS = {
   // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
   // multiplex/leiden) com debounce + cooldown.
   autoIndexEnabled: true,
+  // v1.12 — embed iOS two-tier (codex audit C+B aprovado)
+  // CAMADA 1 (default ON): relay HTTP daemon via Tailscale/loopback. iOS chama
+  //   daemon Mac, persiste em embeddings.jsonl 512-dim NLContextualEmbedding.
+  // CAMADA 2 (default OFF, labs): transformers.js + multilingual-e5-small ~118MB
+  //   fetch lazy primeiro use. Persiste embeddings-ios.jsonl 384-dim.
+  //   v1.12 ENTREGA stub apenas; runtime completo em v1.13 ADR-011 labs.
+  iosEmbedRelayEnabled: true,
+  iosEmbedTransformersEnabled: false,
   // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
   // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
   leidenResolution: 1,
@@ -7556,6 +7738,8 @@ var ZeusPlugin = class extends Plugin {
       this.basesGen = new BasesGenerator(this);
       this.ioQueue = new IoQueue(this);
       this.lexicalIos = new LexicalIosIndex(this);
+      this.embedIos = new EmbedIosLib(this);
+      this.embedRelay = new EmbedIosLib.EmbedRelay(this);
       if (this.settings.lexicalIosAutoBuild) {
         setTimeout(async () => {
           try {
@@ -9087,6 +9271,63 @@ ${top3}`, 12e3);
           } catch (e) {
             n.hide();
             new Notice("Zeus lexical-ios search falhou: " + e.message.slice(0, 200));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-ios-embed-status",
+        name: "Zeus: status embed iOS (relay Mac + transformers.js)",
+        callback: async () => {
+          try {
+            const lines = ["Zeus iOS embed two-tier:"];
+            if (this.embedRelay) {
+              const probe = await this.embedRelay.tryEmbed("zeus iOS embed probe");
+              lines.push(`  Camada 1 (relay daemon): ${probe.ok ? "\u2713 OK" : "\u2717 " + probe.reason}`);
+              if (probe.ok) lines.push(`    dim=${probe.dim} \xB7 model=${probe.model} \xB7 source=${probe.source}`);
+            }
+            if (this.embedIos) {
+              const s = await this.embedIos.stats();
+              lines.push(`  Camada 2 (transformers.js labs): ${s.runtime_installed ? "\u2713 instalado" : "\u2717 n\xE3o instalado"}`);
+              lines.push(`    model=${s.model_id} \xB7 dim=${s.dim} \xB7 entries=${s.count}`);
+            }
+            new Notice(lines.join("\n"), 12e3);
+            console.log("[zeus] iOS embed status:", lines.join(" | "));
+          } catch (e) {
+            new Notice("Zeus iOS embed status falhou: " + e.message.slice(0, 150));
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-ios-embed-install",
+        name: "Zeus: instalar modelo embed iOS (multilingual-e5-small, labs)",
+        callback: async () => {
+          try {
+            const msg = [
+              "Embed iOS v1.12 \u2014 STUB labs. Runtime transformers.js full em v1.13 (ADR-011).",
+              "",
+              "Para v1.12, USE Camada 1 (relay Mac via Tailscale):",
+              "  1. Mac mini / MacBook deve ter ZeusDaemonMac rodando (default)",
+              "  2. iOS Capacitor + Tailscale instalado e mesh ativa",
+              '  3. Settings \u2192 Zeus \u2192 "Permitir fallback remoto via Tailscale" ON',
+              "  4. iosEmbedRelayEnabled: true (default)",
+              "",
+              "iOS chama daemon Mac via http://<tailscale-ip>:2223/v1/embed",
+              "\u2192 persiste em data/embeddings.jsonl 512-dim NLContextualEmbedding",
+              "\u2192 qualidade Apple-native pt-BR otimizada (Mac-can\xF4nico).",
+              "",
+              "Camada 2 (v1.13 labs): transformers.js + Xenova/multilingual-e5-small",
+              "  ~118MB INT8 ONNX cached via Browser Cache API.",
+              "  Quando indispon\xEDvel Tailscale Mac, fallback local 384-dim.",
+              "  Schema versionado: embeddings-ios.jsonl separado."
+            ].join("\n");
+            console.log("[zeus.embed-ios]", msg);
+            try {
+              await navigator.clipboard.writeText(msg);
+            } catch (e) {
+            }
+            new Notice("Embed iOS install: instru\xE7\xF5es copiadas pro clipboard. v1.12 entrega relay Mac.", 12e3);
+          } catch (e) {
+            new Notice("Embed iOS install falhou: " + e.message.slice(0, 150));
           }
         }
       });

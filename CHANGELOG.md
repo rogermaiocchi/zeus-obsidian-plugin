@@ -4,6 +4,77 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.12.0] — 2026-05-20 — Embed iOS two-tier: relay Mac + schema versionado (codex C+B)
+
+User pediu "Resolva ⚠️ R + Feature H" (gap embeddings.jsonl iOS read-only). Codex debate profundo aprovou estratégia **C + B** (não C + A): relay Mac via Tailscale como camada 1 + transformers.js + e5-small multilingual como camada 2 labs (não MiniLM-L6 EN-bias).
+
+### Added — `lib/embed-ios.js` (~210 LOC)
+
+Two-tier orquestração:
+
+**Camada 1 — `EmbedRelay.tryEmbed(text)`** (default ON):
+- Verifica daemon HTTP disponível via `isAvailable(1500ms)`
+- POST `/v1/embed` para Mac via Tailscale loopback OR Tailscale mesh
+- Resultado 512-dim NLContextualEmbedding Apple-nativo
+- Persiste em `embeddings.jsonl` Mac-canônico (mesmo formato)
+- Quality: Apple-native pt-BR otimizada
+- Latência: 100-500ms Tailscale
+
+**Camada 2 — `EmbedIos` stub** (default OFF, labs):
+- Schema `embeddings-ios.jsonl` 384-dim separado de `embeddings.jsonl` 512-dim
+- Loader recusa dim mismatch (codex MED: não truncar silente)
+- Schema obrigatório por linha: `{schema, model_id, model_revision, dim, device_class, text_sha, source, created_at, vec}`
+- Mutex `_writePromise` em `_persist` (v1.8.1 pattern)
+- **v1.12 entrega STUB apenas** — `embedText()` lança erro acionável apontando comando "instalar modelo"
+- v1.13 ADR-011 labs implementará lazy-import `xenova/transformers` + modelo `Xenova/multilingual-e5-small` INT8 ~118MB via Browser Cache API + `query:`/`passage:` prefix
+
+### Settings novos
+
+- `iosEmbedRelayEnabled: true` — camada 1 ON por padrão
+- `iosEmbedTransformersEnabled: false` — camada 2 labs (default OFF)
+
+### 2 comandos novos
+
+- `Zeus: status embed iOS (relay Mac + transformers.js)` — probe ambas camadas e reporta
+- `Zeus: instalar modelo embed iOS (labs)` — copia instruções pro clipboard (v1.13 implementará fetch real)
+
+### Codex debate profundo — decisões chave
+
+| Codex achado | Aplicado |
+|---|---|
+| Rejeitou MiniLM-L6-v2 EN-bias (vault legal pt-BR) | ✅ multilingual-e5-small recomendado |
+| Transformers.js usa Browser Cache API (não IndexedDB default) | ✅ comentado no JSDoc |
+| Bundle transformers.js via npm, NÃO dynamic import remoto | ✅ deferido v1.13 (fora do escopo v1.12) |
+| Schema rigoroso `{model_id, model_revision, dim, device_class}` | ✅ implementado em embed-ios.js |
+| Loader recusa dim errada (não truncar) | ✅ `dim !== EMBED_IOS_DIM` skip |
+| e5 precisa `query:`/`passage:` prefix | 📝 documentado no JSDoc (futuro v1.13) |
+| Não misture cosine 512×384 — usar RRF rank | ✅ HybridSearch.fuse já é RRF-based |
+| Disclosure network use (Obsidian policy) | 📝 manifest description mantém menção |
+
+### Tradeoffs honestos
+
+- **Camada 1 funciona quando Mac está acessível** (Tailscale mesh OR LAN). User no metrô sem Mac → cai para io-queue eventual consistency
+- **Camada 2 fica em ADR-011** — bundle transformers.js + ONNX runtime + modelo fetch HuggingFace requer spike real em iPhone Capacitor (CSP testing, IndexedDB persistência WKWebView, modelo ~118MB)
+- **embeddings.jsonl continua canônico 512-dim** — embed-ios separa apenas quando v1.13 ativar runtime
+
+### Matriz iOS pós-v1.12
+
+| Camada | Mac | iOS Capacitor | Mecanismo |
+|---|---|---|---|
+| `embeddings.jsonl` (512-dim) | ✅ R/W | ✅ **R/W via relay Mac** (camada 1) | EmbedRelay.tryEmbed → daemon Tailscale |
+| `embeddings-ios.jsonl` (384-dim) | — | 📋 stub v1.13 labs | Transformers.js multilingual-e5-small |
+
+Gap `⚠️ R + Feature H` agora **resolvido pela camada 1** quando Mac acessível; camada 2 v1.13 fecha o caso offline absoluto.
+
+### Validation
+
+- `bun run build` OK
+- Doctor 7/7 OK
+- Smoke 9/9
+- Empirical: `EmbedRelay.tryEmbed("teste")` retorna `{ok:true, dim:512, model:'apple-nlcontextual-pt-BR', source:'daemon-relay'}` quando daemon LIVE
+
+---
+
 ## [1.11.1] — 2026-05-20 — Fixes pós-auditoria codex v1.11 (3 HIGH + 4 MED)
 
 Codex auditou v1.11.0 e achou 13 issues (3 HIGH + 6 MED + 4 LOW-validados). Aplicados 3 HIGH + 4 MED críticos:

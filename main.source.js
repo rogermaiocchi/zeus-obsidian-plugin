@@ -185,6 +185,7 @@ const HybridSearch = require('./lib/hybrid-search');                     // v1.6
 const NativeWatcher = require('./lib/native-watcher');                   // v1.6: FSEvents observability (Mac iCloud)
 const MultiplexGraph = require('./lib/multiplex-graph');                 // v1.8: 8-edge-type multiplex graph (wikilink/backlink/entity/date/folder/cosine/spotlight/co-citation)
 const AutoIndexer = require('./lib/auto-indexer');                        // v1.10: orquestra rebuilds de TODAS as camadas via vault.on() automático
+const EmbedIosLib = require('./lib/embed-ios');                           // v1.12: embed iOS schema versionado + relay Mac via Tailscale
 const LeidenCommunities = require('./lib/leiden');                       // v1.9: community detection enxuto (local move + connectivity split + agregação) sobre multiplex
 const IoQueue = require('./lib/io-queue');                               // v1.11: fila iCloud-mediada para Mac consumir tarefas geradas em iOS (Feature H)
 const LexicalIosIndex = require('./lib/lexical-ios');                    // v1.11: BM25 persistido com stems pt-BR para iOS sem daemon (Feature I)
@@ -290,6 +291,14 @@ const DEFAULT_SETTINGS = {
   // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
   // multiplex/leiden) com debounce + cooldown.
   autoIndexEnabled: true,
+  // v1.12 — embed iOS two-tier (codex audit C+B aprovado)
+  // CAMADA 1 (default ON): relay HTTP daemon via Tailscale/loopback. iOS chama
+  //   daemon Mac, persiste em embeddings.jsonl 512-dim NLContextualEmbedding.
+  // CAMADA 2 (default OFF, labs): transformers.js + multilingual-e5-small ~118MB
+  //   fetch lazy primeiro use. Persiste embeddings-ios.jsonl 384-dim.
+  //   v1.12 ENTREGA stub apenas; runtime completo em v1.13 ADR-011 labs.
+  iosEmbedRelayEnabled: true,
+  iosEmbedTransformersEnabled: false,
   // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
   // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
   leidenResolution: 1.0,                    // γ na modularidade; >1 favorece comunidades menores
@@ -2916,6 +2925,9 @@ class ZeusPlugin extends Plugin {
     // Build full é opt-in via settings.lexicalIosAutoBuild OU comando manual.
     // Incrementals rodam via AutoIndexer ~30s após modify.
     this.lexicalIos = new LexicalIosIndex(this);
+    // v1.12 — embed iOS two-tier wiring (codex C+B aprovado)
+    this.embedIos = new EmbedIosLib(this);
+    this.embedRelay = new EmbedIosLib.EmbedRelay(this);
     if (this.settings.lexicalIosAutoBuild) {
       setTimeout(async () => {
         try {
@@ -4478,6 +4490,67 @@ class ZeusPlugin extends Plugin {
         } catch (e) {
           n.hide();
           new Notice('Zeus lexical-ios search falhou: ' + e.message.slice(0, 200));
+        }
+      },
+    });
+
+    // v1.12 — embed iOS two-tier: relay status + install model stub
+    this.addCommand({
+      id: 'zeus-ios-embed-status',
+      name: 'Zeus: status embed iOS (relay Mac + transformers.js)',
+      callback: async () => {
+        try {
+          const lines = ['Zeus iOS embed two-tier:'];
+          // Camada 1: relay status
+          if (this.embedRelay) {
+            const probe = await this.embedRelay.tryEmbed('zeus iOS embed probe');
+            lines.push(`  Camada 1 (relay daemon): ${probe.ok ? '✓ OK' : '✗ ' + probe.reason}`);
+            if (probe.ok) lines.push(`    dim=${probe.dim} · model=${probe.model} · source=${probe.source}`);
+          }
+          // Camada 2: transformers.js
+          if (this.embedIos) {
+            const s = await this.embedIos.stats();
+            lines.push(`  Camada 2 (transformers.js labs): ${s.runtime_installed ? '✓ instalado' : '✗ não instalado'}`);
+            lines.push(`    model=${s.model_id} · dim=${s.dim} · entries=${s.count}`);
+          }
+          new Notice(lines.join('\n'), 12000);
+          console.log('[zeus] iOS embed status:', lines.join(' | '));
+        } catch (e) {
+          new Notice('Zeus iOS embed status falhou: ' + e.message.slice(0, 150));
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-ios-embed-install',
+      name: 'Zeus: instalar modelo embed iOS (multilingual-e5-small, labs)',
+      callback: async () => {
+        try {
+          // v1.12 ENTREGA stub: copia instruções pro clipboard (mesmo padrão
+          // MobileCLIP v1.9). Runtime transformers.js full em v1.13 ADR-011.
+          const msg = [
+            'Embed iOS v1.12 — STUB labs. Runtime transformers.js full em v1.13 (ADR-011).',
+            '',
+            'Para v1.12, USE Camada 1 (relay Mac via Tailscale):',
+            '  1. Mac mini / MacBook deve ter ZeusDaemonMac rodando (default)',
+            '  2. iOS Capacitor + Tailscale instalado e mesh ativa',
+            '  3. Settings → Zeus → "Permitir fallback remoto via Tailscale" ON',
+            '  4. iosEmbedRelayEnabled: true (default)',
+            '',
+            'iOS chama daemon Mac via http://<tailscale-ip>:2223/v1/embed',
+            '→ persiste em data/embeddings.jsonl 512-dim NLContextualEmbedding',
+            '→ qualidade Apple-native pt-BR otimizada (Mac-canônico).',
+            '',
+            'Camada 2 (v1.13 labs): transformers.js + Xenova/multilingual-e5-small',
+            '  ~118MB INT8 ONNX cached via Browser Cache API.',
+            '  Quando indisponível Tailscale Mac, fallback local 384-dim.',
+            '  Schema versionado: embeddings-ios.jsonl separado.',
+          ].join('\n');
+          console.log('[zeus.embed-ios]', msg);
+          try { await navigator.clipboard.writeText(msg); } catch {}
+          new Notice('Embed iOS install: instruções copiadas pro clipboard. v1.12 entrega relay Mac.', 12000);
+        } catch (e) {
+          new Notice('Embed iOS install falhou: ' + e.message.slice(0, 150));
         }
       },
     });

@@ -3581,15 +3581,15 @@ var require_auto_indexer = __commonJS({
       async _runPassport(path2) {
         const p = this.plugin.passport;
         if (!p) return { skipped: "no-passport" };
-        if (this.plugin.httpClient && typeof this.plugin.httpClient.passportBatchExtract === "function") {
+        if (typeof p.buildOne === "function") {
           try {
-            const r = await this.plugin.httpClient.passportBatchExtract([path2], []);
-            return { passport: path2, daemon: !!r };
+            const passport = await p.buildOne(path2, []);
+            return { passport: passport && passport.path, concepts: (passport && passport.concepts || []).length };
           } catch (e) {
-            return { skipped: "daemon-unavailable", reason: e.message.slice(0, 80) };
+            return { skipped: "buildOne-failed", reason: (e.message || String(e)).slice(0, 80) };
           }
         }
-        return { skipped: "no-passport-api" };
+        return { skipped: "no-buildOne-api" };
       }
       async _runBase() {
         if (!this.plugin.basesGen) return { skipped: "no-basesGen" };

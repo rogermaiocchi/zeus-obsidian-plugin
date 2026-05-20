@@ -3467,6 +3467,252 @@ var require_multiplex_graph = __commonJS({
   }
 });
 
+// lib/auto-indexer.js
+var require_auto_indexer = __commonJS({
+  "lib/auto-indexer.js"(exports2, module2) {
+    "use strict";
+    var DEBOUNCE = {
+      passport: 8e3,
+      base: 1e4,
+      spotlight: 15e3,
+      multiplex: 6e4,
+      leiden: 3e4
+    };
+    var MULTIPLEX_MOD_THRESHOLD = 10;
+    var AutoIndexer2 = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+        this.running = false;
+        this.timers = /* @__PURE__ */ new Map();
+        this.runningKeys = /* @__PURE__ */ new Set();
+        this.lastRun = /* @__PURE__ */ new Map();
+        this._modCount = 0;
+        this._bootTimer = null;
+        this._eventRefs = [];
+      }
+      start() {
+        if (this.running) return { running: true, reason: "already-running" };
+        if (!this.plugin || !this.plugin.app || !this.plugin.app.vault) {
+          return { running: false, reason: "plugin.app.vault unavailable" };
+        }
+        const v = this.plugin.app.vault;
+        const refs = [
+          v.on("modify", (f) => this._onChange(f, "modify")),
+          v.on("create", (f) => this._onChange(f, "create")),
+          v.on("delete", (f) => this._onDelete(f)),
+          v.on("rename", (f, old) => this._onRename(f, old))
+        ];
+        for (const r of refs) {
+          if (this.plugin.registerEvent) this.plugin.registerEvent(r);
+          this._eventRefs.push(r);
+        }
+        this._bootTimer = setTimeout(() => this._bootCheck(), 8e3);
+        this.running = true;
+        return { running: true, hooks: 4 };
+      }
+      stop() {
+        if (!this.running) return { stopped: false };
+        for (const t of this.timers.values()) clearTimeout(t);
+        this.timers.clear();
+        if (this._bootTimer) {
+          clearTimeout(this._bootTimer);
+          this._bootTimer = null;
+        }
+        this._eventRefs = [];
+        this.running = false;
+        return { stopped: true };
+      }
+      // ---------------------------------------------------------------------------
+      // Event handlers
+      // ---------------------------------------------------------------------------
+      _onChange(file, kind) {
+        if (!file || !file.path) return;
+        if (!file.path.endsWith(".md")) return;
+        if (file.path.startsWith(this.plugin.manifest.dir)) return;
+        this._modCount++;
+        this._schedule("passport:" + file.path, DEBOUNCE.passport, () => this._runPassport(file.path));
+        this._schedule("base", DEBOUNCE.base, () => this._runBase());
+        this._schedule("spotlight", DEBOUNCE.spotlight, () => this._runSpotlight());
+        if (this._modCount >= MULTIPLEX_MOD_THRESHOLD) {
+          this._modCount = 0;
+          this._schedule("multiplex", DEBOUNCE.multiplex, () => this._runMultiplex());
+        }
+      }
+      _onDelete(file) {
+        if (!file || !file.path || !file.path.endsWith(".md")) return;
+        this._schedule("base", DEBOUNCE.base, () => this._runBase());
+        this._modCount++;
+        if (this._modCount >= MULTIPLEX_MOD_THRESHOLD) {
+          this._modCount = 0;
+          this._schedule("multiplex", DEBOUNCE.multiplex, () => this._runMultiplex());
+        }
+      }
+      _onRename(file, oldPath) {
+        if (!file || !file.path) return;
+        this._onDelete({ path: oldPath || "" });
+        this._onChange(file, "rename");
+      }
+      // ---------------------------------------------------------------------------
+      // Schedulers (debounced + dedup)
+      // ---------------------------------------------------------------------------
+      _schedule(key, ms, fn) {
+        if (this.runningKeys.has(key)) return;
+        const prev = this.timers.get(key);
+        if (prev) clearTimeout(prev);
+        const t = setTimeout(async () => {
+          this.timers.delete(key);
+          this.runningKeys.add(key);
+          const t0 = Date.now();
+          try {
+            const result = await fn();
+            this.lastRun.set(key, { at: Date.now(), result, durationMs: Date.now() - t0 });
+          } catch (e) {
+            console.warn("[zeus.autoidx]", key, "failed:", e && e.message ? e.message : e);
+            this.lastRun.set(key, { at: Date.now(), error: e && e.message ? e.message : String(e), durationMs: Date.now() - t0 });
+          } finally {
+            this.runningKeys.delete(key);
+          }
+        }, ms);
+        this.timers.set(key, t);
+      }
+      // ---------------------------------------------------------------------------
+      // Runners
+      // ---------------------------------------------------------------------------
+      async _runPassport(path2) {
+        const p = this.plugin.passport;
+        if (!p) return { skipped: "no-passport" };
+        if (this.plugin.httpClient && typeof this.plugin.httpClient.passportBatchExtract === "function") {
+          try {
+            const r = await this.plugin.httpClient.passportBatchExtract([path2], []);
+            return { passport: path2, daemon: !!r };
+          } catch (e) {
+            return { skipped: "daemon-unavailable", reason: e.message.slice(0, 80) };
+          }
+        }
+        return { skipped: "no-passport-api" };
+      }
+      async _runBase() {
+        if (!this.plugin.basesGen) return { skipped: "no-basesGen" };
+        const r = await this.plugin.basesGen.regenerate();
+        return { written: r.written, count: r.count };
+      }
+      async _runSpotlight() {
+        if (!this.plugin.httpClient || !this.plugin.vaultRoot) return { skipped: "no-spotlight" };
+        if (!this.plugin.app.vault.getMarkdownFiles) return { skipped: "no-getMarkdownFiles" };
+        const files = this.plugin.app.vault.getMarkdownFiles();
+        if (!files.length) return { skipped: "empty-vault" };
+        let passportMap = /* @__PURE__ */ new Map();
+        try {
+          if (this.plugin.passport && typeof this.plugin.passport.loadAll === "function") {
+            passportMap = await this.plugin.passport.loadAll();
+          }
+        } catch (e) {
+        }
+        const items = [];
+        for (const f of files) {
+          const passport = passportMap.get(f.path) || null;
+          const cache = this.plugin.app.metadataCache && this.plugin.app.metadataCache.getFileCache ? this.plugin.app.metadataCache.getFileCache(f) || {} : {};
+          const fm = cache.frontmatter || {};
+          const headings = (cache.headings || []).filter((h) => h.level <= 3).slice(0, 8).map((h) => h.heading);
+          const keywords = /* @__PURE__ */ new Set();
+          for (const c of (passport == null ? void 0 : passport.concepts) || []) keywords.add(String(c));
+          const fmTags = Array.isArray(fm.tags) ? fm.tags : typeof fm.tags === "string" ? fm.tags.split(",").map((s) => s.trim()) : [];
+          for (const t of fmTags) keywords.add(t);
+          const aliases = Array.isArray(fm.aliases) ? fm.aliases : typeof fm.aliases === "string" ? [fm.aliases] : [];
+          for (const a of aliases) keywords.add(a);
+          for (const h of headings) keywords.add(h);
+          const seen = /* @__PURE__ */ new Set();
+          const kw = [];
+          for (const k of keywords) {
+            if (!k) continue;
+            const s = String(k).trim();
+            if (s.length < 2) continue;
+            const lower = s.toLowerCase();
+            if (seen.has(lower)) continue;
+            seen.add(lower);
+            kw.push(s);
+            if (kw.length >= 25) break;
+          }
+          items.push({
+            path: this.plugin.vaultRoot.replace(/\/$/, "") + "/" + f.path,
+            title: f.basename,
+            summary: passport && (passport.one_line_summary || passport.summary) || "",
+            keywords: kw,
+            mtime: f.stat ? f.stat.mtime : Date.now()
+          });
+        }
+        let domainHint = "com.maiocchi.zeus.default";
+        try {
+          const universal2 = require_universal_fs();
+          const hex = await universal2.sha256Hex(this.plugin.vaultRoot);
+          domainHint = "com.maiocchi.zeus." + hex.slice(0, 16);
+        } catch (e) {
+        }
+        try {
+          const r = await this.plugin.httpClient.spotlightIndex(items, domainHint);
+          return { indexed: r.indexed, domain: r.domain };
+        } catch (e) {
+          return { skipped: "daemon-error", reason: e.message.slice(0, 80) };
+        }
+      }
+      async _runMultiplex() {
+        if (!this.plugin.multiplex) return { skipped: "no-multiplex" };
+        const stats = await this.plugin.multiplex.buildFromVault(() => {
+        });
+        await this.plugin.multiplex.persist();
+        this.plugin._multiplexLoaded = true;
+        this._schedule("leiden", DEBOUNCE.leiden, () => this._runLeiden());
+        return { total: stats.total, elapsedMs: stats.elapsedMs };
+      }
+      async _runLeiden() {
+        if (!this.plugin.leiden) return { skipped: "no-leiden" };
+        if (!this.plugin.multiplex || this.plugin.multiplex.edges.size === 0) {
+          return { skipped: "no-multiplex-edges" };
+        }
+        const r = await this.plugin.leiden.detectCommunities({
+          resolution: this.plugin.settings && this.plugin.settings.leidenResolution || 1,
+          seed: 42
+        });
+        if (this.plugin.leiden.persist) await this.plugin.leiden.persist();
+        return {
+          communities: (/* @__PURE__ */ new Set([...r.communities.values()])).size,
+          nodes: r.communities.size,
+          Q: Number(r.modularity.toFixed(4))
+        };
+      }
+      // ---------------------------------------------------------------------------
+      // Boot check — se data files estão stale vs vault, dispara rebuild
+      // ---------------------------------------------------------------------------
+      async _bootCheck() {
+      }
+      // ---------------------------------------------------------------------------
+      // Status — comando "Zeus: status auto-indexer"
+      // ---------------------------------------------------------------------------
+      getStatus() {
+        const summary = {};
+        for (const [k, v] of this.lastRun) {
+          summary[k] = {
+            ago_s: Math.round((Date.now() - v.at) / 1e3),
+            durationMs: v.durationMs,
+            result: v.result || null,
+            error: v.error || null
+          };
+        }
+        return {
+          running: this.running,
+          pending: Array.from(this.timers.keys()),
+          running_now: Array.from(this.runningKeys),
+          mod_count_since_multiplex: this._modCount,
+          mod_threshold: MULTIPLEX_MOD_THRESHOLD,
+          last_run: summary,
+          debounces: DEBOUNCE
+        };
+      }
+    };
+    module2.exports = AutoIndexer2;
+  }
+});
+
 // lib/leiden.js
 var require_leiden = __commonJS({
   "lib/leiden.js"(exports2, module2) {
@@ -4026,6 +4272,7 @@ var DaemonLifecycle = require_daemon_lifecycle();
 var HybridSearch = require_hybrid_search();
 var NativeWatcher = require_native_watcher();
 var MultiplexGraph = require_multiplex_graph();
+var AutoIndexer = require_auto_indexer();
 var LeidenCommunities = require_leiden();
 var VIEW_TYPE_SMART = "zeus-smart-view";
 var VIEW_TYPE_STATUS = "zeus-status-view";
@@ -4144,6 +4391,10 @@ var DEFAULT_SETTINGS = {
   hybridBm25Enabled: true,
   multiplexAutoBuild: false,
   // se ON, build inicial roda no onload em background
+  // v1.10 — AutoIndexer: indexação automática nativa Apple (FSEvents Mac /
+  // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
+  // multiplex/leiden) com debounce + cooldown.
+  autoIndexEnabled: true,
   // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
   // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
   leidenResolution: 1,
@@ -6282,6 +6533,15 @@ var ZeusPlugin = class extends Plugin {
       this.imageSimilarity = new ImageSimilaritySearch(this);
       this.passport = new PassportIndex(this);
       this.basesGen = new BasesGenerator(this);
+      this.autoIndexer = new AutoIndexer(this);
+      if (this.settings.autoIndexEnabled !== false) {
+        try {
+          const ai = this.autoIndexer.start();
+          console.log("[zeus] auto-indexer:", ai);
+        } catch (e) {
+          console.warn("[zeus] auto-indexer start failed:", e.message);
+        }
+      }
       this.coordinator = new DistributedCoordinator(this, {
         deviceId: this.settings.deviceId || void 0,
         ttlMs: this.settings.coordTtlMs || 6e4
@@ -7583,6 +7843,35 @@ breakdown: ${s.sizeBreakdown || "(vazio)"}`,
         }
       });
       this.addCommand({
+        id: "zeus-auto-indexer-status",
+        name: "Zeus: status do auto-indexer (indexa\xE7\xE3o autom\xE1tica)",
+        callback: () => {
+          try {
+            if (!this.autoIndexer) {
+              new Notice("Zeus auto-indexer indispon\xEDvel");
+              return;
+            }
+            const s = this.autoIndexer.getStatus();
+            if (!s.running) {
+              new Notice("Zeus auto-indexer OFF \u2014 habilite em Settings");
+              return;
+            }
+            const lines = [];
+            lines.push(`Auto-indexer: ${s.running ? "ATIVO" : "OFF"} \xB7 ${s.mod_count_since_multiplex}/${s.mod_threshold} mods pr\xE9-multiplex`);
+            if (s.pending.length) lines.push(`Pending: ${s.pending.join(", ")}`);
+            if (s.running_now.length) lines.push(`Running: ${s.running_now.join(", ")}`);
+            for (const [k, v] of Object.entries(s.last_run || {})) {
+              const ago = `${v.ago_s}s atr\xE1s`;
+              const detail = v.result ? JSON.stringify(v.result).slice(0, 60) : v.error ? "err: " + v.error.slice(0, 40) : "";
+              lines.push(`${k}: ${ago} \xB7 ${v.durationMs}ms \xB7 ${detail}`);
+            }
+            new Notice("Zeus AutoIndexer\n" + lines.join("\n"), 15e3);
+          } catch (e) {
+            new Notice("Auto-indexer status falhou: " + e.message.slice(0, 100), 7e3);
+          }
+        }
+      });
+      this.addCommand({
         id: "zeus-native-watcher-status",
         name: "Zeus: status do native-watcher (FSEvents iCloud)",
         callback: () => {
@@ -7636,6 +7925,13 @@ breakdown: ${s.sizeBreakdown || "(vazio)"}`,
         this.nativeWatcher.stop();
       } catch (e) {
         console.warn("[zeus] native-watcher stop:", e.message);
+      }
+    }
+    if (this.autoIndexer) {
+      try {
+        this.autoIndexer.stop();
+      } catch (e) {
+        console.warn("[zeus] auto-indexer stop:", e.message);
       }
     }
     if (this.daemonLifecycle) {

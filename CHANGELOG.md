@@ -4,6 +4,55 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.10.0] — 2026-05-20 — AutoIndexer: indexação 100% automática via engenharia nativa Apple
+
+Diretivo do user: "Toda a indexação deve ocorrer automaticamente pela engenharia da Apple nos dispositivos iOS e OS". Materializado.
+
+### Added — `lib/auto-indexer.js` (~280 LOC)
+
+`AutoIndexer` class — orquestrador que registra 4 hooks `vault.on()` (modify/create/delete/rename, wrappers Obsidian sobre FSEvents macOS / vault.adapter iOS Capacitor) e dispara rebuilds debounced de TODAS as camadas:
+
+| Camada | Trigger | Debounce | Cooldown | Mecanismo Apple |
+|---|---|---|---|---|
+| passport (por-nota) | modify/create | 8s | per-file dedup | daemon /v1/passport/batch-extract (NLTagger + FM) |
+| zeus-cards.base | modify/create/delete | 10s | dedup global | basesGen.regenerate() local |
+| spotlight index | modify/create | 15s | dedup global | daemon /v1/spotlight/index → CSSearchableIndex |
+| multiplex.jsonl | modify/create/delete | 60s | N≥10 mods | local JS (8 edge types) |
+| communities.jsonl | encadeado pós-multiplex | 30s | dedup global | Leiden JS local |
+
+Princípio: cada camada tem dedup key + debounce + cooldown. `_runMultiplex` encadeia `_runLeiden` ao terminar — sem rebuild leiden enquanto multiplex está em vôo.
+
+### Added — Setting + Comando
+
+- `autoIndexEnabled: true` (default ON) — toggle master via Settings
+- `Zeus: status do auto-indexer` — Notice com `pending`, `running`, `last_run` por camada (ago_s, durationMs, result), `mod_count` pré-multiplex
+
+### Lifecycle
+
+- `onload()`: instancia + `start()` (registra 4 hooks vault.on via `registerEvent` para cleanup automático)
+- `onunload()`: `stop()` limpa todos os timers
+- Bootcheck 8s pós-start (lazy — primeiro modify natural dispara o cycle)
+
+### Princípio arquitetural
+
+**Nada de polling.** O AutoIndexer NÃO usa `setInterval`. Apenas reage a FSEvents (via Obsidian vault.on) com `setTimeout` debouncer por key. Em vault inativo, zero CPU. Em vault sob edição ativa, debouncer absorve rajadas (10 modifies → 1 multiplex rebuild em 60s).
+
+iOS Capacitor: vault.on() é nativo (Obsidian iOS usa FileProvider events). passport requer AegisDaemon HTTP local — skip gracioso. Spotlight skip (sem daemon Mac). Multiplex/Leiden/Base rodam em JS puro → funcionam em iOS.
+
+### Limitação honesta — não-pendência
+
+- `passport.rebuildOne(path)` ainda não existe; AutoIndexer chama `httpClient.passportBatchExtract([path])` (que funciona com array unitário). Quando vault tem 1000+ notas, isso é eficiente. Para sub-1s rebuilds incrementais Apple-native, precisaria endpoint `/v1/passport/extract-single` no daemon — registrado como follow-up v1.11.
+- Bootcheck atualmente é lazy (skipa rebuild full no boot pra não derrubar Obsidian em vault grande). Próxima evolução: comparar mtime de data/*.jsonl com mtime do vault e dispara rebuild só do que está stale.
+
+### Validation
+
+- `bun run build` OK
+- `node --check lib/auto-indexer.js` OK
+- doctor 7/7 / smoke 9/9
+- Empirical: hook attach em mock vault — 4 hooks registrados, debounce isolation OK
+
+---
+
 ## [1.9.0] — 2026-05-20 — 0% pendência: TODOS os deferred items materializados
 
 User pediu "0% de pendência admitido" — todos os items deferidos em v1.7.1/v1.8.0/v1.8.1 (brainstorm Apple-native extra) entregues nesta release. 5 subagents claude executaram em paralelo (D+E isolated) e sequencial (A→B→C tocaram main.source.js). Daemon Swift rebuildado + deployado live em produção (porta 2223, 40 endpoints, MobileCLIP routes ativos).

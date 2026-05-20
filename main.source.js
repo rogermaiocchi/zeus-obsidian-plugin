@@ -184,6 +184,7 @@ const DaemonLifecycle = require('./lib/daemon-lifecycle');               // v1.5
 const HybridSearch = require('./lib/hybrid-search');                     // v1.6: RRF semantic+graph+passport+path; v1.8: +bm25 +MMR diversify
 const NativeWatcher = require('./lib/native-watcher');                   // v1.6: FSEvents observability (Mac iCloud)
 const MultiplexGraph = require('./lib/multiplex-graph');                 // v1.8: 8-edge-type multiplex graph (wikilink/backlink/entity/date/folder/cosine/spotlight/co-citation)
+const AutoIndexer = require('./lib/auto-indexer');                        // v1.10: orquestra rebuilds de TODAS as camadas via vault.on() automático
 const LeidenCommunities = require('./lib/leiden');                       // v1.9: community detection enxuto (local move + connectivity split + agregação) sobre multiplex
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
@@ -278,6 +279,10 @@ const DEFAULT_SETTINGS = {
   // nomes próprios) onde cosine sozinho falha.
   hybridBm25Enabled: true,
   multiplexAutoBuild: false,                // se ON, build inicial roda no onload em background
+  // v1.10 — AutoIndexer: indexação automática nativa Apple (FSEvents Mac /
+  // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
+  // multiplex/leiden) com debounce + cooldown.
+  autoIndexEnabled: true,
   // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
   // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
   leidenResolution: 1.0,                    // γ na modularidade; >1 favorece comunidades menores
@@ -2895,6 +2900,20 @@ class ZeusPlugin extends Plugin {
     this.passport = new PassportIndex(this);
     this.basesGen = new BasesGenerator(this);
 
+    // v1.10 — AutoIndexer: orquestra TODAS as camadas via vault.on() automático.
+    // Engenharia Apple nativa: vault.on é wrapper Obsidian sobre FSEvents (Mac)
+    // / vault.adapter (iOS Capacitor). Sem polling, sem cron — só FS events.
+    // Debounces individuais + cooldown longo no multiplex (60s, N≥10 mods).
+    this.autoIndexer = new AutoIndexer(this);
+    if (this.settings.autoIndexEnabled !== false) {
+      try {
+        const ai = this.autoIndexer.start();
+        console.log('[zeus] auto-indexer:', ai);
+      } catch (e) {
+        console.warn('[zeus] auto-indexer start failed:', e.message);
+      }
+    }
+
     // v0.10.0 — Cross-device coordination (claim/release via iCloud-synced locks)
     this.coordinator = new DistributedCoordinator(this, {
       deviceId: this.settings.deviceId || undefined,
@@ -4233,6 +4252,30 @@ class ZeusPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'zeus-auto-indexer-status',
+      name: 'Zeus: status do auto-indexer (indexação automática)',
+      callback: () => {
+        try {
+          if (!this.autoIndexer) { new Notice('Zeus auto-indexer indisponível'); return; }
+          const s = this.autoIndexer.getStatus();
+          if (!s.running) { new Notice('Zeus auto-indexer OFF — habilite em Settings'); return; }
+          const lines = [];
+          lines.push(`Auto-indexer: ${s.running ? 'ATIVO' : 'OFF'} · ${s.mod_count_since_multiplex}/${s.mod_threshold} mods pré-multiplex`);
+          if (s.pending.length) lines.push(`Pending: ${s.pending.join(', ')}`);
+          if (s.running_now.length) lines.push(`Running: ${s.running_now.join(', ')}`);
+          for (const [k, v] of Object.entries(s.last_run || {})) {
+            const ago = `${v.ago_s}s atrás`;
+            const detail = v.result ? JSON.stringify(v.result).slice(0, 60) : (v.error ? 'err: ' + v.error.slice(0, 40) : '');
+            lines.push(`${k}: ${ago} · ${v.durationMs}ms · ${detail}`);
+          }
+          new Notice('Zeus AutoIndexer\n' + lines.join('\n'), 15000);
+        } catch (e) {
+          new Notice('Auto-indexer status falhou: ' + e.message.slice(0, 100), 7000);
+        }
+      },
+    });
+
+    this.addCommand({
       id: 'zeus-native-watcher-status',
       name: 'Zeus: status do native-watcher (FSEvents iCloud)',
       callback: () => {
@@ -4275,6 +4318,9 @@ class ZeusPlugin extends Plugin {
     }
     if (this.nativeWatcher) {
       try { this.nativeWatcher.stop(); } catch (e) { console.warn('[zeus] native-watcher stop:', e.message); }
+    }
+    if (this.autoIndexer) {
+      try { this.autoIndexer.stop(); } catch (e) { console.warn('[zeus] auto-indexer stop:', e.message); }
     }
     if (this.daemonLifecycle) {
       try { await this.daemonLifecycle.stop(); } catch (e) { console.warn('[zeus] daemon lifecycle stop:', e.message); }

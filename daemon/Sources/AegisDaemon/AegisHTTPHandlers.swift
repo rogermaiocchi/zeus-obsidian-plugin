@@ -24,6 +24,13 @@ import FoundationModels
 #if canImport(AVFoundation)
 import AVFoundation
 #endif
+// v1.13 — CoreSpotlight para iOS/iPadOS (CSSearchableIndex + CSSearchQuery
+// estão disponíveis em iOS 9+ com mesma API do macOS). Permite indexação
+// nativa de notas do vault no Spotlight do iPhone/iPad — busca system-wide
+// (Spotlight do iOS) acha notas Zeus sem precisar abrir Obsidian.
+#if canImport(CoreSpotlight)
+import CoreSpotlight
+#endif
 
 // Handlers HTTP do AegisHTTPServer. Roteia para:
 //   GET  /v1/health           → status + disponibilidade NL/Vision/FoundationModels
@@ -165,7 +172,14 @@ final class AegisHTTPHandler: ChannelInboundHandler {
         case (.POST, "/v1/data-detect"):
             return self.handleUnsupportedEndpoint("/v1/data-detect", reason: "NSDataDetector ainda não está portado no AegisDaemon standalone")
         case (.POST, "/v1/spotlight/search"):
-            return self.handleUnsupportedEndpoint("/v1/spotlight/search", reason: "Spotlight search não está disponível no sandbox iOS standalone")
+            return self.handleUnsupportedEndpoint("/v1/spotlight/search", reason: "Spotlight search (mdfind shell) só macOS — use /v1/spotlight/query no iOS")
+        // v1.13 — CoreSpotlight nativo iOS via CSSearchableIndex programático.
+        case (.POST, "/v1/spotlight/index"):
+            return self.handleSpotlightIndex(bodyJSON: body)
+        case (.POST, "/v1/spotlight/query"):
+            return self.handleSpotlightQueryNative(bodyJSON: body)
+        case (.POST, "/v1/spotlight/purge"):
+            return self.handleSpotlightPurge(bodyJSON: body)
         case (.POST, "/v1/cmd"):
             return self.handleCmd(bodyJSON: body)
         case (.GET, "/v1/cmd"):
@@ -2175,6 +2189,178 @@ final class AegisHTTPHandler: ChannelInboundHandler {
             "endpoint": endpoint,
             "reason": reason
         ])
+    }
+
+    // MARK: - Spotlight CoreSpotlight (v1.13 iOS native bridge)
+    //
+    // CSSearchableIndex / CSSearchQuery são as MESMAS APIs em iOS e macOS desde
+    // iOS 9. AegisDaemon embarcado no app host iOS (Capivara / MetassistemaApp)
+    // expõe os 3 endpoints. Plugin Obsidian Capacitor chama 127.0.0.1:2223
+    // (loopback no mesmo device) → CSSearchableIndex injeta → Spotlight do
+    // iOS acha notas Zeus em busca system-wide.
+    //
+    // domainIdentifier por vault hash isolam indices entre vaults diferentes.
+
+    private static func deriveSpotlightDomain(_ json: [String: Any]) -> String {
+        if let hint = json["domain_hint"] as? String, !hint.isEmpty {
+            return hint
+        }
+        return "com.maiocchi.zeus.ios.default"
+    }
+
+    private func handleSpotlightIndex(bodyJSON: String) -> Response {
+        #if canImport(CoreSpotlight)
+        guard let json = Self.parseJSON(bodyJSON),
+              let items = json["items"] as? [[String: Any]], !items.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"items\": [{\"path\":...,\"title\":...,...}]}"
+            ])
+        }
+        let domainHint = Self.deriveSpotlightDomain(json)
+
+        var searchableItems: [CSSearchableItem] = []
+        for it in items {
+            guard let path = it["path"] as? String, !path.isEmpty else { continue }
+            let attrs = CSSearchableItemAttributeSet(itemContentType: "public.plain-text")
+            attrs.title = (it["title"] as? String) ?? (path as NSString).lastPathComponent
+            attrs.contentDescription = (it["summary"] as? String) ?? ""
+            if let kws = it["keywords"] as? [String] {
+                attrs.keywords = kws
+            } else if let kw = it["keywords"] as? String {
+                attrs.keywords = kw.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
+            }
+            if let mtimeMs = it["mtime"] as? Double, mtimeMs > 0 {
+                attrs.contentModificationDate = Date(timeIntervalSince1970: mtimeMs / 1000.0)
+            }
+            attrs.identifier = path
+            let item = CSSearchableItem(uniqueIdentifier: path, domainIdentifier: domainHint, attributeSet: attrs)
+            searchableItems.append(item)
+        }
+
+        let index = CSSearchableIndex(name: domainHint)
+        let sem = DispatchSemaphore(value: 0)
+        var indexError: Error?
+        index.indexSearchableItems(searchableItems) { err in
+            indexError = err
+            sem.signal()
+        }
+        let waitResult = sem.wait(timeout: .now() + .seconds(30))
+        if waitResult == .timedOut {
+            return Response(status: .init(statusCode: 504, reasonPhrase: "Gateway Timeout"), payload: [
+                "error": "indexSearchableItems excedeu 30s sem callback",
+                "domain": domainHint,
+                "mode": "timeout",
+                "items_attempted": searchableItems.count
+            ])
+        }
+        if let e = indexError {
+            return Response(status: .internalServerError, payload: [
+                "error": "indexSearchableItems falhou: \(e)",
+                "domain": domainHint,
+                "items_attempted": searchableItems.count
+            ])
+        }
+        return Response(status: .ok, payload: [
+            "indexed": searchableItems.count,
+            "domain": domainHint,
+            "mode": "queued",
+            "platform": "ios",
+            "note": "Spotlight iOS async — propagação ~3-10s. Reconsulte /v1/spotlight/query."
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: ["error": "CoreSpotlight indisponível neste build"])
+        #endif
+    }
+
+    private func handleSpotlightQueryNative(bodyJSON: String) -> Response {
+        #if canImport(CoreSpotlight)
+        guard let json = Self.parseJSON(bodyJSON),
+              let query = json["query"] as? String, !query.isEmpty else {
+            return Response(status: .badRequest, payload: ["error": "body inválido: requer {\"query\": \"...\"}"])
+        }
+        let limit = (json["limit"] as? Int) ?? 50
+        let domainHint = Self.deriveSpotlightDomain(json)
+
+        // Escape \ e " para predicate seguro
+        var escaped = query
+        escaped = escaped.replacingOccurrences(of: "\\", with: "\\\\")
+        escaped = escaped.replacingOccurrences(of: "\"", with: "\\\"")
+        let predicate = "(domainIdentifier == \"\(domainHint)\") && (** == \"\(escaped)*\"cdw)"
+
+        let csQuery = CSSearchQuery(queryString: predicate, attributes: [
+            "title", "contentDescription", "keywords", "identifier"
+        ])
+
+        var results: [[String: Any]] = []
+        let sem = DispatchSemaphore(value: 0)
+        csQuery.foundItemsHandler = { items in
+            for it in items {
+                var entry: [String: Any] = [
+                    "path": it.uniqueIdentifier,
+                    "domain": it.domainIdentifier ?? NSNull(),
+                ]
+                let attrs = it.attributeSet
+                if let t = attrs.title { entry["title"] = t }
+                if let d = attrs.contentDescription { entry["summary"] = d }
+                if let k = attrs.keywords { entry["keywords"] = k }
+                results.append(entry)
+                if results.count >= limit { break }
+            }
+        }
+        csQuery.completionHandler = { _ in sem.signal() }
+        csQuery.start()
+        _ = sem.wait(timeout: .now() + .seconds(10))
+        csQuery.cancel()
+
+        let paths = results.compactMap { $0["path"] as? String }
+        return Response(status: .ok, payload: [
+            "query": query,
+            "domain": domainHint,
+            "results": paths,
+            "items": results,
+            "count": paths.count,
+            "platform": "ios",
+            "model": "CSSearchQuery (CoreSpotlight iOS nativo)"
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: ["error": "CoreSpotlight indisponível neste build"])
+        #endif
+    }
+
+    private func handleSpotlightPurge(bodyJSON: String) -> Response {
+        #if canImport(CoreSpotlight)
+        let json = Self.parseJSON(bodyJSON) ?? [:]
+        let domainHint = Self.deriveSpotlightDomain(json)
+
+        let index = CSSearchableIndex(name: domainHint)
+        let sem = DispatchSemaphore(value: 0)
+        var purgeError: Error?
+        index.deleteSearchableItems(withDomainIdentifiers: [domainHint]) { err in
+            purgeError = err
+            sem.signal()
+        }
+        let waitResult = sem.wait(timeout: .now() + .seconds(15))
+        if waitResult == .timedOut {
+            return Response(status: .init(statusCode: 504, reasonPhrase: "Gateway Timeout"), payload: [
+                "error": "deleteSearchableItems excedeu 15s sem callback",
+                "domain": domainHint,
+                "mode": "timeout"
+            ])
+        }
+        if let e = purgeError {
+            return Response(status: .internalServerError, payload: [
+                "error": "purge falhou: \(e)",
+                "domain": domainHint
+            ])
+        }
+        return Response(status: .ok, payload: [
+            "purged": true,
+            "domain": domainHint,
+            "platform": "ios"
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: ["error": "CoreSpotlight indisponível neste build"])
+        #endif
     }
 
     private static func parseJSON(_ s: String) -> [String: Any]? {

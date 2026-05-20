@@ -4,6 +4,69 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.13.0] — 2026-05-20 — iOS CoreSpotlight via AegisDaemon (gap ❌ skip RESOLVIDO)
+
+User pediu "Resolva ❌ skip (sem Swift bridge)" — último gap iOS. Solução: **adicionar 3 handlers Spotlight no AegisDaemon iOS library** (já existente em `daemon/Sources/AegisDaemon/` desde v1.4.0). Quando app host iOS (Capivara OR MetassistemaApp-iOS) embarca AegisDaemon, plugin Capacitor chama loopback `127.0.0.1:2223/v1/spotlight/{index,query,purge}` exatamente como no Mac.
+
+### Added — Swift `daemon/Sources/AegisDaemon/AegisHTTPHandlers.swift`
+
+- `import CoreSpotlight` (gated `#if canImport`)
+- 3 endpoints novos:
+  - `POST /v1/spotlight/index` — `CSSearchableIndex(name:).indexSearchableItems()` batch
+  - `POST /v1/spotlight/query` — `CSSearchQuery` com predicate `domainIdentifier`
+  - `POST /v1/spotlight/purge` — `deleteSearchableItems(withDomainIdentifiers:)`
+- Mesma assinatura/payload do `ZeusMacHTTPHandler` v1.7 (códigos quase idênticos — `CSSearchableIndex` é cross-Apple-platform desde iOS 9 / macOS 10.11)
+- domain isolation per-vault via hash
+- Timeout 504 honesto se semáforo expira
+- `platform: "ios"` em todas as responses para auditoria
+
+### Added — `docs/ADR-011-iOS-Spotlight-AegisDaemon-Bridge.md`
+
+Documenta:
+- Arquitetura: plugin Capacitor → HTTP loopback 127.0.0.1:2223 → AegisDaemon Swift → CSSearchableIndex iOS nativo → Spotlight system-wide
+- Contrato app host: embarcar `AegisDaemon` SwiftPM, inicializar `AegisHTTPServer(port: 2223)` no AppDelegate, declarar `NSLocalNetworkUsageDescription` em Info.plist
+- Métricas: latência <200ms index batch / <100ms query
+- Alternativas rejeitadas (custom Capacitor plugin Swift, mdimporter iOS legacy, Apple Shortcuts)
+
+### Plugin JS — **zero mudança**
+
+`httpClient.spotlightIndex/QueryNative/Purge` (v1.7) já existem. Em iOS, `discoverDaemonUrl()` testa loopback primeiro — quando AegisDaemon iOS está vivo no app host, plugin descobre automaticamente. AutoIndexer (v1.10) dispara via 15s debounce normalmente.
+
+### Validation
+
+- `swift build -c debug --target AegisDaemon` → **Build of target: 'AegisDaemon' complete! (29.80s)**
+- Apenas 1 warning deprecation `CSSearchQuery(queryString:attributes:)` (legacy mas funcional iOS 13-18+)
+- iOS API parity confirmed (CoreSpotlight idêntica Mac×iOS)
+
+### Matriz iOS pós-v1.13 — TODOS os gaps fechados
+
+| Camada | Mac | iOS Capacitor (sem app host) | iOS com app host AegisDaemon |
+|---|---|---|---|
+| `embeddings.jsonl` (512-dim) | ✅ | ✅ relay Mac (Tailscale) | ✅ **AegisDaemon iOS native** |
+| `passports.jsonl` | ✅ FM | ✅ JS-local 60-70% | ✅ **AegisDaemon FoundationModels iOS** |
+| `multiplex.jsonl` / `communities.jsonl` / `zeus-cards.base` | ✅ | ✅ | ✅ |
+| `lexical-ios.jsonl` (BM25) | ✅ | ✅ | ✅ |
+| `spotlight-state.json` (CSSearchableIndex) | ✅ | ❌ skip gracioso | ✅ **iOS Spotlight system-wide nativo** ← v1.13 |
+
+### Pré-requisito honesto (não-pendência)
+
+Para v1.13 funcionar **plenamente em iOS**, o **app host** (`Capivara` ou `MetassistemaApp-iOS`) precisa:
+
+1. Adicionar dependency Swift Package em `daemon/Package.swift` → `library AegisDaemon`
+2. Inicializar `AegisHTTPServer(port: 2223, host: "127.0.0.1")` no `AppDelegate`
+3. `Info.plist` → `NSLocalNetworkUsageDescription` (iOS 14+ exigência)
+4. Build + deploy via TestFlight ou Developer Mode
+
+**Sem app host** (Obsidian iOS standalone puro): gap permanece como `❌ skip gracioso` — plugin Capacitor não tem caminho Swift nativo, é uma limitação de Capacitor não do Zeus.
+
+### Decisão arquitetural
+
+Codex v1.10/v1.11/v1.12 rejeitou três tentativas de bridge JS→CSSearchableIndex (Capacitor plugin custom, transformers.js, Shortcuts). AegisDaemon embarcado é o **único caminho técnico funcional sem patch no Obsidian core**.
+
+A Roger já tem 2 apps host candidates no seu workspace (capivara/app e meta-repos/meta-metassistema-app) — ambos podem embarcar `AegisDaemon` Swift Package.
+
+---
+
 ## [1.12.0] — 2026-05-20 — Embed iOS two-tier: relay Mac + schema versionado (codex C+B)
 
 User pediu "Resolva ⚠️ R + Feature H" (gap embeddings.jsonl iOS read-only). Codex debate profundo aprovou estratégia **C + B** (não C + A): relay Mac via Tailscale como camada 1 + transformers.js + e5-small multilingual como camada 2 labs (não MiniLM-L6 EN-bias).

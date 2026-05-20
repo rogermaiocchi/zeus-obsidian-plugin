@@ -184,6 +184,7 @@ const DaemonLifecycle = require('./lib/daemon-lifecycle');               // v1.5
 const HybridSearch = require('./lib/hybrid-search');                     // v1.6: RRF semantic+graph+passport+path; v1.8: +bm25 +MMR diversify
 const NativeWatcher = require('./lib/native-watcher');                   // v1.6: FSEvents observability (Mac iCloud)
 const MultiplexGraph = require('./lib/multiplex-graph');                 // v1.8: 8-edge-type multiplex graph (wikilink/backlink/entity/date/folder/cosine/spotlight/co-citation)
+const LeidenCommunities = require('./lib/leiden');                       // v1.9: community detection enxuto (local move + connectivity split + agregação) sobre multiplex
 
 const VIEW_TYPE_SMART = 'zeus-smart-view';
 const VIEW_TYPE_STATUS = 'zeus-status-view';
@@ -277,6 +278,11 @@ const DEFAULT_SETTINGS = {
   // nomes próprios) onde cosine sozinho falha.
   hybridBm25Enabled: true,
   multiplexAutoBuild: false,                // se ON, build inicial roda no onload em background
+  // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
+  // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
+  leidenResolution: 1.0,                    // γ na modularidade; >1 favorece comunidades menores
+  leidenAutoRun: false,                     // se ON, dispara detectCommunities após buildFromVault multiplex
+  leidenPropagateFM: false,                 // se ON, escreve zeus_community: NN no frontmatter de cada nota
 };
 
 // =========================================================================
@@ -2695,6 +2701,55 @@ class ZeusSettingTab extends PluginSettingTab {
       }));
 
     // ────────────────────────────────────────────────────────────────────
+    // Leiden communities (v1.9) — vide docs/ADR-008-Leiden-Communities-JS-Port.md
+    // Escopo enxuto: local move + connectivity split + agregação. NÃO é o
+    // Leiden canônico (sem refinement phase). Suficiente para vault típico.
+    // ────────────────────────────────────────────────────────────────────
+    containerEl.createEl('h3', { text: 'Leiden communities (v1.9)' });
+
+    new Setting(containerEl)
+      .setName('Leiden resolution (γ)')
+      .setDesc('Parâmetro de resolução na modularidade. 1.0 = padrão Newman; >1 favorece comunidades menores (mais granular); <1 favorece comunidades maiores. Vide ADR-008.')
+      .addSlider(s => s.setLimits(0.1, 3.0, 0.05).setValue(this.plugin.settings.leidenResolution).setDynamicTooltip().onChange(async v => {
+        this.plugin.settings.leidenResolution = v;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('Auto-run Leiden após multiplex auto-build')
+      .setDesc('Quando ON e multiplexAutoBuild também ON, dispara detectCommunities em sequência após o build (sem competir por CPU). Default OFF — rode manualmente via comando "Zeus: detectar comunidades".')
+      .addToggle(t => t.setValue(this.plugin.settings.leidenAutoRun).onChange(async v => {
+        this.plugin.settings.leidenAutoRun = v;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('Propagar comunidade ao frontmatter (zeus_community)')
+      .setDesc('Quando ON, comando "detectar comunidades" escreve zeus_community: NN no frontmatter de cada nota. SHA-compare evita loop modify→write→modify (pattern v1.6.1). Default OFF — modifica TODAS as notas.')
+      .addToggle(t => t.setValue(this.plugin.settings.leidenPropagateFM).onChange(async v => {
+        this.plugin.settings.leidenPropagateFM = v;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName('Leiden stats')
+      .setDesc('Snapshot das comunidades persistidas em data/communities.jsonl.')
+      .addButton(b => b.setButtonText('Stats').onClick(async () => {
+        try {
+          const r = await this.plugin.leiden.load();
+          if (!r.exists) {
+            new Notice('Zeus Leiden: nunca rodou (data/communities.jsonl ausente)', 5000);
+            return;
+          }
+          const s = this.plugin.leiden.statsFromMap(r.communities);
+          const topStr = s.topSizes.map(t => `c${t.communityId}:${t.size}`).join(', ');
+          new Notice(`Zeus Leiden: ${s.total} notas em ${s.communityCount} comunidades · Q=${r.modularity != null ? r.modularity.toFixed(3) : '?'}\ntop-3 [${topStr}]`, 9000);
+        } catch (e) {
+          new Notice('Zeus Leiden stats falhou: ' + e.message, 5000);
+        }
+      }));
+
+    // ────────────────────────────────────────────────────────────────────
     // Ações finais
     // ────────────────────────────────────────────────────────────────────
     containerEl.createEl('h3', { text: 'Ações' });
@@ -2772,6 +2827,12 @@ class ZeusPlugin extends Plugin {
     // = true reroda buildFromVault em background no onload.
     this.multiplex = new MultiplexGraph(this);
     this._multiplexLoaded = false;
+    // v1.9 — Leiden communities (escopo enxuto JS, sem Python). Apoia-se em
+    // this.multiplex; comando manual `zeus-leiden-detect` ou autoRun via setting.
+    // SHA-compare pattern para frontmatter writes herdado de ZeusNativeGraphIntegration
+    // (v1.6.1 codex MED #1) — evita loop modify→write→modify.
+    this.leiden = new LeidenCommunities(this);
+    this._leidenLastWritten = new Map(); // path → communityId (skip re-write quando inalterado)
 
     // v0.5.0 — modular extensions
     // pluginDataPath: absolute on Mac, vault-relative on iOS (multi-vector saveAll
@@ -2888,6 +2949,20 @@ class ZeusPlugin extends Plugin {
           this._multiplexLoaded = true;
           const s = this.multiplex.stats();
           console.log('[zeus.multiplex] auto-build done:', s.total, 'edges');
+          // v1.9 — Leiden auto-run após multiplex pronto. Roda em sequência (não
+          // em paralelo) — Leiden depende do grafo congelado em memória.
+          if (this.settings.leidenAutoRun) {
+            try {
+              console.log('[zeus.leiden] auto-detect starting…');
+              const r = await this.leiden.detectCommunities({
+                resolution: this.settings.leidenResolution || 1.0,
+              });
+              await this.leiden.persist(r);
+              console.log('[zeus.leiden] auto-detect done:', r.stats.communityCount, 'comunidades, Q=', r.modularity.toFixed(3));
+            } catch (e2) {
+              console.warn('[zeus.leiden] auto-detect failed:', e2.message);
+            }
+          }
         } catch (e) {
           console.warn('[zeus.multiplex] auto-build failed:', e.message);
         }
@@ -3855,6 +3930,82 @@ class ZeusPlugin extends Plugin {
         new ZeusMultiplexNeighborsModal(this.app, this, items, `Vizinhos multiplex de ${file.basename}`).open();
       },
     });
+    // v1.9 — Leiden community detection (escopo enxuto JS sobre o multiplex).
+    // Vide docs/ADR-008-Leiden-Communities-JS-Port.md.
+    this.addCommand({
+      id: 'zeus-leiden-detect',
+      name: 'Zeus: detectar comunidades (Leiden sobre multiplex)',
+      callback: async () => {
+        // 1) Garante multiplex disponível
+        await _ensureMultiplexLoaded();
+        if (!this.multiplex.edges || this.multiplex.edges.size === 0) {
+          new Notice('Zeus Leiden: multiplex vazio — rode "Zeus: construir grafo multiplex" primeiro', 7000);
+          return;
+        }
+        const n = new Notice('Zeus Leiden: detectando comunidades sobre o multiplex…', 0);
+        try {
+          const r = await this.leiden.detectCommunities({
+            resolution: this.settings.leidenResolution || 1.0,
+          });
+          // 2) Persiste data/communities.jsonl
+          const persisted = await this.leiden.persist(r);
+          // 3) Propaga ao frontmatter se setting ON. SHA-compare via
+          // _leidenLastWritten evita timestamp churn (mesmo pattern de
+          // ZeusNativeGraphIntegration v1.6.1).
+          let wroteFM = 0, skippedFM = 0;
+          if (this.settings.leidenPropagateFM) {
+            n.setMessage('Zeus Leiden: escrevendo zeus_community no frontmatter…');
+            for (const [path, cid] of r.communities.entries()) {
+              const prev = this._leidenLastWritten.get(path);
+              if (prev === cid) { skippedFM++; continue; }
+              const file = this.app.vault.getAbstractFileByPath(path);
+              if (!file) continue;
+              try {
+                await this.app.fileManager.processFrontMatter(file, (fm) => {
+                  if (fm.zeus_community === cid) return; // já em sync no disco
+                  fm.zeus_community = cid;
+                });
+                this._leidenLastWritten.set(path, cid);
+                wroteFM++;
+              } catch (_) {
+                // skip silencioso — frontmatter pode falhar em arquivos quebrados
+              }
+            }
+          }
+          n.hide();
+          const topStr = r.stats.topSizes.join(', ');
+          const fmInfo = this.settings.leidenPropagateFM ? ` · FM ${wroteFM} writes (${skippedFM} skip)` : '';
+          new Notice(
+            `Zeus Leiden: ${r.stats.communityCount} comunidades · Q=${r.modularity.toFixed(3)} · top-3 sizes [${topStr}]${fmInfo}\npersistido em ${persisted.path}`,
+            10000
+          );
+        } catch (e) {
+          n.hide();
+          new Notice('Zeus Leiden falhou: ' + (e.message || String(e)).slice(0, 200), 8000);
+        }
+      },
+    });
+    this.addCommand({
+      id: 'zeus-leiden-stats',
+      name: 'Zeus: stats de comunidades (Leiden)',
+      callback: async () => {
+        try {
+          const r = await this.leiden.load();
+          if (!r.exists) {
+            new Notice('Zeus Leiden: data/communities.jsonl não existe — rode "detectar comunidades" primeiro', 7000);
+            return;
+          }
+          const s = this.leiden.statsFromMap(r.communities);
+          const topStr = s.topSizes.map(t => `c${t.communityId}:${t.size}`).join(', ');
+          new Notice(
+            `Zeus Leiden: ${s.total} notas em ${s.communityCount} comunidades · Q=${r.modularity != null ? r.modularity.toFixed(3) : '?'}\ntop-3 [${topStr}]\nbreakdown: ${s.sizeBreakdown || '(vazio)'}`,
+            12000
+          );
+        } catch (e) {
+          new Notice('Zeus Leiden stats falhou: ' + (e.message || String(e)).slice(0, 200), 6000);
+        }
+      },
+    });
     // v1.7 — Spotlight CSSearchableIndex integration
     // codex audit MED A/F: computa domain_hint no JS para que daemon não caia
     // em "com.maiocchi.zeus.default" quando spawned sem --vault. Hash do
@@ -3886,14 +4037,52 @@ class ZeusPlugin extends Plugin {
             ? await this.passport.loadAll().catch(() => new Map())
             : new Map();
           const items = [];
+          let totalKeywords = 0;
           for (const f of files) {
             const passport = passportMap.get(f.path) || null;
             const mtime = f.stat ? f.stat.mtime : Date.now();
+            // ADR-009 (v1.8.2): enriquece kMDItemKeywords (CSSearchableItemAttributeSet.keywords)
+            // com 6 fontes — passport.concepts + frontmatter tags + frontmatter aliases +
+            // top H1-H3 headings + frontmatter zeus_concepts + frontmatter zeus_domain.
+            // Resultado: mdfind "kMDItemKeywords == 'taxonomia'cdw" passa a achar notas
+            // por aliases/headings/tags além dos concepts NLTagger. Cap 25 (>50 vira ruído).
+            // Inline #tags do body NÃO incluídos (await cachedRead em N files seria lento;
+            // diferido para v2.x se houver demanda real).
+            const cache = this.app.metadataCache.getFileCache(f) || {};
+            const fm = cache.frontmatter || {};
+            const headings = (cache.headings || []).filter(h => h.level <= 3).slice(0, 8).map(h => h.heading);
+            const collected = new Set();
+            for (const c of (passport?.concepts || [])) collected.add(String(c));
+            const fmTags = Array.isArray(fm.tags) ? fm.tags
+              : (typeof fm.tags === 'string' ? fm.tags.split(',').map(s => s.trim()) : []);
+            for (const t of fmTags) collected.add(t);
+            const aliases = Array.isArray(fm.aliases) ? fm.aliases
+              : (typeof fm.aliases === 'string' ? [fm.aliases] : []);
+            for (const a of aliases) collected.add(a);
+            for (const h of headings) collected.add(h);
+            if (Array.isArray(fm.zeus_concepts)) for (const c of fm.zeus_concepts) collected.add(c);
+            const fmDomain = Array.isArray(fm.zeus_domain) ? fm.zeus_domain
+              : (fm.zeus_domain ? [fm.zeus_domain] : []);
+            for (const d of fmDomain) collected.add(d);
+            // Filter: drop short/nulls, dedup case-insensitively, cap 25.
+            const seen = new Set();
+            const keywords = [];
+            for (const k of collected) {
+              if (!k) continue;
+              const s = String(k).trim();
+              if (s.length < 2) continue;
+              const lower = s.toLowerCase();
+              if (seen.has(lower)) continue;
+              seen.add(lower);
+              keywords.push(s);
+              if (keywords.length >= 25) break;
+            }
+            totalKeywords += keywords.length;
             items.push({
               path: this.vaultRoot ? `${this.vaultRoot.replace(/\/$/, '')}/${f.path}` : f.path,
               title: f.basename,
               summary: (passport && (passport.one_line_summary || passport.summary)) || '',
-              keywords: (passport && Array.isArray(passport.concepts)) ? passport.concepts.slice(0, 12) : [],
+              keywords,
               mtime,
               modality: 'md',
             });
@@ -3914,7 +4103,8 @@ class ZeusPlugin extends Plugin {
           }
           n.hide();
           if (r.indexed != null) {
-            new Notice(`Zeus Spotlight: ${r.indexed} items indexados · domain ${r.domain.slice(-16)}`, 7000);
+            const avgKw = items.length > 0 ? (totalKeywords / items.length).toFixed(1) : '0.0';
+            new Notice(`Zeus Spotlight: ${r.indexed} items · avg ${avgKw} keywords · domain ${r.domain.slice(-16)}`, 7000);
             try {
               const adapter = this.app.vault.adapter;
               const stateRel = universal.joinPath(this.manifest.dir, 'data', 'spotlight-state.json');
@@ -3960,6 +4150,61 @@ class ZeusPlugin extends Plugin {
           }
         } catch (e) {
           new Notice('Zeus Spotlight purge falhou: ' + (e.message || String(e)).slice(0, 200), 7000);
+        }
+      },
+    });
+
+    // v1.9 — MobileCLIP stub opt-in (ADR-010)
+    // Codex aprovou: sem bundle do modelo (+250MB pioraria install UX). Endpoints
+    // retornam 501 até user rodar "Zeus: instalar modelo MobileCLIP". Em v1.9 o
+    // comando "instalar" apenas copia instruções para o clipboard; o download
+    // automatizado via fetch HTTPS + checksum chega em v2.0 labs.
+    this.addCommand({
+      id: 'zeus-mobileclip-status',
+      name: 'Zeus: status MobileCLIP (modelo instalado?)',
+      callback: async () => {
+        try {
+          if (!isMac()) { new Notice('MobileCLIP: apenas macOS'); return; }
+          const s = await this.httpClient.mobileclipStatus();
+          if (s.error) {
+            new Notice('MobileCLIP status erro: ' + String(s.error).slice(0, 100), 7000);
+            return;
+          }
+          const summary = s.installed
+            ? `MobileCLIP INSTALADO em ${s.model_dir}`
+            : `MobileCLIP NÃO instalado · esperado em ${s.model_dir} · use comando "instalar modelo"`;
+          new Notice(`Zeus ${summary}`, 9000);
+        } catch (e) {
+          new Notice('MobileCLIP status falhou: ' + (e.message || String(e)).slice(0, 100), 7000);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'zeus-mobileclip-install',
+      name: 'Zeus: instalar modelo MobileCLIP (download manual)',
+      callback: async () => {
+        try {
+          if (!isMac()) { new Notice('MobileCLIP: apenas macOS'); return; }
+          // v1.9 — apenas instruções; download automatizado é v2.0 labs.
+          const msg = [
+            'MobileCLIP v1.9 é STUB opt-in (ADR-010). Download manual:',
+            '',
+            '1. mkdir -p ~/Library/Application\\ Support/Zeus/mobileclip-model',
+            '2. Baixe MobileCLIP-S0 (recommended): https://huggingface.co/apple/MobileCLIP-S0',
+            '   Arquivos: MobileCLIP-S0-vision.mlpackage, MobileCLIP-S0-text.mlpackage',
+            '3. cp pra ~/Library/Application\\ Support/Zeus/mobileclip-model/',
+            '4. Crie model-manifest.json: { "version": "1.0", "variant": "S0" }',
+            '5. Cmd+P -> "Zeus: status MobileCLIP" pra verificar',
+            '',
+            'Em v2.0, este comando fará o download automatico via fetch HTTPS + checksum.',
+          ].join('\n');
+          console.log('[zeus.mobileclip]', msg);
+          // Copia pro clipboard se disponível (Electron desktop + browser).
+          try { await navigator.clipboard.writeText(msg); } catch {}
+          new Notice('MobileCLIP install instructions copiadas pro clipboard. Cole em terminal/notas.', 12000);
+        } catch (e) {
+          new Notice('MobileCLIP install falhou: ' + (e.message || String(e)).slice(0, 100), 7000);
         }
       },
     });

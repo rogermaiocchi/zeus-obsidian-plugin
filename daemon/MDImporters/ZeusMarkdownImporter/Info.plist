@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Zeus Markdown Importer</string>
+	<key>CFBundleExecutable</key>
+	<string>ZeusMarkdownImporter</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.maiocchi.zeus.MarkdownImporter</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ZeusMarkdownImporter</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Roger Maiocchi. MIT License.</string>
+
+	<!-- Spotlight MDImporter plugin metadata -->
+	<key>CFPlugInDynamicRegistration</key>
+	<string>NO</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<!-- Factory UUID for this plugin instance. Referenced by CFPlugInTypes below. -->
+		<key>20B7BB87-8919-4FF0-85D6-7BADFC17486B</key>
+		<string>MetadataImporterPluginFactory</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<!-- 8B08C4BF-415B-11D8-B3F1-0003936726FC is the Apple-defined type ID for
+		     all Spotlight metadata importers. Do not change this UUID. -->
+		<key>8B08C4BF-415B-11D8-B3F1-0003936726FC</key>
+		<array>
+			<string>20B7BB87-8919-4FF0-85D6-7BADFC17486B</string>
+		</array>
+	</dict>
+	<key>CFPlugInUnloadFunction</key>
+	<string></string>
+
+	<!-- UTIs this importer handles. net.daringfireball.markdown is the de-facto
+	     standard; public.markdown ships with recent macOS releases. -->
+	<key>LSItemContentTypes</key>
+	<array>
+		<string>net.daringfireball.markdown</string>
+		<string>public.markdown</string>
+	</array>
+
+	<!-- Spotlight importer schema declaration -->
+	<key>MDImporterDataType</key>
+	<string>MDItem</string>
+	<key>MDImporterRequiredAttributes</key>
+	<array>
+		<string>kMDItemTextContent</string>
+	</array>
+	<key>MDImporterOptionalAttributes</key>
+	<array>
+		<string>kMDItemTitle</string>
+		<string>kMDItemKeywords</string>
+		<string>kMDItemAuthors</string>
+		<string>kMDItemDescription</string>
+		<string>kMDItemHeadline</string>
+		<string>kMDItemSubject</string>
+	</array>
+</dict>
+</plist>

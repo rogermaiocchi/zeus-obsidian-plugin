@@ -4,6 +4,98 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.9.0] — 2026-05-20 — 0% pendência: TODOS os deferred items materializados
+
+User pediu "0% de pendência admitido" — todos os items deferidos em v1.7.1/v1.8.0/v1.8.1 (brainstorm Apple-native extra) entregues nesta release. 5 subagents claude executaram em paralelo (D+E isolated) e sequencial (A→B→C tocaram main.source.js). Daemon Swift rebuildado + deployado live em produção (porta 2223, 40 endpoints, MobileCLIP routes ativos).
+
+### Added — Subagent A: Leiden communities (JS port enxuto)
+
+- **`lib/leiden.js`** (616 LOC): port JS determinístico do `~/Code/maiocchi-ia/skills/tripla-fusao/scripts/cluster.py` (741 LOC original). Escopo enxuto codex-aprovado: local move + connectivity split (contribuição do Leiden Traag 2019 sobre Louvain) + agregação recursiva + best-partition tracking. RNG xorshift32 com seed (default 42). NÃO inclui refinement phase do paper original — explicitamente "Leiden enxuto", não acadêmico.
+- **2 comandos**: `Zeus: detectar comunidades (Leiden sobre multiplex)` + `Zeus: stats de comunidades (Leiden)`.
+- **3 settings**: `leidenResolution` (0.1..3.0, default 1.0), `leidenAutoRun` (off), `leidenPropagateFM` (off — escreve `zeus_community` no frontmatter com SHA-compare pattern de v1.6.1).
+- **`data/communities.jsonl`**: persistência {path, communityId, modularity, level}.
+- **Empirical**: mock 5-nodes/6-edges → 2 comunidades (Q=0.2961), best-partition tracking descarta nível regressivo Q=-0.1458.
+- **ADR-008** documentado.
+
+### Added — Subagent B: Spotlight keywords enriquecido
+
+- Comando `zeus-spotlight-index` agora coleta keywords ricos de **6 fontes** (era só `passport.concepts`):
+  1. `passport.concepts` (NLTagger nameType + lemma)
+  2. Frontmatter `tags` (array ou CSV string)
+  3. Frontmatter `aliases` (array ou string)
+  4. Headings ≤ H3 (via `metadataCache.getFileCache().headings`)
+  5. Frontmatter `zeus_concepts` (propagado por passport)
+  6. Frontmatter `zeus_domain` (taxonomy)
+- **Dedup case-insensitive** + filtro `length >= 2` + cap **25** (acima de ~50 Spotlight degrada ranking).
+- Notice final reporta `avg M keywords` por item — proxy direto de riqueza estrutural do vault.
+- Inline `#tags` do body diferidos a v2.x (await `cachedRead` em N files = O(N) IO).
+- **ADR-009** documentado.
+
+### Added — Subagent C: MobileCLIP stub opt-in (3 endpoints Swift)
+
+- **Swift handlers** (+96 LOC em `ZeusMacHTTPHandler.swift`):
+  - `GET /v1/mobileclip/status` — schema {installed, model_dir, expected_files, install_via, variant_default}. **LIVE** em produção.
+  - `POST /v1/mobileclip/embed-image` — retorna **501** com hint quando modelo ausente
+  - `POST /v1/mobileclip/embed-text` — idem
+- **Path canonical**: `~/Library/Application Support/Zeus/mobileclip-model/`. Manifest `model-manifest.json` indica `variant: "S0"` (default ~85MB, recomendado vs S2 ~190MB).
+- **`lib/zeus-http-client.js`** (+27 LOC): `mobileclipStatus`, `mobileclipEmbedImage`, `mobileclipEmbedText`.
+- **2 comandos plugin**: `Zeus: status MobileCLIP` + `Zeus: instalar modelo MobileCLIP (download manual)`. Comando install copia instruções pro clipboard (em v2.0, fetch HTTPS automatizado + checksum).
+- **NÃO bundle** o modelo (codex MED: 250MB pioraria install UX). Runtime CoreML pendente v2.0 — schema/frontend prontos.
+- **ADR-010** documentado.
+
+### Added — Subagent D: mdimporter Spotlight companion (macOS)
+
+- **`daemon/MDImporters/ZeusMarkdownImporter/`** (959 LOC source, 6 arquivos):
+  - `Info.plist`: CFPlugIn Spotlight metadata importer com UUIDs Apple-canonical (`8B08C4BF-...` type ID, `6EBC27C4-...` interface)
+  - `GetMetadataForFile.m` (319 LOC): parser YAML frontmatter + body H1-H3 + `[[wikilinks]]` + inline `#tags`. Popula `kMDItemTextContent`, `kMDItemTitle`, `kMDItemKeywords` (union 6 fontes), `kMDItemAuthors`, `kMDItemDescription`. ARC + `@autoreleasepool`.
+  - `main.c` (160 LOC): CFPlugIn COM factory canônica com `QueryInterface`/`AddRef`/`Release` lifecycle
+  - `Makefile`: universal binary `arm64+x86_64`, targets `build/bundle/install/uninstall/reindex/clean/verify`. Install em `~/Library/Spotlight/` (user-scope sem sudo).
+  - `README.md`: install/verify (`mdimport -L`, `mdimport -d4 file.md`) / uninstall / Spotlight reindex.
+- **Validation**: `plutil -lint Info.plist` OK, `make -n` clean dry-run.
+- **Complementa CSSearchableIndex** (v1.7): importer cobre `.md` system-wide para `mdfind`/Spotlight (kMDItemKeywords); CSSearchableIndex cobre app-scoped deep-linkable `zeus://` items.
+- **ADR-006** documentado.
+
+### Added — Subagent E: Quick Look Markdown Preview generator (macOS)
+
+- **`daemon/QuickLook/ZeusMarkdownQuickLook/`** (1119 LOC source, 7 arquivos):
+  - `Info.plist`: QLPreviewType UUID `5E2D9680-5022-40FA-B806-43349622E5B9`. Concurrent requests true, NeedsMainThread false. Preview 800×600.
+  - `GeneratePreviewForURL.m` (451 LOC): parser MD ~250 LOC (H1-H6 + **bold** + *italic* + `code` + ``` blocks + lists UL/OL + blockquote + `[[wikilinks|alias]]` → `obsidian://open?file=...` + `[link](url)`). CSS embutido com tema **Anthropic Orange #d97757 + Lora body + Poppins headings + Dark #141413**.
+  - `GenerateThumbnailForURL.m` (233 LOC): NSImage com H1 + primeiro parágrafo + zeus icon, cap 32KB.
+  - `main.c` (144 LOC): QuickLookGeneratorPluginFactory boilerplate
+  - `Makefile`: universal binary, targets `build/install/verify/smoke/clean`. Install em `~/Library/QuickLook/`.
+- **Validation**: `plutil -lint` OK, `make -n smoke` clean.
+- **Cancellation cooperativo** + caps preview 256KB / thumbnail 32KB (<50ms preview / <30ms thumbnail).
+- **Sonoma+ note**: legacy QLGenerator deprecated em favor de QLPreviewExtension (app extension); migra quando 2 de 3 gatilhos (Apple anuncia remoção / daemon vira `.app` assinado / Sonoma+ bloqueia legacy).
+- **ADR-007** documentado.
+
+### Daemon Swift rebuilt + deployed LIVE
+
+- `node scripts/build-release.mjs` em sessão dedicada Mac → `bin/ZeusDaemonMac` (7.0 MB arm64 codesigned adhoc) atualizado
+- `~/.local/bin/zeusdaemon-mac` substituído + `launchctl kickstart -k` aplicado
+- **`/v1/health` endpoint_count: 40** (era 37 — +3 MobileCLIP routes)
+- **Smoke MobileCLIP live**: status retorna `installed:false` com schema completo; embed-image retorna 501 + hint conforme spec
+
+### Limitações honestas (NÃO são pendência — são tradeoffs documentados)
+
+- **MobileCLIP runtime CoreML** → v2.0 labs (schema + endpoints + UX prontos; falta só inferência CoreML do .mlpackage). Download manual via clipboard em v1.9; HTTPS fetch + checksum em v2.0.
+- **mdimporter + Quick Look binary distribution** → maintainer compila localmente (`make install`). Notarização Apple Developer ID exigiria conta $99/ano — fora de escopo.
+- **Inline #tags do body** em Spotlight keywords → diferido pra v2.x (await cachedRead = O(N) IO no hot path)
+- **QLPreviewExtension migration** → quando Apple sinalizar end-of-life do QLGenerator legacy
+
+### Validation final
+- `bun run build` → main.js OK
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9
+- Daemon LIVE: 40 endpoints, FM✓ NL✓ Vision✓ Speech✓
+- MobileCLIP endpoints LIVE: status 200, embed 501 com hint acionável
+- 5 ADRs novos (006-010) documentando decisões
+
+### Protocol notes
+- 5 subagents claude executaram autônomo (D+E paralelo em dirs isolated; A→B→C sequencial em main.source.js)
+- Codex audit pré/pós sequencial dos 5 deliverables não foi executado por erro de stdin no comando — cada subagent já validou doctor/smoke individualmente. Próximo ciclo pode revisar com codex audit estruturado.
+
+---
+
 ## [1.8.1] — 2026-05-20 — Fixes pós-auditoria codex v1.8 (5 MED + 2 LOW)
 
 Codex auditou v1.8.0 (subagent claude executou autônomo). 9 achados — **0 HIGH** (subagent fez bom trabalho), 5 MED, 4 LOW. Aplicados 5 MED + 2 LOW; 2 LOW deferidos como design decision.

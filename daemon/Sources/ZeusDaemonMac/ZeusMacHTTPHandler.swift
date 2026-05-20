@@ -45,6 +45,13 @@ import AVFoundation
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
+// v1.9 — MobileCLIP stub opt-in (ADR-010). CoreML carregado quando o modelo
+// estiver instalado em ~/Library/Application Support/Zeus/mobileclip-model/.
+// Codex aprovou: NÃO bundle (+250MB pioraria install UX). Em v1.9 endpoints
+// retornam 501 com `hint` acionável; runtime CoreML real chega em v2.0.
+#if canImport(CoreML)
+import CoreML
+#endif
 
 final class ZeusMacHTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
@@ -218,6 +225,13 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             return self.handleSpotlightQueryNative(bodyJSON: body)
         case (.POST, "/v1/spotlight/purge"):
             return self.handleSpotlightPurge(bodyJSON: body)
+        // v1.9 — MobileCLIP stub opt-in (ADR-010). 501 quando modelo ausente.
+        case (.POST, "/v1/mobileclip/embed-image"):
+            return self.handleMobileCLIPEmbedImage(bodyJSON: body)
+        case (.POST, "/v1/mobileclip/embed-text"):
+            return self.handleMobileCLIPEmbedText(bodyJSON: body)
+        case (.GET, "/v1/mobileclip/status"):
+            return self.handleMobileCLIPStatus()
         case (.POST, "/v1/data-detect"):
             return self.handleDataDetect(bodyJSON: body)
         // v1.3 — afm refine (Writing Tools nativo via FoundationModels)
@@ -257,6 +271,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
                     "POST /v1/data-detect", "POST /v1/spotlight/search",
                     "POST /v1/spotlight/index", "POST /v1/spotlight/query", "POST /v1/spotlight/purge",
+                    "POST /v1/mobileclip/embed-image", "POST /v1/mobileclip/embed-text",
+                    "GET /v1/mobileclip/status",
                     "POST /v1/afm/refine",
                     "POST /v1/asp/transcribe", "POST /v1/asp/vad",
                     "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract",
@@ -306,6 +322,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
             "POST /v1/data-detect", "POST /v1/spotlight/search",
                     "POST /v1/spotlight/index", "POST /v1/spotlight/query", "POST /v1/spotlight/purge",
+            "POST /v1/mobileclip/embed-image", "POST /v1/mobileclip/embed-text",
+            "GET /v1/mobileclip/status",
             "POST /v1/afm/refine",
             "POST /v1/asp/transcribe", "POST /v1/asp/vad",
             "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract",
@@ -3243,5 +3261,83 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         FileHandle.standardError.write("[ZeusMacHTTPHandler] error: \(error)\n".data(using: .utf8) ?? Data())
         context.close(promise: nil)
+    }
+
+    // MARK: - v1.9 — MobileCLIP opt-in stub (ADR-010)
+    //
+    // Codex aprovou stub-only para evitar bundle +250MB pioran do install UX.
+    // Modelo esperado em ~/Library/Application Support/Zeus/mobileclip-model/
+    // (variant default: MobileCLIP-S0, ~85MB; user pode usar S2 ~190MB editando
+    // model-manifest.json). Sem o modelo, embed endpoints retornam 501 com `hint`
+    // acionável apontando para o comando "Zeus: instalar modelo MobileCLIP".
+    // Runtime CoreML real (MLPackage carregamento + inferência) chega em v2.0.
+
+    private static let MOBILECLIP_MODEL_DIR_REL = "Zeus/mobileclip-model"
+
+    private static func mobileCLIPModelPath() -> URL? {
+        guard let support = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                     in: .userDomainMask).first else {
+            return nil
+        }
+        return support.appendingPathComponent(MOBILECLIP_MODEL_DIR_REL)
+    }
+
+    private static func mobileCLIPModelInstalled() -> Bool {
+        guard let dir = mobileCLIPModelPath() else { return false }
+        let manifest = dir.appendingPathComponent("model-manifest.json")
+        return FileManager.default.fileExists(atPath: manifest.path)
+    }
+
+    private func handleMobileCLIPStatus() -> Response {
+        let dir = Self.mobileCLIPModelPath()
+        let installed = Self.mobileCLIPModelInstalled()
+        return Response(status: .ok, payload: [
+            "installed": installed,
+            "model_dir": dir?.path ?? "(applicationSupportDirectory indisponível)",
+            "expected_files": [
+                "model-manifest.json",
+                "MobileCLIP-S0-vision.mlpackage",
+                "MobileCLIP-S0-text.mlpackage"
+            ],
+            "install_via": "Zeus: instalar modelo MobileCLIP (download)",
+            "variant_default": "S0",
+            "phase": "v1.9 stub opt-in (ADR-010) — runtime CoreML pendente para v2.0",
+            "note": "Opt-in. Sem o modelo, embed endpoints retornam 501."
+        ])
+    }
+
+    private func handleMobileCLIPEmbedImage(bodyJSON: String) -> Response {
+        guard Self.mobileCLIPModelInstalled() else {
+            return Response(status: .init(statusCode: 501, reasonPhrase: "Not Implemented"), payload: [
+                "error": "MobileCLIP modelo não instalado",
+                "hint": "Rode 'Zeus: instalar modelo MobileCLIP' no plugin. Modelo esperado em ~/Library/Application Support/Zeus/mobileclip-model/",
+                "status_endpoint": "GET /v1/mobileclip/status",
+                "phase": "v1.9 stub opt-in (ADR-010)"
+            ])
+        }
+        // TODO v2.0 labs: carregar MLPackage, processar imagem, gerar embedding 512-dim.
+        // Pipeline alvo: CGImage → VNImageRequestHandler ou MLFeatureProvider direto → MLModel.prediction → [Float].
+        return Response(status: .init(statusCode: 501, reasonPhrase: "Not Implemented"), payload: [
+            "error": "MobileCLIP runtime ainda não implementado",
+            "phase": "stub v1.9 — modelo detectado mas inferência pendente. Implementação CoreML em release v2.0",
+            "next": "v2.0 carregará MLPackage e gerará embedding 512-dim para image-similarity zero-shot"
+        ])
+    }
+
+    private func handleMobileCLIPEmbedText(bodyJSON: String) -> Response {
+        guard Self.mobileCLIPModelInstalled() else {
+            return Response(status: .init(statusCode: 501, reasonPhrase: "Not Implemented"), payload: [
+                "error": "MobileCLIP modelo não instalado",
+                "hint": "Rode 'Zeus: instalar modelo MobileCLIP' no plugin.",
+                "status_endpoint": "GET /v1/mobileclip/status",
+                "phase": "v1.9 stub opt-in (ADR-010)"
+            ])
+        }
+        // TODO v2.0 labs: tokenizar texto (BPE) → text encoder MLPackage → [Float] 512-dim.
+        return Response(status: .init(statusCode: 501, reasonPhrase: "Not Implemented"), payload: [
+            "error": "MobileCLIP runtime ainda não implementado",
+            "phase": "stub v1.9 — runtime CoreML pendente",
+            "next": "v2.0 entregará text→image zero-shot search via cosine similarity"
+        ])
     }
 }

@@ -1314,6 +1314,30 @@ var require_zeus_http_client = __commonJS({
         });
         return resp.json && resp.json.tools || [];
       }
+      // v1.9 — MobileCLIP stub opt-in (ADR-010)
+      //
+      // Sem modelo instalado em ~/Library/Application Support/Zeus/mobileclip-model/
+      // o daemon retorna 501 com `hint` acionável apontando para o comando do plugin
+      // "Zeus: instalar modelo MobileCLIP (download manual)". Runtime CoreML real
+      // chega em v2.0.
+      async mobileclipStatus() {
+        try {
+          const resp = await this._requestUrl({
+            url: `${this.baseUrl}/v1/mobileclip/status`,
+            method: "GET",
+            throw: false
+          });
+          return resp.json || { error: "unreachable" };
+        } catch (e) {
+          return { error: e.message };
+        }
+      }
+      async mobileclipEmbedImage(imagePath) {
+        return await this._post("/v1/mobileclip/embed-image", { image_path: imagePath }, 6e4);
+      }
+      async mobileclipEmbedText(text) {
+        return await this._post("/v1/mobileclip/embed-text", { text }, 3e4);
+      }
     };
     module2.exports = ZeusHttpClient2;
   }
@@ -3443,6 +3467,451 @@ var require_multiplex_graph = __commonJS({
   }
 });
 
+// lib/leiden.js
+var require_leiden = __commonJS({
+  "lib/leiden.js"(exports2, module2) {
+    "use strict";
+    var universal2 = require_universal_fs();
+    var DATA_DIR_NAME2 = "data";
+    var COMMUNITIES_FILE = "communities.jsonl";
+    var MAX_LEVELS = 10;
+    var MAX_LOCAL_PASSES = 20;
+    var MIN_GAIN = 1e-10;
+    function _makeRng(seed) {
+      let state = seed >>> 0 || 1;
+      return function rng() {
+        state ^= state << 13;
+        state >>>= 0;
+        state ^= state >>> 17;
+        state ^= state << 5;
+        state >>>= 0;
+        return (state >>> 0) / 4294967296;
+      };
+    }
+    function _shuffleInPlace(arr, rng) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        const tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+      }
+      return arr;
+    }
+    function _newGraph() {
+      return {
+        adjacency: [],
+        degrees: [],
+        selfLoop: [],
+        // self-loop weight per node (preserva intra-community em agregação)
+        totalWeight: 0,
+        idToNode: [],
+        nodeToId: /* @__PURE__ */ new Map()
+      };
+    }
+    function _ensureNode(g, label) {
+      let id = g.nodeToId.get(label);
+      if (id !== void 0) return id;
+      id = g.idToNode.length;
+      g.idToNode.push(label);
+      g.nodeToId.set(label, id);
+      g.adjacency.push(/* @__PURE__ */ new Map());
+      g.degrees.push(0);
+      g.selfLoop.push(0);
+      return id;
+    }
+    function _addUndirected(g, srcLabel, dstLabel, weight) {
+      if (weight <= 0) return;
+      const s = _ensureNode(g, srcLabel);
+      const d = _ensureNode(g, dstLabel);
+      if (s === d) {
+        g.adjacency[s].set(s, (g.adjacency[s].get(s) || 0) + weight);
+        g.degrees[s] += 2 * weight;
+        g.selfLoop[s] += weight;
+        g.totalWeight += 2 * weight;
+        return;
+      }
+      g.adjacency[s].set(d, (g.adjacency[s].get(d) || 0) + weight);
+      g.adjacency[d].set(s, (g.adjacency[d].get(s) || 0) + weight);
+      g.degrees[s] += weight;
+      g.degrees[d] += weight;
+      g.totalWeight += 2 * weight;
+    }
+    function _modularity(g, community, resolution) {
+      const m2 = g.totalWeight;
+      if (m2 <= 0) return 0;
+      const inW = /* @__PURE__ */ new Map();
+      const totW = /* @__PURE__ */ new Map();
+      for (let i = 0; i < g.idToNode.length; i++) {
+        const c = community[i];
+        totW.set(c, (totW.get(c) || 0) + g.degrees[i]);
+        const adj = g.adjacency[i];
+        for (const [j, w] of adj.entries()) {
+          if (community[j] !== c) continue;
+          inW.set(c, (inW.get(c) || 0) + w);
+        }
+      }
+      let Q = 0;
+      for (const c of totW.keys()) {
+        const sIn = inW.get(c) || 0;
+        const sTot = totW.get(c) || 0;
+        Q += sIn / m2 - resolution * (sTot / m2) * (sTot / m2);
+      }
+      return Q;
+    }
+    function _localMove(g, community, resolution, rng) {
+      const n = g.idToNode.length;
+      if (n === 0) return { passes: 0, moves: 0 };
+      const m2 = g.totalWeight;
+      if (m2 <= 0) return { passes: 0, moves: 0 };
+      const totW = /* @__PURE__ */ new Map();
+      for (let i = 0; i < n; i++) {
+        const c = community[i];
+        totW.set(c, (totW.get(c) || 0) + g.degrees[i]);
+      }
+      let totalMoves = 0;
+      let passes = 0;
+      for (let pass = 0; pass < MAX_LOCAL_PASSES; pass++) {
+        passes++;
+        let movesThisPass = 0;
+        const order = Array.from({ length: n }, (_, i) => i);
+        _shuffleInPlace(order, rng);
+        for (const i of order) {
+          const oldC = community[i];
+          const ki = g.degrees[i];
+          const linksToComm = /* @__PURE__ */ new Map();
+          const adj = g.adjacency[i];
+          for (const [j, w] of adj.entries()) {
+            if (j === i) continue;
+            const cj = community[j];
+            linksToComm.set(cj, (linksToComm.get(cj) || 0) + w);
+          }
+          const kIin_old = linksToComm.get(oldC) || 0;
+          const totOldMinusI = (totW.get(oldC) || 0) - ki;
+          let bestC = oldC;
+          let bestGain = 0;
+          for (const [c, kIin_new] of linksToComm.entries()) {
+            if (c === oldC) continue;
+            const totNew = totW.get(c) || 0;
+            const gain = (kIin_new - kIin_old) / (m2 / 2) - resolution * ki * (totNew - totOldMinusI) / (m2 / 2 * m2);
+            if (gain > bestGain + MIN_GAIN) {
+              bestGain = gain;
+              bestC = c;
+            }
+          }
+          if (bestC !== oldC) {
+            community[i] = bestC;
+            totW.set(oldC, totOldMinusI);
+            totW.set(bestC, (totW.get(bestC) || 0) + ki);
+            movesThisPass++;
+            totalMoves++;
+          }
+        }
+        if (movesThisPass === 0) break;
+      }
+      return { passes, moves: totalMoves };
+    }
+    function _connectivitySplit(g, community) {
+      const n = g.idToNode.length;
+      const members = /* @__PURE__ */ new Map();
+      for (let i = 0; i < n; i++) {
+        const c = community[i];
+        if (!members.has(c)) members.set(c, []);
+        members.get(c).push(i);
+      }
+      let nextId = 1;
+      for (const c of members.keys()) if (c >= nextId) nextId = c + 1;
+      let splits = 0;
+      for (const [c, nodes] of members.entries()) {
+        if (nodes.length <= 1) continue;
+        const nodeSet = new Set(nodes);
+        const visited = /* @__PURE__ */ new Set();
+        let firstComponent = true;
+        for (const start of nodes) {
+          if (visited.has(start)) continue;
+          const comp = [];
+          const queue = [start];
+          visited.add(start);
+          while (queue.length) {
+            const u = queue.shift();
+            comp.push(u);
+            for (const v of g.adjacency[u].keys()) {
+              if (!nodeSet.has(v) || visited.has(v)) continue;
+              visited.add(v);
+              queue.push(v);
+            }
+          }
+          if (!firstComponent) {
+            const newId = nextId++;
+            for (const v of comp) community[v] = newId;
+            splits++;
+          }
+          firstComponent = false;
+        }
+      }
+      return splits;
+    }
+    function _aggregate(g, community) {
+      const superGraph = _newGraph();
+      const edgeMap = /* @__PURE__ */ new Map();
+      for (let i = 0; i < g.idToNode.length; i++) {
+        const cI = community[i];
+        for (const [j, w] of g.adjacency[i].entries()) {
+          const cJ = community[j];
+          if (i === j) {
+            const key = `${cI}|${cI}|self`;
+            edgeMap.set(key, (edgeMap.get(key) || 0) + w);
+          } else if (i < j) {
+            if (cI === cJ) {
+              const key = `${cI}|${cI}|self`;
+              edgeMap.set(key, (edgeMap.get(key) || 0) + w);
+            } else {
+              const [a, b] = cI < cJ ? [cI, cJ] : [cJ, cI];
+              const key = `${a}|${b}|inter`;
+              edgeMap.set(key, (edgeMap.get(key) || 0) + w);
+            }
+          }
+        }
+      }
+      for (const [key, w] of edgeMap.entries()) {
+        const [a, b, kind] = key.split("|");
+        if (kind === "self") {
+          _addUndirected(superGraph, String(a), String(a), w);
+        } else {
+          _addUndirected(superGraph, String(a), String(b), w);
+        }
+      }
+      const seen = /* @__PURE__ */ new Set();
+      for (const c of community) seen.add(c);
+      for (const c of seen) _ensureNode(superGraph, String(c));
+      return superGraph;
+    }
+    var LeidenCommunities2 = class {
+      constructor(plugin) {
+        this.plugin = plugin;
+      }
+      get _adapter() {
+        return this.plugin.app.vault.adapter;
+      }
+      get dataPath() {
+        return universal2.joinPath(this.plugin.manifest.dir, DATA_DIR_NAME2);
+      }
+      get jsonlPath() {
+        return universal2.joinPath(this.dataPath, COMMUNITIES_FILE);
+      }
+      /**
+       * Constrói grafo singleplex weighted a partir de multiplex edges.
+       * Edges undirected: A↔B somado dos dois sentidos. Filtra por edgeTypes
+       * se passado.
+       */
+      _buildGraphFromMultiplex(edgeTypesFilter) {
+        const g = _newGraph();
+        const multiplex = this.plugin.multiplex;
+        if (!multiplex || !multiplex.edges) return g;
+        const filter = edgeTypesFilter && edgeTypesFilter.length ? new Set(edgeTypesFilter) : null;
+        const pairWeight = /* @__PURE__ */ new Map();
+        for (const edge of multiplex.edges.values()) {
+          if (filter && !filter.has(edge.type)) continue;
+          const src = edge.src, dst = edge.dst;
+          if (!src || !dst || src === dst) continue;
+          const [a, b] = src < dst ? [src, dst] : [dst, src];
+          const key = `${a}|${b}`;
+          pairWeight.set(key, (pairWeight.get(key) || 0) + (edge.weight || 0));
+        }
+        for (const [key, w] of pairWeight.entries()) {
+          const [a, b] = key.split("|");
+          _addUndirected(g, a, b, w / 2);
+        }
+        return g;
+      }
+      /**
+       * detectCommunities — algoritmo completo.
+       *
+       * options:
+       *   resolution: 1.0  (γ na modularidade; >1 favorece comunidades menores)
+       *   seed: 42         (RNG)
+       *   maxIterations: 10 (cap recursão)
+       *   edgeTypes: null  (null = todos os tipos multiplex)
+       *
+       * @returns {Promise<{communities: Map<path, communityId>, modularity: number, levels: object[], stats: object}>}
+       */
+      async detectCommunities(options = {}) {
+        const opts = {
+          resolution: options.resolution != null ? options.resolution : 1,
+          seed: options.seed != null ? options.seed : 42,
+          maxIterations: options.maxIterations != null ? options.maxIterations : MAX_LEVELS,
+          edgeTypes: options.edgeTypes || null
+        };
+        const rng = _makeRng(opts.seed);
+        let g = this._buildGraphFromMultiplex(opts.edgeTypes);
+        const n0 = g.idToNode.length;
+        const e0 = (() => {
+          let c = 0;
+          for (const a of g.adjacency) c += a.size;
+          return c / 2;
+        })();
+        if (n0 === 0) {
+          return {
+            communities: /* @__PURE__ */ new Map(),
+            modularity: 0,
+            levels: [],
+            stats: { nodes: 0, edges: 0, communityCount: 0, topSizes: [] }
+          };
+        }
+        let community = new Array(g.idToNode.length);
+        for (let i = 0; i < community.length; i++) community[i] = i;
+        let bestPartitionOriginal = community.slice();
+        let bestQ = _modularity(g, community, opts.resolution);
+        const originalLabels = g.idToNode.slice();
+        let level0Community = community.slice();
+        const levelsLog = [];
+        let currentG = g;
+        let currentCommunity = community;
+        for (let level = 0; level < opts.maxIterations; level++) {
+          const { passes, moves } = _localMove(currentG, currentCommunity, opts.resolution, rng);
+          const splits = _connectivitySplit(currentG, currentCommunity);
+          const Q = _modularity(currentG, currentCommunity, opts.resolution);
+          if (level === 0) {
+            level0Community = currentCommunity.slice();
+          } else {
+            const labelToSuperId = /* @__PURE__ */ new Map();
+            for (let s = 0; s < currentG.idToNode.length; s++) {
+              labelToSuperId.set(currentG.idToNode[s], s);
+            }
+            const newLevel0 = new Array(level0Community.length);
+            for (let i = 0; i < level0Community.length; i++) {
+              const prevC = level0Community[i];
+              const superId = labelToSuperId.get(String(prevC));
+              newLevel0[i] = superId !== void 0 ? currentCommunity[superId] : prevC;
+            }
+            level0Community = newLevel0;
+          }
+          const communitySet = new Set(currentCommunity);
+          levelsLog.push({
+            level,
+            Q,
+            passes,
+            moves,
+            splits,
+            nodes: currentG.idToNode.length,
+            communities: communitySet.size
+          });
+          if (Q > bestQ + MIN_GAIN) {
+            bestQ = Q;
+            bestPartitionOriginal = level0Community.slice();
+          }
+          if (communitySet.size === currentG.idToNode.length) break;
+          if (communitySet.size <= 1) break;
+          const nextG = _aggregate(currentG, currentCommunity);
+          const nextCommunity = new Array(nextG.idToNode.length);
+          for (let i = 0; i < nextCommunity.length; i++) nextCommunity[i] = i;
+          currentG = nextG;
+          currentCommunity = nextCommunity;
+        }
+        const remap = /* @__PURE__ */ new Map();
+        let nextId = 0;
+        for (const c of bestPartitionOriginal) {
+          if (!remap.has(c)) remap.set(c, nextId++);
+        }
+        const finalCommunities = /* @__PURE__ */ new Map();
+        for (let i = 0; i < bestPartitionOriginal.length; i++) {
+          finalCommunities.set(originalLabels[i], remap.get(bestPartitionOriginal[i]));
+        }
+        const sizeByComm = /* @__PURE__ */ new Map();
+        for (const c of finalCommunities.values()) {
+          sizeByComm.set(c, (sizeByComm.get(c) || 0) + 1);
+        }
+        const sizesSorted = Array.from(sizeByComm.values()).sort((a, b) => b - a);
+        return {
+          communities: finalCommunities,
+          modularity: bestQ,
+          levels: levelsLog,
+          stats: {
+            nodes: n0,
+            edges: e0,
+            communityCount: sizeByComm.size,
+            topSizes: sizesSorted.slice(0, 3)
+          }
+        };
+      }
+      /**
+       * Persiste resultado em data/communities.jsonl (1 linha por nó).
+       */
+      async persist(result) {
+        if (!result || !result.communities) throw new Error("persist: result.communities ausente");
+        await universal2.adapterMkdir(this._adapter, this.dataPath);
+        const lines = [];
+        const Q = result.modularity;
+        const lastLevel = result.levels.length ? result.levels[result.levels.length - 1].level : 0;
+        for (const [path2, communityId] of result.communities.entries()) {
+          lines.push(JSON.stringify({
+            path: path2,
+            communityId,
+            modularity: Number(Q.toFixed(6)),
+            level: lastLevel
+          }));
+        }
+        await universal2.adapterWriteAtomic(this._adapter, this.jsonlPath, lines.join("\n"));
+        return { wrote: lines.length, path: this.jsonlPath };
+      }
+      /**
+       * Carrega data/communities.jsonl → Map<path, {communityId, modularity, level}>
+       */
+      async load() {
+        if (!await universal2.adapterExists(this._adapter, this.jsonlPath)) {
+          return { loaded: 0, communities: /* @__PURE__ */ new Map(), modularity: null, path: this.jsonlPath, exists: false };
+        }
+        const raw = await universal2.adapterRead(this._adapter, this.jsonlPath);
+        const communities = /* @__PURE__ */ new Map();
+        let Q = null;
+        let n = 0;
+        for (const line of raw.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (!entry || !entry.path) continue;
+            communities.set(entry.path, {
+              communityId: entry.communityId,
+              modularity: entry.modularity,
+              level: entry.level
+            });
+            if (Q == null && typeof entry.modularity === "number") Q = entry.modularity;
+            n++;
+          } catch (_) {
+          }
+        }
+        return { loaded: n, communities, modularity: Q, path: this.jsonlPath, exists: true };
+      }
+      /**
+       * Stats prontas a partir de um load() (ou de um result em memória).
+       */
+      statsFromMap(communitiesMap) {
+        const sizeByComm = /* @__PURE__ */ new Map();
+        for (const v of communitiesMap.values()) {
+          const cid = v && typeof v === "object" ? v.communityId : v;
+          sizeByComm.set(cid, (sizeByComm.get(cid) || 0) + 1);
+        }
+        const sorted = Array.from(sizeByComm.entries()).sort((a, b) => b[1] - a[1]);
+        return {
+          total: communitiesMap.size,
+          communityCount: sizeByComm.size,
+          topSizes: sorted.slice(0, 3).map(([cid, size]) => ({ communityId: cid, size })),
+          sizeBreakdown: sorted.slice(0, 20).map(([cid, size]) => `c${cid}:${size}`).join(" \xB7 ")
+        };
+      }
+    };
+    module2.exports = LeidenCommunities2;
+    module2.exports._internal = {
+      _makeRng,
+      _modularity,
+      _newGraph,
+      _addUndirected,
+      _localMove,
+      _connectivitySplit,
+      _aggregate
+    };
+  }
+});
+
 // main.source.js
 function _zeusFindPluginDir() {
   let fs0, path0;
@@ -3557,6 +4026,7 @@ var DaemonLifecycle = require_daemon_lifecycle();
 var HybridSearch = require_hybrid_search();
 var NativeWatcher = require_native_watcher();
 var MultiplexGraph = require_multiplex_graph();
+var LeidenCommunities = require_leiden();
 var VIEW_TYPE_SMART = "zeus-smart-view";
 var VIEW_TYPE_STATUS = "zeus-status-view";
 var DATA_DIR_NAME = "data";
@@ -3672,8 +4142,16 @@ var DEFAULT_SETTINGS = {
   // recomendação — BM25 complementa semantic em casos lexicais (siglas, IDs,
   // nomes próprios) onde cosine sozinho falha.
   hybridBm25Enabled: true,
-  multiplexAutoBuild: false
+  multiplexAutoBuild: false,
   // se ON, build inicial roda no onload em background
+  // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
+  // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
+  leidenResolution: 1,
+  // γ na modularidade; >1 favorece comunidades menores
+  leidenAutoRun: false,
+  // se ON, dispara detectCommunities após buildFromVault multiplex
+  leidenPropagateFM: false
+  // se ON, escreve zeus_community: NN no frontmatter de cada nota
 };
 function sha256(text) {
   if (universal.nodeCrypto && typeof universal.nodeCrypto.createHash === "function") {
@@ -5685,6 +6163,34 @@ ${s.builtAt ? "built " + s.builtAt : "(nunca buildado)"}`, 9e3);
         new Notice("Zeus multiplex stats falhou: " + e.message, 5e3);
       }
     }));
+    containerEl.createEl("h3", { text: "Leiden communities (v1.9)" });
+    new Setting(containerEl).setName("Leiden resolution (\u03B3)").setDesc("Par\xE2metro de resolu\xE7\xE3o na modularidade. 1.0 = padr\xE3o Newman; >1 favorece comunidades menores (mais granular); <1 favorece comunidades maiores. Vide ADR-008.").addSlider((s) => s.setLimits(0.1, 3, 0.05).setValue(this.plugin.settings.leidenResolution).setDynamicTooltip().onChange(async (v) => {
+      this.plugin.settings.leidenResolution = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Auto-run Leiden ap\xF3s multiplex auto-build").setDesc('Quando ON e multiplexAutoBuild tamb\xE9m ON, dispara detectCommunities em sequ\xEAncia ap\xF3s o build (sem competir por CPU). Default OFF \u2014 rode manualmente via comando "Zeus: detectar comunidades".').addToggle((t) => t.setValue(this.plugin.settings.leidenAutoRun).onChange(async (v) => {
+      this.plugin.settings.leidenAutoRun = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Propagar comunidade ao frontmatter (zeus_community)").setDesc('Quando ON, comando "detectar comunidades" escreve zeus_community: NN no frontmatter de cada nota. SHA-compare evita loop modify\u2192write\u2192modify (pattern v1.6.1). Default OFF \u2014 modifica TODAS as notas.').addToggle((t) => t.setValue(this.plugin.settings.leidenPropagateFM).onChange(async (v) => {
+      this.plugin.settings.leidenPropagateFM = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Leiden stats").setDesc("Snapshot das comunidades persistidas em data/communities.jsonl.").addButton((b) => b.setButtonText("Stats").onClick(async () => {
+      try {
+        const r = await this.plugin.leiden.load();
+        if (!r.exists) {
+          new Notice("Zeus Leiden: nunca rodou (data/communities.jsonl ausente)", 5e3);
+          return;
+        }
+        const s = this.plugin.leiden.statsFromMap(r.communities);
+        const topStr = s.topSizes.map((t) => `c${t.communityId}:${t.size}`).join(", ");
+        new Notice(`Zeus Leiden: ${s.total} notas em ${s.communityCount} comunidades \xB7 Q=${r.modularity != null ? r.modularity.toFixed(3) : "?"}
+top-3 [${topStr}]`, 9e3);
+      } catch (e) {
+        new Notice("Zeus Leiden stats falhou: " + e.message, 5e3);
+      }
+    }));
     containerEl.createEl("h3", { text: "A\xE7\xF5es" });
     new Setting(containerEl).setName("Reindex completo").setDesc("Re-l\xEA o vault e recalcula embeddings. Mac only \u2014 outros devices apenas l\xEAem.").addButton((b) => b.setButtonText("Reindex").onClick(async () => {
       if (!isMac()) {
@@ -5743,6 +6249,8 @@ var ZeusPlugin = class extends Plugin {
       this.nativeWatcher = new NativeWatcher(this);
       this.multiplex = new MultiplexGraph(this);
       this._multiplexLoaded = false;
+      this.leiden = new LeidenCommunities(this);
+      this._leidenLastWritten = /* @__PURE__ */ new Map();
       const pluginDataPath = path && this.vaultRoot ? path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME) : universal.joinPath(this.manifest.dir, DATA_DIR_NAME);
       this.hierarchical = new HierarchicalProcessor(null, this.settings.hierarchicalThreshold);
       this.multiVector = new MultiVectorEmbedder(null, pluginDataPath);
@@ -5817,6 +6325,18 @@ var ZeusPlugin = class extends Plugin {
             this._multiplexLoaded = true;
             const s = this.multiplex.stats();
             console.log("[zeus.multiplex] auto-build done:", s.total, "edges");
+            if (this.settings.leidenAutoRun) {
+              try {
+                console.log("[zeus.leiden] auto-detect starting\u2026");
+                const r = await this.leiden.detectCommunities({
+                  resolution: this.settings.leidenResolution || 1
+                });
+                await this.leiden.persist(r);
+                console.log("[zeus.leiden] auto-detect done:", r.stats.communityCount, "comunidades, Q=", r.modularity.toFixed(3));
+              } catch (e2) {
+                console.warn("[zeus.leiden] auto-detect failed:", e2.message);
+              }
+            }
           } catch (e) {
             console.warn("[zeus.multiplex] auto-build failed:", e.message);
           }
@@ -6778,6 +7298,80 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
           new ZeusMultiplexNeighborsModal(this.app, this, items, `Vizinhos multiplex de ${file.basename}`).open();
         }
       });
+      this.addCommand({
+        id: "zeus-leiden-detect",
+        name: "Zeus: detectar comunidades (Leiden sobre multiplex)",
+        callback: async () => {
+          await _ensureMultiplexLoaded();
+          if (!this.multiplex.edges || this.multiplex.edges.size === 0) {
+            new Notice('Zeus Leiden: multiplex vazio \u2014 rode "Zeus: construir grafo multiplex" primeiro', 7e3);
+            return;
+          }
+          const n = new Notice("Zeus Leiden: detectando comunidades sobre o multiplex\u2026", 0);
+          try {
+            const r = await this.leiden.detectCommunities({
+              resolution: this.settings.leidenResolution || 1
+            });
+            const persisted = await this.leiden.persist(r);
+            let wroteFM = 0, skippedFM = 0;
+            if (this.settings.leidenPropagateFM) {
+              n.setMessage("Zeus Leiden: escrevendo zeus_community no frontmatter\u2026");
+              for (const [path2, cid] of r.communities.entries()) {
+                const prev = this._leidenLastWritten.get(path2);
+                if (prev === cid) {
+                  skippedFM++;
+                  continue;
+                }
+                const file = this.app.vault.getAbstractFileByPath(path2);
+                if (!file) continue;
+                try {
+                  await this.app.fileManager.processFrontMatter(file, (fm) => {
+                    if (fm.zeus_community === cid) return;
+                    fm.zeus_community = cid;
+                  });
+                  this._leidenLastWritten.set(path2, cid);
+                  wroteFM++;
+                } catch (_) {
+                }
+              }
+            }
+            n.hide();
+            const topStr = r.stats.topSizes.join(", ");
+            const fmInfo = this.settings.leidenPropagateFM ? ` \xB7 FM ${wroteFM} writes (${skippedFM} skip)` : "";
+            new Notice(
+              `Zeus Leiden: ${r.stats.communityCount} comunidades \xB7 Q=${r.modularity.toFixed(3)} \xB7 top-3 sizes [${topStr}]${fmInfo}
+persistido em ${persisted.path}`,
+              1e4
+            );
+          } catch (e) {
+            n.hide();
+            new Notice("Zeus Leiden falhou: " + (e.message || String(e)).slice(0, 200), 8e3);
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-leiden-stats",
+        name: "Zeus: stats de comunidades (Leiden)",
+        callback: async () => {
+          try {
+            const r = await this.leiden.load();
+            if (!r.exists) {
+              new Notice('Zeus Leiden: data/communities.jsonl n\xE3o existe \u2014 rode "detectar comunidades" primeiro', 7e3);
+              return;
+            }
+            const s = this.leiden.statsFromMap(r.communities);
+            const topStr = s.topSizes.map((t) => `c${t.communityId}:${t.size}`).join(", ");
+            new Notice(
+              `Zeus Leiden: ${s.total} notas em ${s.communityCount} comunidades \xB7 Q=${r.modularity != null ? r.modularity.toFixed(3) : "?"}
+top-3 [${topStr}]
+breakdown: ${s.sizeBreakdown || "(vazio)"}`,
+              12e3
+            );
+          } catch (e) {
+            new Notice("Zeus Leiden stats falhou: " + (e.message || String(e)).slice(0, 200), 6e3);
+          }
+        }
+      });
       this._deriveSpotlightDomain = async () => {
         if (!this.vaultRoot) return "com.maiocchi.zeus.default";
         try {
@@ -6804,14 +7398,41 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
             const files = this.app.vault.getMarkdownFiles();
             const passportMap = this.passport && typeof this.passport.loadAll === "function" ? await this.passport.loadAll().catch(() => /* @__PURE__ */ new Map()) : /* @__PURE__ */ new Map();
             const items = [];
+            let totalKeywords = 0;
             for (const f of files) {
               const passport = passportMap.get(f.path) || null;
               const mtime = f.stat ? f.stat.mtime : Date.now();
+              const cache = this.app.metadataCache.getFileCache(f) || {};
+              const fm = cache.frontmatter || {};
+              const headings = (cache.headings || []).filter((h) => h.level <= 3).slice(0, 8).map((h) => h.heading);
+              const collected = /* @__PURE__ */ new Set();
+              for (const c of (passport == null ? void 0 : passport.concepts) || []) collected.add(String(c));
+              const fmTags = Array.isArray(fm.tags) ? fm.tags : typeof fm.tags === "string" ? fm.tags.split(",").map((s) => s.trim()) : [];
+              for (const t of fmTags) collected.add(t);
+              const aliases = Array.isArray(fm.aliases) ? fm.aliases : typeof fm.aliases === "string" ? [fm.aliases] : [];
+              for (const a of aliases) collected.add(a);
+              for (const h of headings) collected.add(h);
+              if (Array.isArray(fm.zeus_concepts)) for (const c of fm.zeus_concepts) collected.add(c);
+              const fmDomain = Array.isArray(fm.zeus_domain) ? fm.zeus_domain : fm.zeus_domain ? [fm.zeus_domain] : [];
+              for (const d of fmDomain) collected.add(d);
+              const seen = /* @__PURE__ */ new Set();
+              const keywords = [];
+              for (const k of collected) {
+                if (!k) continue;
+                const s = String(k).trim();
+                if (s.length < 2) continue;
+                const lower = s.toLowerCase();
+                if (seen.has(lower)) continue;
+                seen.add(lower);
+                keywords.push(s);
+                if (keywords.length >= 25) break;
+              }
+              totalKeywords += keywords.length;
               items.push({
                 path: this.vaultRoot ? `${this.vaultRoot.replace(/\/$/, "")}/${f.path}` : f.path,
                 title: f.basename,
                 summary: passport && (passport.one_line_summary || passport.summary) || "",
-                keywords: passport && Array.isArray(passport.concepts) ? passport.concepts.slice(0, 12) : [],
+                keywords,
                 mtime,
                 modality: "md"
               });
@@ -6832,7 +7453,8 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
             }
             n.hide();
             if (r.indexed != null) {
-              new Notice(`Zeus Spotlight: ${r.indexed} items indexados \xB7 domain ${r.domain.slice(-16)}`, 7e3);
+              const avgKw = items.length > 0 ? (totalKeywords / items.length).toFixed(1) : "0.0";
+              new Notice(`Zeus Spotlight: ${r.indexed} items \xB7 avg ${avgKw} keywords \xB7 domain ${r.domain.slice(-16)}`, 7e3);
               try {
                 const adapter = this.app.vault.adapter;
                 const stateRel = universal.joinPath(this.manifest.dir, "data", "spotlight-state.json");
@@ -6882,6 +7504,59 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
             }
           } catch (e) {
             new Notice("Zeus Spotlight purge falhou: " + (e.message || String(e)).slice(0, 200), 7e3);
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-mobileclip-status",
+        name: "Zeus: status MobileCLIP (modelo instalado?)",
+        callback: async () => {
+          try {
+            if (!isMac()) {
+              new Notice("MobileCLIP: apenas macOS");
+              return;
+            }
+            const s = await this.httpClient.mobileclipStatus();
+            if (s.error) {
+              new Notice("MobileCLIP status erro: " + String(s.error).slice(0, 100), 7e3);
+              return;
+            }
+            const summary = s.installed ? `MobileCLIP INSTALADO em ${s.model_dir}` : `MobileCLIP N\xC3O instalado \xB7 esperado em ${s.model_dir} \xB7 use comando "instalar modelo"`;
+            new Notice(`Zeus ${summary}`, 9e3);
+          } catch (e) {
+            new Notice("MobileCLIP status falhou: " + (e.message || String(e)).slice(0, 100), 7e3);
+          }
+        }
+      });
+      this.addCommand({
+        id: "zeus-mobileclip-install",
+        name: "Zeus: instalar modelo MobileCLIP (download manual)",
+        callback: async () => {
+          try {
+            if (!isMac()) {
+              new Notice("MobileCLIP: apenas macOS");
+              return;
+            }
+            const msg = [
+              "MobileCLIP v1.9 \xE9 STUB opt-in (ADR-010). Download manual:",
+              "",
+              "1. mkdir -p ~/Library/Application\\ Support/Zeus/mobileclip-model",
+              "2. Baixe MobileCLIP-S0 (recommended): https://huggingface.co/apple/MobileCLIP-S0",
+              "   Arquivos: MobileCLIP-S0-vision.mlpackage, MobileCLIP-S0-text.mlpackage",
+              "3. cp pra ~/Library/Application\\ Support/Zeus/mobileclip-model/",
+              '4. Crie model-manifest.json: { "version": "1.0", "variant": "S0" }',
+              '5. Cmd+P -> "Zeus: status MobileCLIP" pra verificar',
+              "",
+              "Em v2.0, este comando far\xE1 o download automatico via fetch HTTPS + checksum."
+            ].join("\n");
+            console.log("[zeus.mobileclip]", msg);
+            try {
+              await navigator.clipboard.writeText(msg);
+            } catch (e) {
+            }
+            new Notice("MobileCLIP install instructions copiadas pro clipboard. Cole em terminal/notas.", 12e3);
+          } catch (e) {
+            new Notice("MobileCLIP install falhou: " + (e.message || String(e)).slice(0, 100), 7e3);
           }
         }
       });

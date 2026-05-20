@@ -4,6 +4,77 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.10.4] — 2026-05-20 — Cápsula Mac + iOS validada (audit cross-platform)
+
+User pediu "cápsula perfeita Mac + iOS". Audit completo do stack v1.5 → v1.10.3 contra ambiente Capacitor iOS realizado.
+
+### Cápsula final (artefatos)
+
+| Arquivo | Bytes | Plataforma | Função |
+|---|---:|---|---|
+| `main.js` | 340 KB | Mac + iOS | Bundle esbuild (Node builtins external — `fs`/`path`/`child_process`/`os`/`crypto`/`http`/`https`/`net`/`tls`/`stream`/`util`/`events`/`url`/`zlib`) |
+| `bin/ZeusDaemonMac` | 7.0 MB | **Mac only** | arm64 codesigned adhoc (FoundationModels + Vision + Speech + NL + Translation + CoreSpotlight) |
+| `styles.css` | 28 KB | Mac + iOS | Anthropic theme (Orange #d97757 + Lora + Poppins) |
+| `manifest.json` | 4 KB | Mac + iOS | metadata |
+| **Total Mac** | **7.4 MB** | | drop-in completo |
+| **Total iOS** | **372 KB** | | sem daemon (Obsidian iOS ignora `bin/`) |
+
+### Matriz de compatibilidade audit
+
+| Camada | macOS | iOS Capacitor | Fallback iOS |
+|---|---|---|---|
+| `embeddings.jsonl` | ✅ | ⚠️ R/O | Lê do iCloud sync; novas notas embedam quando Mac roda |
+| `passports.jsonl` | ✅ | ⚠️ R/O | `passport.buildOne` falha gracioso → `{skipped: 'buildOne-failed'}` sem travar AutoIndexer |
+| `multiplex.jsonl` | ✅ | ✅ | JS puro — roda full em iOS |
+| `communities.jsonl` (Leiden) | ✅ | ✅ | JS puro |
+| `zeus-cards.base` | ✅ | ✅ | JS puro + vault.adapter |
+| `spotlight-state.json` | ✅ | ❌ | Skip silencioso (sem daemon iOS) |
+| AutoIndexer (vault.on hooks) | ✅ | ✅ | Obsidian wrappers universais |
+| `daemon-lifecycle` (spawn) | ✅ | ❌ | `child_process` gated → `{running: false, source: 'no-spawn'}` |
+| `native-watcher` (fs.watch) | ✅ | ❌ | `fs.watch` gated → `{running: false}` |
+| HybridSearch RRF/MMR/BM25 | ✅ | ✅ | JS puro |
+| MobileCLIP stub | ✅ | ❌ | Endpoint inacessível sem daemon — comando degrada gracioso |
+
+### Guards verificados zero unguarded require Node builtins
+
+- `lib/auto-indexer.js`: só `require('./universal-fs')` (sempre safe)
+- `lib/leiden.js`: idem
+- `lib/multiplex-graph.js`: idem
+- `lib/bm25.js`: `process.argv` está dentro de `if (require.main === module)` (CLI demo gated)
+- `lib/universal-fs.js`: TODO Node builtin em `try { require } catch { /* iOS sandbox */ }`
+
+### Validation
+
+- `node --check` em todos `lib/*.js` + `main.source.js` → OK
+- `bun run build` → main.js 337.5 KB bundle (Node builtins external preservados)
+- `doctor 7/7` + `smoke 9/9`
+- Daemon LIVE 40 endpoints
+- AutoIndexer ativo no vault Memoria comprovado (passport persist + spotlight-state + .base regen + multiplex 103 edges)
+
+### Sem mudanças código além de:
+- `manifest.json` description atualizada com features v1.6 → v1.10
+- Bump version 1.10.3 → 1.10.4
+
+---
+
+## [1.10.3] — 2026-05-20 — AutoIndexer fix: vault-relative → absolute path
+
+`vault.on('create').file.path` é vault-relative (`00 Templates/Foo.md`); daemon `/v1/passport/extract` exige absolute. AutoIndexer agora prepende `this.plugin.vaultRoot` antes de `passport.buildOne(absPath)`. Validado live: nova nota → passports.jsonl pulou de 1→8 entries, novo entry com 5 concepts atômicos + summary FM em 519 bytes.
+
+---
+
+## [1.10.2] — 2026-05-20 — AutoIndexer._runPassport usa passport.buildOne (persiste)
+
+Bug v1.10.0/.1: chamava `httpClient.passportBatchExtract` direto e descartava retorno. Daemon respondia mas nada era gravado em `data/passports.jsonl`. Cobertura ficava em 14% (1/7 no vault Memoria). Fix: troca pra `PassportIndex.buildOne(path)` que internamente faz extract + `loadAll() + map.set + saveAll()` + `_updateManifestEntry`.
+
+---
+
+## [1.10.1] — 2026-05-20 — AutoIndexer persiste spotlight-state.json
+
+AutoIndexer chamava daemon `/v1/spotlight/index` mas não escrevia `data/spotlight-state.json`. Comando manual fazia. Adicionado mesmo persist payload `{last_indexed_at, count, domain, mode, source: 'auto-indexer-v1.10'}` para observability.
+
+---
+
 ## [1.10.0] — 2026-05-20 — AutoIndexer: indexação 100% automática via engenharia nativa Apple
 
 Diretivo do user: "Toda a indexação deve ocorrer automaticamente pela engenharia da Apple nos dispositivos iOS e OS". Materializado.

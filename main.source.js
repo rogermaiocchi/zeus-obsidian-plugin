@@ -1326,34 +1326,41 @@ class ZeusNativeGraphIntegration {
 
   // Top-N neighbors da nota (cosine NL), injeta como wikilinks no frontmatter.
   // v1.6 — compara SHA antes de escrever, evita timestamp churn.
+  // v1.6.1 — codex MED #1: quando filtered fica vazio, REMOVE zeus_related em vez
+  // de fazer no-op (que deixava arestas stale no Graph nativo).
   async syncFile(filePath, topN = 5, minScore = 0.3) {
     if (!this.plugin.settings.nativeGraphIntegration) return;
     if (this._inFlight.has(filePath)) return;
     const neighbors = this.plugin.searcher.neighbors(filePath, topN);
     const filtered = neighbors.filter(n => n.score >= minScore);
-    if (filtered.length === 0) return;
 
     const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
     if (!file) return;
 
     const wikilinks = this._renderLinks(filtered);
     const sha = this._arraySha(wikilinks);
-    if (this._lastWritten.get(`${filePath}|${this.FRONTMATTER_KEY}`) === sha) return;
+    const cacheKey = `${filePath}|${this.FRONTMATTER_KEY}`;
+    if (this._lastWritten.get(cacheKey) === sha) return;
 
     this._inFlight.add(filePath);
     try {
       await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
         const current = Array.isArray(fm[this.FRONTMATTER_KEY]) ? fm[this.FRONTMATTER_KEY] : null;
         const currentSha = current ? this._arraySha(current) : null;
-        if (currentSha === sha) return; // already up-to-date on disk
-        fm[this.FRONTMATTER_KEY] = wikilinks;
-        fm.zeus_neighbor_count = filtered.length;
-        // v1.6 — NÃO mexer em zeus_indexed_at em cada sync. Só atualiza quando o
-        // conjunto realmente mudou (já garantido pelo SHA check acima). Reduz
-        // ruído de mtime e quebra o loop iCloud↔Obsidian.
-        fm.zeus_indexed_at = new Date().toISOString();
+        if (currentSha === sha) return; // já em sync no disco
+        if (wikilinks.length === 0) {
+          delete fm[this.FRONTMATTER_KEY];
+          delete fm.zeus_neighbor_count;
+          delete fm.zeus_indexed_at;
+        } else {
+          fm[this.FRONTMATTER_KEY] = wikilinks;
+          fm.zeus_neighbor_count = filtered.length;
+          // zeus_indexed_at só muda quando o conjunto realmente mudou (já garantido
+          // pelo SHA check). Quebra o loop iCloud↔Obsidian.
+          fm.zeus_indexed_at = new Date().toISOString();
+        }
       });
-      this._lastWritten.set(`${filePath}|${this.FRONTMATTER_KEY}`, sha);
+      this._lastWritten.set(cacheKey, sha);
     } finally {
       this._inFlight.delete(filePath);
     }
@@ -1367,56 +1374,69 @@ class ZeusNativeGraphIntegration {
   // Manual/on-command apenas — graph-extract é caro (~3-8s/nota), não roda em
   // real-time pra não competir com pipeline de embed.
   async syncFromGraphExtract(filePath) {
+    // codex HIGH #1: lock antes do `await graphExtractor.extract()` para que
+    // duas invocações concorrentes não disparem extract+write em paralelo.
+    // Toda a operação envelopada em try/finally.
     if (this._inFlight.has(filePath)) return { skipped: 'in-flight' };
     if (!this.plugin.graphExtractor) return { error: 'graphExtractor indisponível' };
     const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
     if (!file) return { error: 'arquivo não encontrado no vault' };
 
-    let graph;
-    try {
-      graph = await this.plugin.graphExtractor.extract(filePath);
-    } catch (e) {
-      return { error: 'graph-extract: ' + (e.message || String(e)).slice(0, 200) };
-    }
-    const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
-    if (nodes.length === 0) return { skipped: 'sem nodes extraídos' };
-
-    // Resolve cada entity para um arquivo do vault via metadataCache (respeita
-    // aliases, pastas). Codex MED #2: API canônica em vez de Nome.md.
-    const mdc = this.plugin.app.metadataCache;
-    const matches = [];
-    const seen = new Set();
-    for (const node of nodes) {
-      const label = String((node && (node.id || node.label || node.name)) || '').trim();
-      if (!label || label.length < 2) continue;
-      const dest = mdc.getFirstLinkpathDest ? mdc.getFirstLinkpathDest(label, filePath) : null;
-      if (dest && dest.path && dest.path !== filePath && !seen.has(dest.path)) {
-        seen.add(dest.path);
-        matches.push({ path: dest.path, score: undefined, label });
-      }
-    }
-    if (matches.length === 0) return { skipped: `nenhum dos ${nodes.length} nodes corresponde a notas do vault` };
-
-    const wikilinks = this._renderLinks(matches);
-    const sha = this._arraySha(wikilinks);
-    if (this._lastWritten.get(`${filePath}|${this.FRONTMATTER_GRAPH_KEY}`) === sha) {
-      return { skipped: 'já sincronizado', count: matches.length };
-    }
-
     this._inFlight.add(filePath);
     try {
+      let graph;
+      try {
+        graph = await this.plugin.graphExtractor.extract(filePath);
+      } catch (e) {
+        return { error: 'graph-extract: ' + (e.message || String(e)).slice(0, 200) };
+      }
+      const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+
+      // Resolve entidades via metadataCache (codex pré-fix MED #2)
+      const mdc = this.plugin.app.metadataCache;
+      const matches = [];
+      const seen = new Set();
+      for (const node of nodes) {
+        const label = String((node && (node.id || node.label || node.name)) || '').trim();
+        if (!label || label.length < 2) continue;
+        const dest = mdc.getFirstLinkpathDest ? mdc.getFirstLinkpathDest(label, filePath) : null;
+        if (dest && dest.path && dest.path !== filePath && !seen.has(dest.path)) {
+          seen.add(dest.path);
+          matches.push({ path: dest.path, score: undefined, label });
+        }
+      }
+
+      const wikilinks = this._renderLinks(matches);
+      const sha = this._arraySha(wikilinks);
+      const cacheKey = `${filePath}|${this.FRONTMATTER_GRAPH_KEY}`;
+      if (this._lastWritten.get(cacheKey) === sha) {
+        return matches.length
+          ? { skipped: 'já sincronizado', count: matches.length }
+          : { skipped: 'já vazio (sem matches)', nodes: nodes.length };
+      }
+
+      // codex MED #1: quando resultado é vazio, NÃO retorna skipped sem limpar;
+      // remove entradas stale para que o Graph nativo deixe de mostrar arestas mortas.
       await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
         const current = Array.isArray(fm[this.FRONTMATTER_GRAPH_KEY]) ? fm[this.FRONTMATTER_GRAPH_KEY] : null;
         if (current && this._arraySha(current) === sha) return;
-        fm[this.FRONTMATTER_GRAPH_KEY] = wikilinks;
-        fm.zeus_graph_node_count = nodes.length;
-        fm.zeus_graph_synced_at = new Date().toISOString();
+        if (wikilinks.length === 0) {
+          delete fm[this.FRONTMATTER_GRAPH_KEY];
+          delete fm.zeus_graph_node_count;
+          delete fm.zeus_graph_synced_at;
+        } else {
+          fm[this.FRONTMATTER_GRAPH_KEY] = wikilinks;
+          fm.zeus_graph_node_count = nodes.length;
+          fm.zeus_graph_synced_at = new Date().toISOString();
+        }
       });
-      this._lastWritten.set(`${filePath}|${this.FRONTMATTER_GRAPH_KEY}`, sha);
+      this._lastWritten.set(cacheKey, sha);
+      return matches.length
+        ? { ok: true, count: matches.length, nodes: nodes.length }
+        : { ok: true, cleared: true, nodes: nodes.length };
     } finally {
       this._inFlight.delete(filePath);
     }
-    return { ok: true, count: matches.length, nodes: nodes.length };
   }
 
   // Sync TODAS as notas com embeddings (batch operation)
@@ -1808,13 +1828,18 @@ class ZeusHybridSearchModal extends SuggestModal {
     this.setPlaceholder('Zeus — busca híbrida (semantic ⊕ graph ⊕ passport ⊕ path)…');
     this.cached = [];
     this.lastQuery = '';
+    // codex MED #4: querySeq monotônico — respostas async stale são descartadas
+    // se o usuário continuou digitando antes do RRF retornar.
+    this._querySeq = 0;
   }
   async getSuggestions(q) {
     if (!q || q.length < 2) return [];
     if (q === this.lastQuery) return this.cached;
     this.lastQuery = q;
+    const seq = ++this._querySeq;
     try {
       const r = await this.plugin.hybrid.query(q, this.plugin.settings.maxResults || 30);
+      if (seq !== this._querySeq) return this.cached; // resposta stale — usuário já digitou outra coisa
       this.cached = r;
       return r;
     } catch (e) {
@@ -3367,14 +3392,19 @@ class ZeusPlugin extends Plugin {
       }));
     }
     // v0.8.0 — native graph auto-resync on save (independent of indexOnSave/Mac)
+    // v1.6.1 — codex MED #2: timer global era cancelado a cada modify, então só
+    // a última nota dentro da janela 6s sincronizava. Map<path,timer> isola.
     if (this.settings.nativeGraphSyncOnSave) {
+      this._graphSyncTimers = this._graphSyncTimers || new Map();
       this.registerEvent(this.app.vault.on('modify', file => {
         if (file instanceof TFile && file.extension === 'md') {
-          // Debounce: re-sync after 6s (after potential reindex)
-          clearTimeout(this._graphSyncTimer);
-          this._graphSyncTimer = setTimeout(() => {
+          const prev = this._graphSyncTimers.get(file.path);
+          if (prev) clearTimeout(prev);
+          const t = setTimeout(() => {
+            this._graphSyncTimers.delete(file.path);
             this.nativeGraph.syncFile(file.path).catch(e => console.warn('[zeus] graph sync', e.message));
           }, 6000);
+          this._graphSyncTimers.set(file.path, t);
         }
       }));
     }
@@ -3589,7 +3619,11 @@ class ZeusPlugin extends Plugin {
       id: 'zeus-hybrid-search',
       name: 'Zeus: busca híbrida (graph + semantic + path)',
       callback: () => {
-        new ZeusHybridSearchModal(this.app, this).open();
+        try {
+          new ZeusHybridSearchModal(this.app, this).open();
+        } catch (e) {
+          new Notice('Zeus hybrid-search falhou: ' + (e.message || String(e)).slice(0, 150));
+        }
       },
     });
     this.addCommand({
@@ -3619,15 +3653,19 @@ class ZeusPlugin extends Plugin {
       id: 'zeus-native-watcher-status',
       name: 'Zeus: status do native-watcher (FSEvents iCloud)',
       callback: () => {
-        if (!this.nativeWatcher) { new Notice('Zeus: native-watcher indisponível'); return; }
-        const s = this.nativeWatcher.getStats();
-        if (!s.running) { new Notice(`Zeus watcher OFF (iOS Capacitor ou fs.watch indisponível)`, 5000); return; }
-        const hitRate = s.adapterHitRate != null ? `${(s.adapterHitRate * 100).toFixed(0)}%` : 'n/a';
-        const ago = s.lastExternalAgoMs != null ? `${(s.lastExternalAgoMs / 1000).toFixed(0)}s` : 'never';
-        new Notice(
-          `Zeus watcher: ${s.externalEvents} ext events · adapter caught ${hitRate} · ${s.adapterMissed} missed · last ${ago}`,
-          8000,
-        );
+        try {
+          if (!this.nativeWatcher) { new Notice('Zeus: native-watcher indisponível'); return; }
+          const s = this.nativeWatcher.getStats();
+          if (!s.running) { new Notice(`Zeus watcher OFF (iOS Capacitor ou fs.watch indisponível)`, 5000); return; }
+          const hitRate = s.adapterHitRate != null ? `${(s.adapterHitRate * 100).toFixed(0)}%` : 'n/a';
+          const ago = s.lastExternalAgoMs != null ? `${(s.lastExternalAgoMs / 1000).toFixed(0)}s` : 'never';
+          new Notice(
+            `Zeus watcher: ${s.externalEvents} ext events · adapter caught ${hitRate} · ${s.adapterMissed} missed · last ${ago}`,
+            8000,
+          );
+        } catch (e) {
+          new Notice('Zeus watcher-status falhou: ' + (e.message || String(e)).slice(0, 150));
+        }
       },
     });
 

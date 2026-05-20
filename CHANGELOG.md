@@ -4,6 +4,27 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.6.1] — 2026-05-20 — Fixes pós-auditoria codex (7 achados, 1 HIGH + 4 MED + 2 LOW)
+
+Auditoria pós-execução do v1.6.0 via `codex exec` (gpt-5.5 high-reasoning) achou 7 bugs novos não cobertos no plano-review pré-execução. Todos os 7 aplicados:
+
+- **HIGH** — `syncFromGraphExtract()` adicionava `_inFlight` DEPOIS de `await graphExtractor.extract()`. Dois comandos concorrentes passavam pelo guard e disparavam extract+write em paralelo. Lock movido para antes do `await`, método inteiro envelopado em try/finally (`main.source.js:1369`).
+- **MED** — `syncFile()` e `syncFromGraphExtract()` retornavam skipped quando resultado era vazio, mas NÃO removiam wikilinks antigos do frontmatter. Resultado: arestas stale persistiam no Graph nativo. Agora limpam `zeus_related` / `zeus_graph_related` quando vazio (`main.source.js:1332, 1381`).
+- **MED** — `nativeGraphSyncOnSave` usava `_graphSyncTimer` global; mods em N arquivos dentro de 6s cancelavam timers anteriores, só último sincronizava. Trocado por `Map<path,timer>` (`main.source.js:3390`).
+- **MED** — Comandos `zeus-hybrid-search` e `zeus-native-watcher-status` sem try/catch → falha em construtor de modal ou getStats vazava silencioso. Padronizado com `try/catch + Notice`.
+- **MED** — `ZeusHybridSearchModal.getSuggestions()` tinha race de autocomplete: query async antiga sobrescrevia `cached` da query atual. Adicionado `_querySeq` monotônico que descarta respostas stale.
+- **LOW** — `native-watcher` listener `vault.on('modify')` usava `this._adapterSeen.get()` mas `_adapterSeen` era inicializado depois. Movido para constructor.
+- **LOW** — `native-watcher` deadline timers não armazenados/limpos em `stop()`. Adicionado `_deadlineTimers Set` + clearTimeout no stop. `_adapterSeen` agora também tem cap `MAX_TRACKED`.
+
+### Validation
+
+- `node esbuild.config.mjs` → main.js 249 KB
+- `node scripts/zeus-doctor.mjs` → 7/7 OK
+- `node scripts/zeus-smoke.mjs` → 9/9
+- `node -e "const HS=require('./lib/hybrid-search'); HS.prototype...` — fuse + sisterNotes API OK
+
+---
+
 ## [1.6.0] — 2026-05-20 — Hybrid retrieval + Graphify→graph nativo + FSEvents observability
 
 Integração profunda de 4 superfícies (request do usuário). Plano debatido com `codex exec` ANTES da execução; 5 dos 6 achados do codex incorporados na primeira iteração; pós-execução re-auditada via codex.

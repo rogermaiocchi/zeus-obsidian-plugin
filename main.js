@@ -2535,6 +2535,8 @@ var require_native_watcher = __commonJS({
         this.watcher = null;
         this.running = false;
         this._pending = /* @__PURE__ */ new Map();
+        this._adapterSeen = /* @__PURE__ */ new Map();
+        this._deadlineTimers = /* @__PURE__ */ new Set();
         this.stats = {
           externalEvents: 0,
           adapterSawEvent: 0,
@@ -2589,7 +2591,6 @@ var require_native_watcher = __commonJS({
           this._vaultListener = ref;
         } catch (_) {
         }
-        this._adapterSeen = /* @__PURE__ */ new Map();
         this.running = true;
         return { running: true, root, quietMs: QUIET_MS };
       }
@@ -2599,7 +2600,12 @@ var require_native_watcher = __commonJS({
         this.stats.lastExternalAt = Date.now();
         const deadline = Date.now() + ADAPTER_DEADLINE_MS;
         this._adapterSeen.set(rel, deadline);
-        setTimeout(() => {
+        if (this._adapterSeen.size > MAX_TRACKED) {
+          const oldest = [...this._adapterSeen.entries()].sort((a, b) => a[1] - b[1])[0];
+          if (oldest) this._adapterSeen.delete(oldest[0]);
+        }
+        const timer = setTimeout(() => {
+          this._deadlineTimers.delete(timer);
           if (this._adapterSeen.has(rel)) {
             this.stats.adapterMissed++;
             this.stats.missedPaths.push({ path: rel, at: Date.now() });
@@ -2607,6 +2613,7 @@ var require_native_watcher = __commonJS({
             this._adapterSeen.delete(rel);
           }
         }, ADAPTER_DEADLINE_MS + 200);
+        this._deadlineTimers.add(timer);
       }
       getStats() {
         const elapsed = this.stats.lastExternalAt ? Date.now() - this.stats.lastExternalAt : null;
@@ -2633,7 +2640,9 @@ var require_native_watcher = __commonJS({
           if (entry.timer) clearTimeout(entry.timer);
         }
         this._pending.clear();
-        if (this._adapterSeen) this._adapterSeen.clear();
+        for (const t of this._deadlineTimers) clearTimeout(t);
+        this._deadlineTimers.clear();
+        this._adapterSeen.clear();
         this.running = false;
       }
     };
@@ -3769,28 +3778,36 @@ var ZeusNativeGraphIntegration = class {
   }
   // Top-N neighbors da nota (cosine NL), injeta como wikilinks no frontmatter.
   // v1.6 — compara SHA antes de escrever, evita timestamp churn.
+  // v1.6.1 — codex MED #1: quando filtered fica vazio, REMOVE zeus_related em vez
+  // de fazer no-op (que deixava arestas stale no Graph nativo).
   async syncFile(filePath, topN = 5, minScore = 0.3) {
     if (!this.plugin.settings.nativeGraphIntegration) return;
     if (this._inFlight.has(filePath)) return;
     const neighbors = this.plugin.searcher.neighbors(filePath, topN);
     const filtered = neighbors.filter((n) => n.score >= minScore);
-    if (filtered.length === 0) return;
     const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
     if (!file) return;
     const wikilinks = this._renderLinks(filtered);
     const sha = this._arraySha(wikilinks);
-    if (this._lastWritten.get(`${filePath}|${this.FRONTMATTER_KEY}`) === sha) return;
+    const cacheKey = `${filePath}|${this.FRONTMATTER_KEY}`;
+    if (this._lastWritten.get(cacheKey) === sha) return;
     this._inFlight.add(filePath);
     try {
       await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
         const current = Array.isArray(fm[this.FRONTMATTER_KEY]) ? fm[this.FRONTMATTER_KEY] : null;
         const currentSha = current ? this._arraySha(current) : null;
         if (currentSha === sha) return;
-        fm[this.FRONTMATTER_KEY] = wikilinks;
-        fm.zeus_neighbor_count = filtered.length;
-        fm.zeus_indexed_at = (/* @__PURE__ */ new Date()).toISOString();
+        if (wikilinks.length === 0) {
+          delete fm[this.FRONTMATTER_KEY];
+          delete fm.zeus_neighbor_count;
+          delete fm.zeus_indexed_at;
+        } else {
+          fm[this.FRONTMATTER_KEY] = wikilinks;
+          fm.zeus_neighbor_count = filtered.length;
+          fm.zeus_indexed_at = (/* @__PURE__ */ new Date()).toISOString();
+        }
       });
-      this._lastWritten.set(`${filePath}|${this.FRONTMATTER_KEY}`, sha);
+      this._lastWritten.set(cacheKey, sha);
     } finally {
       this._inFlight.delete(filePath);
     }
@@ -3807,46 +3824,51 @@ var ZeusNativeGraphIntegration = class {
     if (!this.plugin.graphExtractor) return { error: "graphExtractor indispon\xEDvel" };
     const file = this.plugin.app.vault.getAbstractFileByPath(filePath);
     if (!file) return { error: "arquivo n\xE3o encontrado no vault" };
-    let graph;
-    try {
-      graph = await this.plugin.graphExtractor.extract(filePath);
-    } catch (e) {
-      return { error: "graph-extract: " + (e.message || String(e)).slice(0, 200) };
-    }
-    const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
-    if (nodes.length === 0) return { skipped: "sem nodes extra\xEDdos" };
-    const mdc = this.plugin.app.metadataCache;
-    const matches = [];
-    const seen = /* @__PURE__ */ new Set();
-    for (const node of nodes) {
-      const label = String(node && (node.id || node.label || node.name) || "").trim();
-      if (!label || label.length < 2) continue;
-      const dest = mdc.getFirstLinkpathDest ? mdc.getFirstLinkpathDest(label, filePath) : null;
-      if (dest && dest.path && dest.path !== filePath && !seen.has(dest.path)) {
-        seen.add(dest.path);
-        matches.push({ path: dest.path, score: void 0, label });
-      }
-    }
-    if (matches.length === 0) return { skipped: `nenhum dos ${nodes.length} nodes corresponde a notas do vault` };
-    const wikilinks = this._renderLinks(matches);
-    const sha = this._arraySha(wikilinks);
-    if (this._lastWritten.get(`${filePath}|${this.FRONTMATTER_GRAPH_KEY}`) === sha) {
-      return { skipped: "j\xE1 sincronizado", count: matches.length };
-    }
     this._inFlight.add(filePath);
     try {
+      let graph;
+      try {
+        graph = await this.plugin.graphExtractor.extract(filePath);
+      } catch (e) {
+        return { error: "graph-extract: " + (e.message || String(e)).slice(0, 200) };
+      }
+      const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+      const mdc = this.plugin.app.metadataCache;
+      const matches = [];
+      const seen = /* @__PURE__ */ new Set();
+      for (const node of nodes) {
+        const label = String(node && (node.id || node.label || node.name) || "").trim();
+        if (!label || label.length < 2) continue;
+        const dest = mdc.getFirstLinkpathDest ? mdc.getFirstLinkpathDest(label, filePath) : null;
+        if (dest && dest.path && dest.path !== filePath && !seen.has(dest.path)) {
+          seen.add(dest.path);
+          matches.push({ path: dest.path, score: void 0, label });
+        }
+      }
+      const wikilinks = this._renderLinks(matches);
+      const sha = this._arraySha(wikilinks);
+      const cacheKey = `${filePath}|${this.FRONTMATTER_GRAPH_KEY}`;
+      if (this._lastWritten.get(cacheKey) === sha) {
+        return matches.length ? { skipped: "j\xE1 sincronizado", count: matches.length } : { skipped: "j\xE1 vazio (sem matches)", nodes: nodes.length };
+      }
       await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
         const current = Array.isArray(fm[this.FRONTMATTER_GRAPH_KEY]) ? fm[this.FRONTMATTER_GRAPH_KEY] : null;
         if (current && this._arraySha(current) === sha) return;
-        fm[this.FRONTMATTER_GRAPH_KEY] = wikilinks;
-        fm.zeus_graph_node_count = nodes.length;
-        fm.zeus_graph_synced_at = (/* @__PURE__ */ new Date()).toISOString();
+        if (wikilinks.length === 0) {
+          delete fm[this.FRONTMATTER_GRAPH_KEY];
+          delete fm.zeus_graph_node_count;
+          delete fm.zeus_graph_synced_at;
+        } else {
+          fm[this.FRONTMATTER_GRAPH_KEY] = wikilinks;
+          fm.zeus_graph_node_count = nodes.length;
+          fm.zeus_graph_synced_at = (/* @__PURE__ */ new Date()).toISOString();
+        }
       });
-      this._lastWritten.set(`${filePath}|${this.FRONTMATTER_GRAPH_KEY}`, sha);
+      this._lastWritten.set(cacheKey, sha);
+      return matches.length ? { ok: true, count: matches.length, nodes: nodes.length } : { ok: true, cleared: true, nodes: nodes.length };
     } finally {
       this._inFlight.delete(filePath);
     }
-    return { ok: true, count: matches.length, nodes: nodes.length };
   }
   // Sync TODAS as notas com embeddings (batch operation)
   async syncAllFiles(onProgress) {
@@ -4188,13 +4210,16 @@ var ZeusHybridSearchModal = class extends SuggestModal {
     this.setPlaceholder("Zeus \u2014 busca h\xEDbrida (semantic \u2295 graph \u2295 passport \u2295 path)\u2026");
     this.cached = [];
     this.lastQuery = "";
+    this._querySeq = 0;
   }
   async getSuggestions(q) {
     if (!q || q.length < 2) return [];
     if (q === this.lastQuery) return this.cached;
     this.lastQuery = q;
+    const seq = ++this._querySeq;
     try {
       const r = await this.plugin.hybrid.query(q, this.plugin.settings.maxResults || 30);
+      if (seq !== this._querySeq) return this.cached;
       this.cached = r;
       return r;
     } catch (e) {
@@ -5557,12 +5582,16 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
         }));
       }
       if (this.settings.nativeGraphSyncOnSave) {
+        this._graphSyncTimers = this._graphSyncTimers || /* @__PURE__ */ new Map();
         this.registerEvent(this.app.vault.on("modify", (file) => {
           if (file instanceof TFile && file.extension === "md") {
-            clearTimeout(this._graphSyncTimer);
-            this._graphSyncTimer = setTimeout(() => {
+            const prev = this._graphSyncTimers.get(file.path);
+            if (prev) clearTimeout(prev);
+            const t = setTimeout(() => {
+              this._graphSyncTimers.delete(file.path);
               this.nativeGraph.syncFile(file.path).catch((e) => console.warn("[zeus] graph sync", e.message));
             }, 6e3);
+            this._graphSyncTimers.set(file.path, t);
           }
         }));
       }
@@ -5755,7 +5784,11 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
         id: "zeus-hybrid-search",
         name: "Zeus: busca h\xEDbrida (graph + semantic + path)",
         callback: () => {
-          new ZeusHybridSearchModal(this.app, this).open();
+          try {
+            new ZeusHybridSearchModal(this.app, this).open();
+          } catch (e) {
+            new Notice("Zeus hybrid-search falhou: " + (e.message || String(e)).slice(0, 150));
+          }
         }
       });
       this.addCommand({
@@ -5788,21 +5821,25 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
         id: "zeus-native-watcher-status",
         name: "Zeus: status do native-watcher (FSEvents iCloud)",
         callback: () => {
-          if (!this.nativeWatcher) {
-            new Notice("Zeus: native-watcher indispon\xEDvel");
-            return;
+          try {
+            if (!this.nativeWatcher) {
+              new Notice("Zeus: native-watcher indispon\xEDvel");
+              return;
+            }
+            const s = this.nativeWatcher.getStats();
+            if (!s.running) {
+              new Notice(`Zeus watcher OFF (iOS Capacitor ou fs.watch indispon\xEDvel)`, 5e3);
+              return;
+            }
+            const hitRate = s.adapterHitRate != null ? `${(s.adapterHitRate * 100).toFixed(0)}%` : "n/a";
+            const ago = s.lastExternalAgoMs != null ? `${(s.lastExternalAgoMs / 1e3).toFixed(0)}s` : "never";
+            new Notice(
+              `Zeus watcher: ${s.externalEvents} ext events \xB7 adapter caught ${hitRate} \xB7 ${s.adapterMissed} missed \xB7 last ${ago}`,
+              8e3
+            );
+          } catch (e) {
+            new Notice("Zeus watcher-status falhou: " + (e.message || String(e)).slice(0, 150));
           }
-          const s = this.nativeWatcher.getStats();
-          if (!s.running) {
-            new Notice(`Zeus watcher OFF (iOS Capacitor ou fs.watch indispon\xEDvel)`, 5e3);
-            return;
-          }
-          const hitRate = s.adapterHitRate != null ? `${(s.adapterHitRate * 100).toFixed(0)}%` : "n/a";
-          const ago = s.lastExternalAgoMs != null ? `${(s.lastExternalAgoMs / 1e3).toFixed(0)}s` : "never";
-          new Notice(
-            `Zeus watcher: ${s.externalEvents} ext events \xB7 adapter caught ${hitRate} \xB7 ${s.adapterMissed} missed \xB7 last ${ago}`,
-            8e3
-          );
         }
       });
       console.log(`[zeus] loaded v${this.manifest.version} \u2014 Apple-native search & connections`);

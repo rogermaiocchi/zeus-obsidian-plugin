@@ -256,6 +256,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     "POST /v1/translate",
                     "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
                     "POST /v1/data-detect", "POST /v1/spotlight/search",
+                    "POST /v1/spotlight/index", "POST /v1/spotlight/query", "POST /v1/spotlight/purge",
                     "POST /v1/afm/refine",
                     "POST /v1/asp/transcribe", "POST /v1/asp/vad",
                     "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract",
@@ -304,6 +305,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             "POST /v1/translate",
             "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
             "POST /v1/data-detect", "POST /v1/spotlight/search",
+                    "POST /v1/spotlight/index", "POST /v1/spotlight/query", "POST /v1/spotlight/purge",
             "POST /v1/afm/refine",
             "POST /v1/asp/transcribe", "POST /v1/asp/vad",
             "POST /v1/refine", "POST /v1/hyde", "POST /v1/graph/extract",
@@ -3082,11 +3084,11 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     "path": it.uniqueIdentifier,
                     "domain": it.domainIdentifier ?? NSNull(),
                 ]
-                if let attrs = it.attributeSet {
-                    if let t = attrs.title { entry["title"] = t }
-                    if let d = attrs.contentDescription { entry["summary"] = d }
-                    if let k = attrs.keywords { entry["keywords"] = k }
-                }
+                // attributeSet é não-optional em SDKs recentes — acessar direto.
+                let attrs = it.attributeSet
+                if let t = attrs.title { entry["title"] = t }
+                if let d = attrs.contentDescription { entry["summary"] = d }
+                if let k = attrs.keywords { entry["keywords"] = k }
                 results.append(entry)
                 if results.count >= limit { break }
             }

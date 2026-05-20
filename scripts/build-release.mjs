@@ -60,8 +60,15 @@ function main() {
   const verify = run('codesign', ['-dv', targetBin], { capture: true, allowFail: true });
   console.log('[build-release] codesign:', (verify.stderr || verify.stdout).trim().split('\n').slice(0, 3).join(' · '));
 
-  // 4. esbuild main.js
-  run('node', ['esbuild.config.mjs']);
+  // 4. esbuild main.js — prefere `bun` (resolve esbuild da própria runtime,
+  // sem precisar de `node_modules`); fallback `node esbuild.config.mjs` quando
+  // bun não está disponível.
+  const hasBun = spawnSync('bun', ['--version'], { stdio: 'ignore' }).status === 0;
+  if (hasBun) {
+    run('bun', ['run', 'build']);
+  } else {
+    run('node', ['esbuild.config.mjs']);
+  }
 
   // 5. Final smoke: spawn binary, hit /v1/health, kill
   console.log('[build-release] ✓ bin/ZeusDaemonMac pronto. Para validar:');

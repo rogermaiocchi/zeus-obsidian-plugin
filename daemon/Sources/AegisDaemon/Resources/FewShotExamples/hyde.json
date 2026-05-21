@@ -1,22 +1,22 @@
 {
   "task": "hyde",
-  "captured_from": "curated (estilo apple-foundationmodels)",
-  "captured_at": "2026-05-16",
+  "captured_from": "zeus-codex-neural-core-v1.15.1",
+  "captured_at": "2026-05-21",
   "examples": [
     {
-      "input": "pensão por morte militar inativo SPSM/IPESM cumulação com previdência geral",
-      "style": "juridico",
-      "output": "A pensão por morte deixada por militar inativo, paga pelo Sistema de Proteção Social dos Militares por intermédio do IPESM, possui natureza jurídica autônoma em relação ao Regime Geral de Previdência Social. A cumulação entre os benefícios é admitida quando decorrentes de fontes contributivas distintas, conforme entendimento consolidado do STF a partir do RE 612.451. Eventual vedação dependerá de norma específica do regime aplicável e da relação jurídica originária entre instituidor e beneficiário."
+      "input": "coesão referencial em português",
+      "style": "nota-tecnica",
+      "output": "A coesão referencial em português brasileiro é realizada por mecanismos que garantem a continuidade do referente ao longo do texto sem repetição lexical desnecessária. Os principais recursos são: anáfora pronominal (substituição do referente por pronome — ex.: 'O texto foi lido. Ele revelou padrões inesperados'), catáfora (antecipação de referente a ser introduzido — ex.: 'Eis a conclusão: toda coesão depende de contexto'), elipse (supressão de termos recuperáveis pelo contexto sintático ou discursivo) e substituição nominal (uso de hiperônimo, sinônimo ou expressão nominal para retomar o referente). A ruptura da cadeia referencial — por uso incorreto de pronomes ou elipses ambíguas — compromete a progressão temática e gera ambiguidade. No PT-BR, o clítico acusativo de terceira pessoa (o/a) concorre com o pronome reto em posição de objeto, sendo a elipse do objeto a estratégia mais frequente no registro informal."
     },
     {
-      "input": "como configurar swift package manager para dependência condicional por plataforma",
-      "style": "tecnico",
-      "output": "Em Swift Package Manager, a inclusão condicional de dependências por plataforma é declarada em cada `.product(...)` do array `dependencies` do target, usando o parâmetro `condition: .when(platforms: [.iOS])`. Essa estratégia permite linkar frameworks específicos somente nos targets desejados, evitando que pacotes pesados sejam compilados em plataformas onde não fazem sentido. Compatível desde swift-tools-version 5.7."
+      "input": "Luhmann Zettelkasten wikilinks Obsidian",
+      "style": "nota-conceitual",
+      "output": "O Zettelkasten de Niklas Luhmann é um método de gestão do conhecimento baseado em notas atômicas (Zettel) interligadas por referências explícitas, formando uma rede não hierárquica e navegável. Cada Zettel contém uma única ideia claramente articulada, recebe um identificador único e aponta para outras notas por meio de referências cruzadas, permitindo que conexões entre conceitos distantes emirjam organicamente ao longo do tempo. No Obsidian, essa arquitetura é implementada via wikilinks bidirecionais: a notação [[NomeNota]] cria um link que o vault registra como backlink na nota de destino, tornando o grafo de conhecimento navegável em ambas as direções. A descoberta emergente — resultado de conexões não planejadas reveladas pela navegação do grafo — é o efeito epistêmico central do método. O vault Obsidian funciona, nesse sentido, como segunda mente externalizada: seu crescimento orgânico reproduz a estrutura associativa da memória humana, favorecendo sínteses e insights que seriam improvistáveis em sistemas de anotação lineares ou hierárquicos."
     },
     {
-      "input": "estratégias de retrieval RAG com HyDE para vault Obsidian",
-      "style": "tecnico",
-      "output": "HyDE (Hypothetical Document Embeddings) melhora retrieval em RAG ao gerar previamente um documento hipotético que responde à consulta, e em seguida usar o embedding desse documento — e não da consulta crua — como vetor de busca. Em vaults Obsidian, a abordagem reduz o gap léxico entre perguntas curtas e notas longas. A geração ocorre on-device via FoundationModels no Mac e via Gemma 4 Apple-Twin no iPhone/iPad."
+      "input": "embeddings NLContextualEmbedding iOS",
+      "style": "nota-tecnica",
+      "output": "NLContextualEmbedding é a API da Apple (framework Natural Language, iOS 17+) para geração de embeddings semânticos contextuais inteiramente on-device. A API produz vetores de 512 dimensões a partir de sequências de texto em linguagem natural, utilizando um modelo transformer compacto otimizado para execução no Neural Engine dos chips Apple Silicon. O embedding de cada token é sensível ao contexto sentencial completo — diferente de embeddings estáticos (word2vec, GloVe), o mesmo token recebe representações distintas conforme o contexto em que ocorre, capturando polissemia e dependências de longa distância. No pipeline de busca semântica do Zeus, os vetores gerados pela API são armazenados em um índice de embeddings do vault; a consulta do usuário é também vetorizada pela mesma API, e a similaridade cossenoidal entre o vetor de consulta e os vetores do índice determina o ranking de relevância das notas recuperadas. A operação é completamente offline, sem transmissão de dados para servidores externos, alinhada ao princípio de privacidade on-device da arquitetura Zeus."
     }
   ]
 }

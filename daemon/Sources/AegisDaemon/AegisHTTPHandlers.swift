@@ -690,6 +690,7 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         }
         let notePath = (json["note_path"] as? String) ?? "(desconhecido)"
         let vaultSummary = (json["vault_summary"] as? String) ?? ""
+        let inlineExamples = Self.extractInlineExamples(from: json)
 
         // Truncar inputs para caber na janela de 4096 tokens (~12k chars conservadores).
         let maxChars = 8000
@@ -720,7 +721,8 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             instructions: "Você é um assistente on-device para enriquecimento de vault Obsidian. Responda somente JSON estrito.",
             prompt: prompt,
             maxTokens: 700,
-            extraPayload: ["task": "enrich", "note_path": notePath]
+            extraPayload: ["task": "enrich", "note_path": notePath],
+            inlineExamples: inlineExamples
         )
         guard res.status == .ok else { return res }
         let raw = String((res.payload["text"] as? String) ?? "")
@@ -873,12 +875,14 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         let maxTokens = (json["max_tokens"] as? Int) ?? 500
         let instructions = (json["instructions"] as? String)
             ?? "Resuma o texto a seguir de forma concisa e fiel ao original. Mantenha o idioma do texto."
+        let inlineExamples = Self.extractInlineExamples(from: json)
 
         return self.runFoundationModel(
             instructions: instructions,
             prompt: text,
             maxTokens: maxTokens,
-            extraPayload: ["task": "summarize"]
+            extraPayload: ["task": "summarize"],
+            inlineExamples: inlineExamples
         )
     }
 
@@ -2279,12 +2283,37 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
 
     // MARK: - FoundationModels runner (gated)
 
+    // MARK: - Helper: extrai few_shot_examples do body JSON
+
+    /// Parseia o array `few_shot_examples: [{input, output}]` do body da requisição.
+    /// Usado pelos handlers generativos para passar exemplos vault-local ao Qwen.
+    private static func extractInlineExamples(from json: [String: Any]) -> [(input: String, output: String)] {
+        guard let arr = json["few_shot_examples"] as? [[String: Any]] else { return [] }
+        return arr.compactMap { d -> (input: String, output: String)? in
+            guard let i = d["input"] as? String, let o = d["output"] as? String,
+                  !i.isEmpty, !o.isEmpty else { return nil }
+            return (input: i, output: o)
+        }
+    }
+
+    // MARK: - Motor generativo principal (FoundationModels → Qwen fallback)
+
+    /// Executa uma tarefa generativa:
+    ///   1. Tenta Apple FoundationModels (iOS 26+ com Apple Intelligence)
+    ///   2. Se indisponível → fallback para Qwen 2.5 3B-Instruct via MLX (on-device)
+    ///   3. Captura par (input, output) para Fase B LoRA (Mac, opt-in via flag-file)
+    ///
+    /// `inlineExamples` — exemplos vault-local do FewShotCache.js (aprendizado contínuo).
+    /// São prepended ao prompt do Qwen DEPOIS dos exemplos bundle (maior especificidade).
     private func runFoundationModel(
         instructions: String,
         prompt: String,
         maxTokens: Int,
-        extraPayload: [String: Any]
+        extraPayload: [String: Any],
+        inlineExamples: [(input: String, output: String)] = []
     ) -> Response {
+        let taskName = (extraPayload["task"] as? String) ?? "prompt"
+
         #if canImport(FoundationModels)
         if #available(iOS 26.0, macOS 26.0, *) {
             let model = SystemLanguageModel.default
@@ -2316,8 +2345,7 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     "provider": "apple-intelligence"
                 ]
                 for (k, v) in extraPayload { payload[k] = v }
-                // v1.4 Fase B — captura para dataset contínuo (opt-in via flag-file)
-                let taskName = (extraPayload["task"] as? String) ?? "prompt"
+                // Fase B — captura para dataset contínuo (opt-in via flag-file)
                 AegisFMCaptureMiddleware.capture(
                     task: taskName,
                     input: ["instructions": instructions, "prompt": prompt, "max_tokens": maxTokens],
@@ -2326,25 +2354,55 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     model: "apple-foundationmodels-systemlanguagemodel"
                 )
                 return Response(status: .ok, payload: payload)
-            case .unavailable(let reason):
-                return Response(status: .serviceUnavailable, payload: [
-                    "error": "FoundationModels indisponível: \(reason)"
-                ])
+
+            case .unavailable:
+                // FM indisponível → tenta Qwen 2.5 3B on-device (iPhone/iPad sem AI)
+                break
             @unknown default:
-                return Response(status: .serviceUnavailable, payload: [
-                    "error": "FoundationModels com estado desconhecido"
-                ])
+                break
             }
-        } else {
-            return Response(status: .serviceUnavailable, payload: [
-                "error": "FoundationModels requer iOS 26.0+ (este device é mais antigo)"
-            ])
         }
-        #else
-        return Response(status: .serviceUnavailable, payload: [
-            "error": "FoundationModels framework não disponível neste build (compilar em iOS 26+ SDK)"
-        ])
         #endif
+
+        // Fallback: Qwen 2.5 3B-Instruct 4-bit via MLX (on-device, sem rede).
+        // Rota: FoundationModels ausente OU compilação sem SDK iOS 26.
+        // inlineExamples do FewShotCache.js são passados aqui para aprendizado contínuo.
+        #if os(iOS) && canImport(MLXLLM)
+        if let twin = MLXAppleTwinProvider.shared as? MLXQwenRunner {
+            switch twin.runGeneric(
+                instructions: instructions,
+                prompt: prompt,
+                maxTokens: maxTokens,
+                task: taskName,
+                inlineExamples: inlineExamples
+            ) {
+            case .failure(let e):
+                return Response(status: .serviceUnavailable, payload: [
+                    "error": "Qwen MLX falhou: \(e.localizedDescription)"
+                ])
+            case .success(let text):
+                var payload: [String: Any] = [
+                    "text": text,
+                    "model": "zeus-qwen2.5-3b-instruct-4bit",
+                    "provider": "mlx-qwen"
+                ]
+                for (k, v) in extraPayload { payload[k] = v }
+                // Captura Qwen output → pode ser usado como training signal negativo/distilação
+                AegisFMCaptureMiddleware.capture(
+                    task: taskName,
+                    input: ["instructions": instructions, "prompt": prompt, "max_tokens": maxTokens],
+                    output: text,
+                    provider: "mlx-qwen",
+                    model: "zeus-qwen2.5-3b-instruct-4bit"
+                )
+                return Response(status: .ok, payload: payload)
+            }
+        }
+        #endif
+
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "Nenhum motor generativo disponível (FoundationModels requer iOS/macOS 26+ com Apple Intelligence; Qwen MLX não carregado)"
+        ])
     }
 
     // MARK: - v1.15.0 Novos handlers (antes unsupported)

@@ -1,33 +1,47 @@
 {
   "task": "enrich",
-  "captured_from": "apple-foundationmodels-systemlanguagemodel (Mac mini)",
-  "captured_at": "2026-05-16",
+  "captured_from": "zeus-codex-neural-core-v1.15.1",
+  "captured_at": "2026-05-21",
   "examples": [
     {
-      "input": "Decisão arquitetural sobre o Apple-Twin: Opção 1 — paridade total Mac↔iOS. Gemma 4 E2B no iPhone, E4B no iPad, rodando via MLX Swift on-device. Cobre as 7 funções generativas. Fase A: few-shot prompting. Fase B: fine-tune contínuo passivo no Mac mini.",
+      "input": "NLContextualEmbedding é a API da Apple para geração de embeddings semânticos on-device. Ela produz vetores de 512 dimensões a partir de sequências de texto em linguagem natural, usando um modelo transformer compacto otimizado para chips Neural Engine. Os vetores resultantes permitem calcular similaridade cossenoidal entre notas do vault, fundamentando o pipeline de busca semântica do Zeus RAG. A API está disponível desde iOS 17 e opera inteiramente offline, sem enviar dados para servidores externos.",
       "output": {
-        "suggested_tags": ["generative-AI", "mac-ios", "mlx-swift"],
+        "suggested_tags": ["embeddings-semanticos", "nlp-ios", "NLContextualEmbedding", "busca-semantica", "on-device-ml"],
         "suggested_links": [
-          {"title": "Apple-Twin", "path": "/notes/apple-twin", "reason": "Explorar mais sobre a tecnologia e a arquitetura do Apple-Twin."},
-          {"title": "MLX Swift on-device", "path": "/notes/mlx-swift", "reason": "Entender como MLX Swift é utilizado em dispositivos Apple."}
+          {"title": "Pipeline RAG Zeus", "path": "/notas/zeus-rag-pipeline", "reason": "NLContextualEmbedding é o componente de embedding do pipeline RAG."},
+          {"title": "Neural Engine Apple", "path": "/notas/neural-engine-apple", "reason": "O modelo transformer da API é otimizado especificamente para o Neural Engine."}
         ],
         "connections": [
-          {"title": "Few-shot prompting", "path": "/notes/few-shot-prompting", "reason": "Aplicabilidade de few-shot prompting em modelos de IA."},
-          {"title": "Fine-tuning contínuo", "path": "/notes/fine-tuning-contínuo", "reason": "Processo de fine-tuning contínuo e sua importância."}
+          {"title": "Similaridade cossenoidal", "path": "/notas/similaridade-cossenoidal", "reason": "Métrica usada para comparar vetores produzidos pela API."},
+          {"title": "Privacidade on-device", "path": "/notas/privacidade-on-device", "reason": "Operação offline sem transmissão de dados é princípio central da doutrina Apple soberano."}
         ]
       }
     },
     {
-      "input": "Cliente João Silva, militar reformado, ajuizou ação contra o IPESM pleiteando revisão de pensão por morte. Documento principal: contrato de honorários assinado em 2026-04-10. Tese: aplicação da Lei 6880/80 vigente à época da admissão.",
+      "input": "O método Cornell de anotação estrutura a folha em três regiões: a coluna de dicas (cue column) à esquerda, a área principal de notas à direita e uma seção de resumo ao final. Durante a leitura ou aula, o aprendiz registra ideias na área principal. Depois, na coluna de dicas, extrai palavras-chave e perguntas que disparam a recuperação do conteúdo. O resumo ao final sintetiza os pontos centrais da nota em linguagem própria. Esse layout favorece a recuperação ativa (active recall) e o espaçamento (spaced repetition), dois mecanismos consolidados pela ciência cognitiva para retenção de longo prazo.",
       "output": {
-        "suggested_tags": ["pensão-por-morte", "ipesm", "militares", "lei-6880"],
+        "suggested_tags": ["metodo-cornell", "anotacao", "aprendizagem-ativa", "spaced-repetition", "cognicao"],
         "suggested_links": [
-          {"title": "Lei 6.880/80", "path": "/legislacao/lei-6880-80", "reason": "Estatuto dos Militares vigente à época da admissão."},
-          {"title": "Cliente: João Silva", "path": "/clientes/joao-silva", "reason": "Ficha do cliente vinculada ao processo."}
+          {"title": "Método Feynman", "path": "/notas/metodo-feynman", "reason": "Cornell e Feynman compartilham o princípio de reelaboração ativa do conhecimento."},
+          {"title": "Zettelkasten Luhmann", "path": "/notas/zettelkasten-luhmann", "reason": "Ambos os métodos organizam notas para facilitar recuperação e conexão de ideias."}
         ],
         "connections": [
-          {"title": "Tese — direito adquirido em mudança de regime previdenciário", "path": "/teses/direito-adquirido-regime", "reason": "Fundamento jurídico central da ação."},
-          {"title": "Modelo — contrato de honorários previdenciário", "path": "/modelos/contrato-honorarios-prev", "reason": "Documento de referência arquivado."}
+          {"title": "Recuperação ativa (active recall)", "path": "/notas/active-recall", "reason": "A coluna de dicas Cornell é um mecanismo direto de active recall."},
+          {"title": "Repetição espaçada (spaced repetition)", "path": "/notas/spaced-repetition", "reason": "O resumo Cornell se integra naturalmente a sistemas de repetição espaçada como Anki."}
+        ]
+      }
+    },
+    {
+      "input": "O grafo de conhecimento do Obsidian representa as notas como nós e os wikilinks como arestas direcionadas. A visão de grafo (Graph View) permite identificar clusters temáticos, nós centrais (hubs) altamente conectados e ilhas isoladas. Para o Zeus, o grafo é materializado em um índice de adjacência que alimenta a camada de re-ranking do pipeline RAG: notas ligadas ao resultado recuperado recebem um bônus de relevância estrutural. Isso implementa, na prática, a ideia luhmanniana de que conexões explícitas entre conceitos têm valor epistêmico independente do conteúdo individual de cada nota.",
+      "output": {
+        "suggested_tags": ["grafo-obsidian", "wikilinks", "rag-reranking", "luhmann", "estrutura-conhecimento"],
+        "suggested_links": [
+          {"title": "Zettelkasten Luhmann", "path": "/notas/zettelkasten-luhmann", "reason": "O grafo Obsidian operacionaliza o princípio luhmanniano de conexões explícitas entre conceitos."},
+          {"title": "Pipeline RAG Zeus", "path": "/notas/zeus-rag-pipeline", "reason": "O índice de adjacência do grafo alimenta o re-ranking do pipeline RAG."}
+        ],
+        "connections": [
+          {"title": "Re-ranking estrutural", "path": "/notas/reranking-estrutural", "reason": "Bônus de relevância baseado em adjacência no grafo é o mecanismo de re-ranking descrito."},
+          {"title": "Hubs e clusters no grafo", "path": "/notas/grafo-hubs-clusters", "reason": "Identificação de nós centrais e clusters é a principal utilidade analítica da Graph View."}
         ]
       }
     }

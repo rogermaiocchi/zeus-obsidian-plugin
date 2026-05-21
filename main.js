@@ -1179,11 +1179,12 @@ var require_zeus_http_client = __commonJS({
         }
         return { vectors, dim, model, count: vectors.length };
       }
-      async enrich(noteContent, notePath, vaultSummary = "") {
+      async enrich(noteContent, notePath, vaultSummary = "", fewShotExamples = []) {
         return await this._post("/v1/enrich", {
           note_content: noteContent,
           note_path: notePath,
-          vault_summary: vaultSummary
+          vault_summary: vaultSummary,
+          ...fewShotExamples.length > 0 ? { few_shot_examples: fewShotExamples } : {}
         }, 9e4);
       }
       async agent(question, pattern = "auto") {
@@ -1197,11 +1198,15 @@ var require_zeus_http_client = __commonJS({
           output_format: outputFormat
         }, 12e4);
       }
-      async summarize(text) {
-        return await this._post("/v1/summarize", { text }, 6e4);
+      async summarize(text, fewShotExamples = []) {
+        const body = { text };
+        if (fewShotExamples.length > 0) body.few_shot_examples = fewShotExamples;
+        return await this._post("/v1/summarize", body, 6e4);
       }
-      async graphExtract(text, maxNodes = 20, maxEdges = 30) {
-        return await this._post("/v1/graph/extract", { text, max_nodes: maxNodes, max_edges: maxEdges }, 6e4);
+      async graphExtract(text, maxNodes = 20, maxEdges = 30, fewShotExamples = []) {
+        const body = { text, max_nodes: maxNodes, max_edges: maxEdges };
+        if (fewShotExamples.length > 0) body.few_shot_examples = fewShotExamples;
+        return await this._post("/v1/graph/extract", body, 6e4);
       }
       async classify(text, options) {
         return await this._post("/v1/classify", { text, options }, 6e4);
@@ -1213,6 +1218,9 @@ var require_zeus_http_client = __commonJS({
           deterministic: options.deterministic !== false
         };
         if (options.prewarm !== void 0) body.prewarm = options.prewarm;
+        if (Array.isArray(options.fewShotExamples) && options.fewShotExamples.length > 0) {
+          body.few_shot_examples = options.fewShotExamples;
+        }
         return await this._post("/v1/prompt", body, options.timeoutMs || 9e4);
       }
       async visionClassify(imagePath, topN = 8) {

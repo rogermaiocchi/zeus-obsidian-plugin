@@ -1,30 +1,40 @@
 {
   "task": "agent_query",
-  "captured_from": "curated (estilo apple-foundationmodels com RAG)",
-  "captured_at": "2026-05-16",
+  "captured_from": "zeus-codex-neural-core-v1.15.1",
+  "captured_at": "2026-05-21",
   "examples": [
     {
       "input": {
-        "question": "Qual é o status atual do projeto meta-grafo-juridico?",
+        "question": "Qual a diferença entre anáfora e catáfora?",
         "context": [
-          "meta-grafo-juridico: projeto de extração de grafo de conhecimento jurídico a partir do vault. Status: em rascunho, sem implementação. Última edição: 2026-05-09.",
-          "Pendência da auditoria 2026-05-09: definir esquema do grafo (entidades + relações) antes de qualquer extração."
+          "Anáfora é o mecanismo de coesão referencial em que um elemento do texto remete retrospectivamente a um referente já introduzido. Ex.: 'Maria entrou na sala. Ela estava concentrada.' — o pronome 'ela' retoma 'Maria', que foi introduzida na oração anterior.",
+          "Catáfora é o mecanismo inverso: um elemento antecipa um referente que será introduzido na sequência do texto. Ex.: 'Isto é fundamental: toda análise linguística exige corpus.' — o demonstrativo 'isto' aponta prospectivamente para a proposição seguinte."
         ],
         "pattern": "auto"
       },
-      "output": "O projeto meta-grafo-juridico está em rascunho, sem implementação iniciada. A última edição é de 2026-05-09. A pendência aberta na auditoria daquela data é a definição do esquema do grafo (entidades e relações) antes da extração."
+      "output": "Anáfora e catáfora são mecanismos opostos de coesão referencial. A anáfora opera retrospectivamente: um elemento remete a um referente já introduzido no texto — em 'Maria entrou. Ela estava concentrada', 'ela' retoma 'Maria'. A catáfora opera prospectivamente: um elemento antecipa um referente a ser introduzido — em 'Isto é fundamental: toda análise exige corpus', 'isto' aponta para a proposição seguinte. Ambos os recursos sustentam a cadeia referencial e a progressão temática sem repetição lexical."
     },
     {
       "input": {
-        "question": "Liste os arquivos de doutrina do Zeus.",
+        "question": "Como o método Luhmann organiza conexões entre notas?",
         "context": [
-          "meta-doutrina-zeus: doutrina arquitetural para o subsistema Zeus, ênfase em privacidade on-device.",
-          "meta-doutrina-apple-soberano: princípio de soberania Apple no ecossistema.",
-          "meta-doutrina-fundacional: doutrina fundacional do Metassistema."
+          "No Zettelkasten de Luhmann, cada nota (Zettel) recebe um identificador alfanumérico hierárquico que permite ramificações: a nota 21 pode ser seguida de 21a, 21b, 21a1 etc. Isso cria uma estrutura não linear onde notas relacionadas ficam fisicamente próximas, mas qualquer Zettel pode apontar para qualquer outro por meio de referência cruzada explícita anotada no rodapé.",
+          "A descoberta emergente é o efeito central do método: ao percorrer as referências cruzadas, Luhmann encontrava conexões não planejadas entre conceitos distantes, que se tornavam ponto de partida para novos Zettel e novas linhas de pensamento. O sistema funcionava como interlocutor: respondia a consultas com associações inesperadas."
         ],
-        "pattern": "plan-execute"
+        "pattern": "auto"
       },
-      "output": "Plano: percorrer o contexto e separar os documentos cujo nome contém 'doutrina-zeus'.\n\nExecução: o vault contém um único documento de doutrina especificamente do Zeus — meta-doutrina-zeus, que trata da arquitetura on-device privacy-first. Os demais (meta-doutrina-apple-soberano e meta-doutrina-fundacional) compartilham princípios mas não são doutrinas-do-Zeus stricto sensu."
+      "output": "O método Luhmann organiza conexões por dois mecanismos complementares. O primeiro é a numeração alfanumérica ramificada: cada nota recebe um identificador (ex.: 21, 21a, 21a1) que permite inserir notas relacionadas na vizinhança física do argumento em desenvolvimento, criando ramificações temáticas sem hierarquia rígida. O segundo é a referência cruzada explícita: qualquer nota pode apontar para qualquer outra por meio de referências anotadas no rodapé, criando uma rede de conexões transversais independente da ordem física. A descoberta emergente — conexões não planejadas entre conceitos distantes reveladas ao percorrer as referências — é o efeito epistêmico central: o sistema funciona como interlocutor que responde com associações inesperadas."
+    },
+    {
+      "input": {
+        "question": "Como SimHash acelera a busca semântica?",
+        "context": [
+          "SimHash é uma técnica de locality-sensitive hashing (LSH) que gera uma assinatura binária compacta (tipicamente 64 bits) para cada documento. Documentos semanticamente similares produzem assinaturas com baixa distância de Hamming. Isso permite comparar milhares de documentos por operações bit a bit extremamente rápidas, em vez de cálculos de produto escalar em espaços de alta dimensão.",
+          "No pipeline turbo quantico do Zeus, o SimHash funciona como pré-filtro: a assinatura da consulta é comparada contra todas as assinaturas pré-computadas do vault via distância de Hamming. Apenas notas com distância abaixo de um limiar configuram a lista de candidatos que avança para o terceiro estágio de similaridade cossenoidal exata, reduzindo o número de operações vetoriais completas em 90–95%."
+        ],
+        "pattern": "auto"
+      },
+      "output": "SimHash acelera a busca semântica atuando como pré-filtro antes do cálculo cossenoidal exato. A técnica gera uma assinatura binária de 64 bits para cada nota do vault: documentos semanticamente similares produzem assinaturas com baixa distância de Hamming, que é calculada por operações bit a bit muito mais rápidas do que produto escalar em espaços de 512 dimensões. No pipeline turbo quantico do Zeus, a assinatura da consulta é comparada contra todas as assinaturas pré-computadas; apenas notas abaixo de um limiar de distância de Hamming avançam para o estágio de similaridade cossenoidal exata. Essa cascata elimina tipicamente 90–95% dos candidatos antes do cálculo vetorial mais custoso, tornando o pipeline viável para execução on-device em tempo real."
     }
   ]
 }

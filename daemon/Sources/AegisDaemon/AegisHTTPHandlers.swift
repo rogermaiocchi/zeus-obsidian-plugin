@@ -1213,6 +1213,128 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         let difficulty: Int
         let extractedAt: String
         let charCount: Int
+        // Cornell method fields
+        let cornellCue: [String]
+        let cornellSummary: String
+        // Luhmann Zettelkasten fields
+        let noteType: String?
+        let zettelId: String
+        let atomicSplits: [String]
+    }
+
+    // MARK: - Cornell: heading → cue question
+
+    private func headingToCue(_ heading: String) -> String {
+        let h = heading.trimmingCharacters(in: .whitespaces)
+        guard !h.isEmpty else { return "" }
+        if h.hasSuffix("?") { return h }
+        let lower = h.lowercased()
+        let questionStarts = ["o que", "como", "por que", "por quê", "quem", "quando",
+                              "onde", "qual", "quais", "quanto", "what", "how", "why",
+                              "who", "when", "where", "which"]
+        for qw in questionStarts where lower.hasPrefix(qw) {
+            return h.hasSuffix("?") ? h : h + "?"
+        }
+        let words = h.split(separator: " ")
+        if words.count > 6 { return h + "?" }
+        return "O que é \(lower.replacingOccurrences(of: "?", with: "").replacingOccurrences(of: "!", with: ""))?"
+    }
+
+    private func extractCornellCues(from text: String) -> [String] {
+        var cues: [String] = []
+        let lines = text.components(separatedBy: "\n")
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("## ") || trimmed.hasPrefix("### ") {
+                let raw = trimmed.replacingOccurrences(of: "^#{2,3}\\s+", with: "",
+                    options: .regularExpression)
+                    .replacingOccurrences(of: "**", with: "")
+                    .replacingOccurrences(of: "__", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                if raw.count >= 3 && raw.count <= 80 {
+                    let cue = headingToCue(raw)
+                    if !cue.isEmpty { cues.append(cue) }
+                }
+            }
+            if cues.count >= 8 { break }
+        }
+        return cues
+    }
+
+    // MARK: - Luhmann: note type + zettel ID
+
+    private static let fleetingFolders: Set<String> = [
+        "inbox", "capture", "fleeting", "scratch", "rascunho", "captura",
+        "quick", "daily", "diário", "diario", "log",
+    ]
+    private static let literatureKeys: Set<String> = [
+        "source", "author", "authors", "url", "doi", "isbn", "journal",
+        "book", "livro", "fonte", "autor", "artigo", "paper", "reference",
+    ]
+
+    private func detectNoteType(path: String, content: String, concepts: [String],
+                                 charCount: Int) -> String? {
+        let components = path.replacingOccurrences(of: "\\", with: "/").components(separatedBy: "/")
+        let topFolder = components.first?.lowercased() ?? ""
+        let secondFolder = components.count > 1 ? components[1].lowercased() : ""
+        let isFleetingFolder = Self.fleetingFolders.contains(topFolder) ||
+                               Self.fleetingFolders.contains(secondFolder)
+
+        let wikilinkCount = (content.components(separatedBy: "[[").count) - 1
+        let bqLines = content.components(separatedBy: "\n").filter { $0.hasPrefix("> ") }.count
+        let totalLines = max(1, content.components(separatedBy: "\n").count)
+        let bqRatio = Double(bqLines) / Double(totalLines)
+
+        // Check frontmatter for literature keys (simple heuristic: key: value at start)
+        let frontmatterEnd = content.hasPrefix("---")
+            ? (content.range(of: "\n---\n")?.upperBound ?? content.startIndex)
+            : content.startIndex
+        let frontmatter = String(content[content.startIndex..<frontmatterEnd]).lowercased()
+        let hasLiteratureKey = Self.literatureKeys.contains(where: { frontmatter.contains("\n\($0):") })
+
+        if charCount < 300 && wikilinkCount == 0 && (isFleetingFolder || charCount < 150) {
+            return "fleeting"
+        }
+        if hasLiteratureKey || bqRatio > 0.3 {
+            return "literature"
+        }
+        if wikilinkCount >= 2 && concepts.count >= 3 && charCount > 600 {
+            return "permanent"
+        }
+        return nil
+    }
+
+    private func generateZettelId(from dateString: String) -> String {
+        // Format: YYYYMMDDHHMM from ISO8601 extractedAt
+        let digits = dateString.filter { $0.isNumber }
+        guard digits.count >= 12 else { return String(digits.prefix(12)) }
+        return String(digits.prefix(12))
+    }
+
+    private func suggestAtomicSplits(from text: String) -> [String] {
+        var splits: [String] = []
+        let lines = text.components(separatedBy: "\n")
+        var currentHeading: String? = nil
+        var bodyChars = 0
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("## ") || trimmed.hasPrefix("### ") {
+                if let h = currentHeading, bodyChars > 200 {
+                    splits.append(h)
+                }
+                currentHeading = trimmed.replacingOccurrences(of: "^#{2,3}\\s+", with: "",
+                    options: .regularExpression).trimmingCharacters(in: .whitespaces)
+                bodyChars = 0
+            } else {
+                bodyChars += trimmed.count
+            }
+            if splits.count >= 5 { break }
+        }
+        if let h = currentHeading, bodyChars > 200, splits.count < 5 {
+            splits.append(h)
+        }
+        return splits
     }
 
     /// Core extraction: text → passport. FM gated; em iPad Air gen 4 retorna sem summary/domain.
@@ -1289,20 +1411,37 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let extractedAt = formatter.string(from: Date())
 
+        let summary = oneLineSummary.get() ?? ""
+
+        // Cornell fields
+        let cornellCue = extractCornellCues(from: rawContent)
+        let cornellSummary = summary
+
+        // Luhmann fields
+        let noteType = detectNoteType(path: path, content: rawContent,
+                                      concepts: concepts, charCount: rawContent.count)
+        let zettelId = generateZettelId(from: extractedAt)
+        let atomicSplits = suggestAtomicSplits(from: rawContent)
+
         let result = PassportResult(
             path: path,
             concepts: concepts,
-            oneLineSummary: oneLineSummary.get() ?? "",
+            oneLineSummary: summary,
             domain: domain,
             difficulty: difficulty,
             extractedAt: extractedAt,
-            charCount: rawContent.count
+            charCount: rawContent.count,
+            cornellCue: cornellCue,
+            cornellSummary: cornellSummary,
+            noteType: noteType,
+            zettelId: zettelId,
+            atomicSplits: atomicSplits
         )
         return (result, nil)
     }
 
     private func passportToDict(_ p: PassportResult, modelVersions: [String: String]) -> [String: Any] {
-        return [
+        var dict: [String: Any] = [
             "path": p.path,
             "concepts": p.concepts,
             "one_line_summary": p.oneLineSummary,
@@ -1310,8 +1449,14 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             "difficulty": p.difficulty,
             "extracted_at": p.extractedAt,
             "char_count": p.charCount,
-            "model_versions": modelVersions
+            "model_versions": modelVersions,
+            "cornell_cue": p.cornellCue,
+            "cornell_summary": p.cornellSummary,
+            "zettel_id": p.zettelId,
+            "atomic_splits": p.atomicSplits,
         ]
+        if let nt = p.noteType { dict["note_type"] = nt }
+        return dict
     }
 
     private func handlePassportExtract(bodyJSON: String) -> Response {

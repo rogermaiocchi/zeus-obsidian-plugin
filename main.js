@@ -1621,11 +1621,205 @@ var require_image_similarity = __commonJS({
   }
 });
 
+// lib/cornell.js
+var require_cornell = __commonJS({
+  "lib/cornell.js"(exports2, module2) {
+    "use strict";
+    var H2_H3_RE = /^#{2,3}\s+(.+)$/gm;
+    var QUESTION_RE = /[?？]$/;
+    var QUESTION_STARTS = /* @__PURE__ */ new Set([
+      "o que",
+      "como",
+      "por que",
+      "por qu\xEA",
+      "quem",
+      "quando",
+      "onde",
+      "qual",
+      "quais",
+      "quanto",
+      "quantos",
+      "quantas",
+      "para que",
+      "what",
+      "how",
+      "why",
+      "who",
+      "when",
+      "where",
+      "which"
+    ]);
+    function headingToCue(heading) {
+      const h = heading.trim();
+      if (!h) return "";
+      if (QUESTION_RE.test(h)) return h;
+      const lower = h.toLowerCase();
+      for (const qw of QUESTION_STARTS) {
+        if (lower.startsWith(qw)) return h.endsWith("?") ? h : h + "?";
+      }
+      const words = h.split(/\s+/);
+      if (words.length > 6) return h + "?";
+      return `O que \xE9 ${lower.replace(/[?！!]/g, "")}?`;
+    }
+    function extractCornellFields(body, fm, headings, one_line_summary, concepts) {
+      let cornell_cue = [];
+      if (fm && (fm.zeus_cornell_cue || fm.cornell_cue)) {
+        const raw = fm.zeus_cornell_cue || fm.cornell_cue;
+        cornell_cue = Array.isArray(raw) ? raw.map(String).filter(Boolean) : String(raw).split(/[;,\n]+/).map((s) => s.trim()).filter(Boolean);
+      }
+      if (cornell_cue.length === 0) {
+        const h23 = [];
+        let m;
+        const re = new RegExp(H2_H3_RE.source, "gm");
+        while ((m = re.exec(body)) !== null) {
+          const h = m[1].trim().replace(/\*\*/g, "").replace(/__/g, "");
+          if (h.length >= 3 && h.length <= 80) h23.push(h);
+        }
+        cornell_cue = h23.slice(0, 8).map(headingToCue).filter(Boolean);
+      }
+      if (cornell_cue.length === 0 && Array.isArray(concepts) && concepts.length > 0) {
+        cornell_cue = concepts.slice(0, 3).map((c) => `O que \xE9 ${c.toLowerCase()}?`);
+      }
+      let cornell_summary = "";
+      if (fm && (fm.zeus_cornell_summary || fm.cornell_summary)) {
+        cornell_summary = String(fm.zeus_cornell_summary || fm.cornell_summary).trim();
+      }
+      if (!cornell_summary && one_line_summary) {
+        cornell_summary = one_line_summary;
+      }
+      if (!cornell_summary && body) {
+        const firstSentence = body.replace(/^#{1,6}\s+.+\n?/m, "").trim().split(/[.!?]\s/)[0];
+        if (firstSentence && firstSentence.length > 20) {
+          cornell_summary = firstSentence.slice(0, 200).trim() + (firstSentence.length > 200 ? "\u2026" : "");
+        }
+      }
+      return { cornell_cue, cornell_summary };
+    }
+    function isCornellFormatted(body) {
+      const lower = body.toLowerCase();
+      const hasCueSection = /#{2,3}\s*(perguntas[- ]chave|cue|questões|keywords)/i.test(body);
+      const hasSummarySection = /#{2,3}\s*(resumo|summary|síntese)/i.test(body);
+      return hasCueSection || hasSummarySection;
+    }
+    module2.exports = { extractCornellFields, headingToCue, isCornellFormatted };
+  }
+});
+
+// lib/luhmann.js
+var require_luhmann = __commonJS({
+  "lib/luhmann.js"(exports2, module2) {
+    "use strict";
+    var FLEETING_FOLDERS = /* @__PURE__ */ new Set([
+      "inbox",
+      "capture",
+      "fleeting",
+      "scratch",
+      "rascunho",
+      "captura",
+      "quick",
+      "daily",
+      "di\xE1rio",
+      "diario",
+      "log",
+      "notas-r\xE1pidas"
+    ]);
+    var LITERATURE_KEYS = /* @__PURE__ */ new Set([
+      "source",
+      "author",
+      "authors",
+      "url",
+      "doi",
+      "isbn",
+      "journal",
+      "book",
+      "livro",
+      "fonte",
+      "autor",
+      "artigo",
+      "paper",
+      "reference",
+      "refer\xEAncia",
+      "referencia"
+    ]);
+    var WIKILINK_RE = /\[\[([^\]]+)\]\]/g;
+    var BLOCKQUOTE_LINE_RE = /^>\s/gm;
+    var HEADING_RE = /^(#{1,3})\s+(.+)$/gm;
+    function detectNoteType(body, fm, filePath, charCount, concepts) {
+      if (fm) {
+        const explicit = fm.zeus_note_type || fm.note_type || fm.zettel_type;
+        if (explicit) {
+          const v = String(explicit).toLowerCase().trim();
+          if (v === "fleeting" || v === "literature" || v === "permanent") return v;
+        }
+      }
+      const folderParts = filePath.replace(/\\/g, "/").split("/");
+      const topFolder = (folderParts[0] || "").toLowerCase();
+      const secondFolder = (folderParts[1] || "").toLowerCase();
+      const isFleetingFolder = FLEETING_FOLDERS.has(topFolder) || FLEETING_FOLDERS.has(secondFolder);
+      const wikilinkMatches = (body.match(WIKILINK_RE) || []).length;
+      const totalLines = (body.match(/\n/g) || []).length + 1;
+      const bqLines = (body.match(BLOCKQUOTE_LINE_RE) || []).length;
+      const bqRatio = totalLines > 0 ? bqLines / totalLines : 0;
+      const hasLiteratureKey = fm && Object.keys(fm).some((k) => LITERATURE_KEYS.has(k.toLowerCase()));
+      if (charCount < 300 && wikilinkMatches === 0 && (isFleetingFolder || charCount < 150)) {
+        return "fleeting";
+      }
+      if (hasLiteratureKey || bqRatio > 0.3) {
+        return "literature";
+      }
+      if (wikilinkMatches >= 2 && (concepts || []).length >= 3 && charCount > 600) {
+        return "permanent";
+      }
+      return null;
+    }
+    function generateZettelId(fm, extractedAt) {
+      if (fm) {
+        const explicit = fm.zeus_zettel_id || fm.zettel_id || fm.zeus_id;
+        if (explicit) return String(explicit).trim();
+      }
+      try {
+        const d = extractedAt ? new Date(extractedAt) : /* @__PURE__ */ new Date();
+        const pad = (n) => String(n).padStart(2, "0");
+        return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + pad(d.getHours()) + pad(d.getMinutes());
+      } catch (e) {
+        return String(Date.now()).slice(0, 12);
+      }
+    }
+    function suggestAtomicSplits(body) {
+      const candidates = [];
+      const sections = body.split(/^#{2,3}\s+/m).slice(1);
+      const headings = [];
+      let m;
+      const re = new RegExp(HEADING_RE.source, "gm");
+      while ((m = re.exec(body)) !== null) {
+        if (m[1].length >= 2) headings.push(m[2].trim());
+      }
+      for (let i = 0; i < sections.length; i++) {
+        const sectionBody = sections[i].split(/\n#{2,3}\s/)[0];
+        if (sectionBody.replace(/\s/g, "").length > 200 && headings[i]) {
+          candidates.push(headings[i]);
+        }
+      }
+      return candidates.slice(0, 5);
+    }
+    function extractLuhmannFields(body, fm, filePath, charCount, concepts, extractedAt) {
+      return {
+        note_type: detectNoteType(body, fm, filePath, charCount, concepts),
+        zettel_id: generateZettelId(fm, extractedAt),
+        atomic_splits: suggestAtomicSplits(body)
+      };
+    }
+    module2.exports = { extractLuhmannFields, detectNoteType, generateZettelId, suggestAtomicSplits };
+  }
+});
+
 // lib/passport-ios.js
 var require_passport_ios = __commonJS({
   "lib/passport-ios.js"(exports2, module2) {
     "use strict";
-    var MODEL_VERSION = "zeus-ios-1.15.0";
+    var { extractCornellFields } = require_cornell();
+    var { extractLuhmannFields } = require_luhmann();
+    var MODEL_VERSION = "zeus-ios-1.16.0";
     var MAX_CONCEPTS = 12;
     var MAX_INLINE_TAGS = 30;
     var MAX_PROPER_NOUNS = 15;
@@ -1826,14 +2020,22 @@ var require_passport_ios = __commonJS({
       if (domain.length === 0) domain = detectDomainByFolder(filePath);
       const summary = extractSummary(body, fm, headings);
       const difficulty = estimateDifficulty(charCount);
+      const extractedAt = (/* @__PURE__ */ new Date()).toISOString();
+      const cornell = extractCornellFields(body, fm, headings, summary, concepts);
+      const luhmann = extractLuhmannFields(body, fm, filePath, charCount, concepts, extractedAt);
       return {
         path: filePath,
-        extracted_at: (/* @__PURE__ */ new Date()).toISOString(),
+        extracted_at: extractedAt,
         char_count: charCount,
         concepts,
         domain,
         difficulty,
         one_line_summary: summary,
+        cornell_cue: cornell.cornell_cue,
+        cornell_summary: cornell.cornell_summary,
+        note_type: luhmann.note_type,
+        zettel_id: luhmann.zettel_id,
+        atomic_splits: luhmann.atomic_splits,
         model_versions: { passport: MODEL_VERSION },
         source: "ios-local"
       };
@@ -2296,7 +2498,8 @@ var require_passport_index = __commonJS({
         const corpus = passports.map((p) => {
           const summary = p.one_line_summary || p.summary || "";
           const basename = (p.path || "").split("/").pop().replace(/\.md$/, "");
-          return bm25.tokenize(summary + " " + basename);
+          const cornellText = Array.isArray(p.cornell_cue) ? p.cornell_cue.join(" ") : "";
+          return bm25.tokenize(summary + " " + cornellText + " " + basename);
         });
         const bmScores = bm25.bm25Scores(corpus, queryTokens);
         const scored = [];
@@ -2410,7 +2613,10 @@ var require_bases_generator = __commonJS({
         let withSummary = 0;
         let withConcepts = 0;
         let withDomain = 0;
+        let withCornell = 0;
+        let withLuhmann = 0;
         const domains = /* @__PURE__ */ new Set();
+        const noteTypes = { fleeting: 0, literature: 0, permanent: 0 };
         for (const ln of lines) {
           try {
             const obj = JSON.parse(ln);
@@ -2423,21 +2629,28 @@ var require_bases_generator = __commonJS({
               if (Array.isArray(obj.domain)) for (const d of obj.domain) domains.add(d);
               else domains.add(String(obj.domain));
             }
+            if (Array.isArray(obj.cornell_cue) && obj.cornell_cue.length) withCornell++;
+            if (obj.note_type) {
+              withLuhmann++;
+              if (noteTypes[obj.note_type] !== void 0) noteTypes[obj.note_type]++;
+            }
           } catch (e) {
           }
         }
         const generatedAt = (/* @__PURE__ */ new Date()).toISOString();
-        const stats = { count, withSummary, withConcepts, withDomain, domainList: [...domains].sort() };
+        const stats = { count, withSummary, withConcepts, withDomain, withCornell, withLuhmann, noteTypes, domainList: [...domains].sort() };
         const yaml = this._renderYaml(stats, generatedAt);
         await universal2.adapterWriteAtomic(this._adapter, outputPath, yaml);
         return { written: true, count, stats, path: outputPath };
       }
       _renderYaml(stats, generatedAt) {
+        const cornellStat = `cornell=${stats.withCornell}`;
+        const luhmannStat = `luhmann=${stats.withLuhmann}(f=${stats.noteTypes.fleeting}/l=${stats.noteTypes.literature}/p=${stats.noteTypes.permanent})`;
         return [
-          "# zeus-cards.base \u2014 auto-generated v1.7.1 (rich schema, codex audit)",
+          "# zeus-cards.base \u2014 auto-generated v1.8.0 (Cornell + Luhmann Zettelkasten)",
           "# DO NOT EDIT MANUALLY \u2014 regenerated on each passport rebuild.",
           `# generated_at: ${generatedAt}`,
-          `# stats: ${stats.count} passports \xB7 summary=${stats.withSummary} \xB7 concepts=${stats.withConcepts} \xB7 domain=${stats.withDomain}`,
+          `# stats: ${stats.count} passports \xB7 summary=${stats.withSummary} \xB7 concepts=${stats.withConcepts} \xB7 domain=${stats.withDomain} \xB7 ${cornellStat} \xB7 ${luhmannStat}`,
           `# domains: ${stats.domainList.slice(0, 10).join(", ")}${stats.domainList.length > 10 ? " \u2026" : ""}`,
           "#",
           "# Can\xF4nico: data/passports.jsonl. Bases \xE9 UI derivativa.",
@@ -2455,6 +2668,11 @@ var require_bases_generator = __commonJS({
           '  neighbor_count: "list(zeus_related).length"',
           '  graph_node_count: "list(zeus_graph_related).length"',
           '  domain_primary: "list(zeus_domain)[0]"',
+          '  has_cornell: "list(zeus_cornell_cue).length > 0"',
+          '  cue_count: "list(zeus_cornell_cue).length"',
+          '  is_permanent: "zeus_note_type == \\"permanent\\""',
+          '  is_literature: "zeus_note_type == \\"literature\\""',
+          '  is_fleeting: "zeus_note_type == \\"fleeting\\""',
           "",
           "properties:",
           "  file.path:",
@@ -2471,6 +2689,14 @@ var require_bases_generator = __commonJS({
           "    displayName: Semantic neighbors",
           "  zeus_graph_related:",
           "    displayName: Graph entities",
+          "  zeus_cornell_cue:",
+          "    displayName: Cornell Cues",
+          "  zeus_cornell_summary:",
+          "    displayName: Cornell Summary",
+          "  zeus_note_type:",
+          "    displayName: Note type (Luhmann)",
+          "  zeus_zettel_id:",
+          "    displayName: Zettel ID",
           "  formula.density_est:",
           "    displayName: Density ~tokens",
           "  formula.freshness_days:",
@@ -2479,6 +2705,8 @@ var require_bases_generator = __commonJS({
           '    displayName: "# neighbors"',
           "  formula.graph_node_count:",
           '    displayName: "# graph nodes"',
+          "  formula.cue_count:",
+          '    displayName: "# Cornell cues"',
           "",
           "views:",
           "  - type: table",
@@ -2488,6 +2716,7 @@ var require_bases_generator = __commonJS({
           "      - zeus_summary",
           "      - zeus_domain",
           "      - zeus_difficulty",
+          "      - zeus_note_type",
           "      - formula.neighbor_count",
           "      - formula.graph_node_count",
           "      - formula.density_est",
@@ -2541,6 +2770,63 @@ var require_bases_generator = __commonJS({
           "    sort:",
           "      - property: formula.freshness_days",
           "        direction: ASC",
+          "",
+          "  - type: table",
+          "    name: Zettelkasten \u2014 Permanent notes",
+          "    filters:",
+          "      and:",
+          '        - file.ext == "md"',
+          "        - formula.is_permanent == true",
+          "    order:",
+          "      - zeus_zettel_id",
+          "      - file.path",
+          "      - zeus_summary",
+          "      - zeus_concepts",
+          "      - formula.neighbor_count",
+          "    sort:",
+          "      - property: zeus_zettel_id",
+          "        direction: ASC",
+          "",
+          "  - type: cards",
+          "    name: Zettelkasten \u2014 Literature notes",
+          "    filters:",
+          "      and:",
+          '        - file.ext == "md"',
+          "        - formula.is_literature == true",
+          "    order:",
+          "      - file.path",
+          "      - zeus_summary",
+          "      - zeus_cornell_cue",
+          "      - formula.freshness_days",
+          "",
+          "  - type: table",
+          "    name: Zettelkasten \u2014 Fleeting notes (to process)",
+          "    filters:",
+          "      and:",
+          '        - file.ext == "md"',
+          "        - formula.is_fleeting == true",
+          "    order:",
+          "      - file.path",
+          "      - zeus_summary",
+          "      - formula.freshness_days",
+          "    sort:",
+          "      - property: formula.freshness_days",
+          "        direction: ASC",
+          "",
+          "  - type: table",
+          "    name: Cornell \u2014 Notas com cues",
+          "    filters:",
+          "      and:",
+          '        - file.ext == "md"',
+          "        - formula.has_cornell == true",
+          "    order:",
+          "      - file.path",
+          "      - zeus_cornell_summary",
+          "      - zeus_cornell_cue",
+          "      - formula.cue_count",
+          "    sort:",
+          "      - property: formula.cue_count",
+          "        direction: DESC",
           ""
         ].join("\n");
       }
@@ -7228,6 +7514,11 @@ var ZeusPassportFindModal = class extends obsidian.Modal {
           if (p.one_line_summary) {
             card.createEl("div", { cls: "zeus-passport-card-summary", text: p.one_line_summary });
           }
+          if (p.cornell_cue && p.cornell_cue.length) {
+            const cueEl = card.createEl("div", { cls: "zeus-passport-card-cornell" });
+            cueEl.createEl("span", { cls: "zeus-cornell-label", text: "cues: " });
+            cueEl.createEl("span", { text: p.cornell_cue.slice(0, 3).join(" \xB7 ") });
+          }
           const meta = card.createEl("div", { cls: "zeus-passport-card-meta" });
           if (p.concepts && p.concepts.length) {
             meta.createEl("span", { text: "concepts: " + p.concepts.slice(0, 6).join(", ") });
@@ -7237,6 +7528,9 @@ var ZeusPassportFindModal = class extends obsidian.Modal {
           }
           if (p.difficulty != null) {
             meta.createEl("span", { text: " | difficulty: " + p.difficulty });
+          }
+          if (p.note_type) {
+            meta.createEl("span", { text: " | " + p.note_type });
           }
         }
         if (!hits.length) {

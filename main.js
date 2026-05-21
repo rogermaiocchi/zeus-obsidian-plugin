@@ -109,20 +109,21 @@ var require_universal_fs = __commonJS({
     }
     function generateDeviceId() {
       const platform = detectPlatform();
-      let hint = "dev";
+      let rand = "";
       try {
-        if (nodeOs && typeof nodeOs.hostname === "function") {
-          hint = String(nodeOs.hostname()).replace(/[^a-z0-9-]/gi, "").slice(0, 12) || "dev";
-        } else if (typeof navigator !== "undefined") {
-          const ua = String(navigator.userAgent || "");
-          const m = ua.match(/(iPhone|iPad|iPod|Mac|Win|Linux|Android)[^\s;)]*/i);
-          if (m) hint = m[0].replace(/[^a-z0-9-]/gi, "").slice(0, 12);
+        if (nodeCrypto && typeof nodeCrypto.randomBytes === "function") {
+          rand = nodeCrypto.randomBytes(8).toString("hex");
+        } else if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+          const bytes = new Uint8Array(8);
+          crypto.getRandomValues(bytes);
+          rand = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
         }
       } catch (_) {
       }
-      const rand = Math.random().toString(36).slice(2, 8);
-      const ts = Date.now().toString(36).slice(-4);
-      return `${platform}-${hint}-${ts}-${rand}`;
+      if (!rand) {
+        rand = (Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)).slice(0, 16);
+      }
+      return `${platform}-${rand}`;
     }
     async function adapterRead(adapter, vaultRelPath) {
       return await adapter.read(vaultRelPath);

@@ -31,6 +31,9 @@ import AVFoundation
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
+#if canImport(Translation)
+import Translation
+#endif
 
 // Handlers HTTP do AegisHTTPServer. Roteia para:
 //   GET  /v1/health           → status + disponibilidade NL/Vision/FoundationModels
@@ -72,6 +75,17 @@ fileprivate final class SpotlightItemsBox: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return _items
     }
+}
+
+// v1.15.0 — Translation async bridge box (mesmo padrão @unchecked Sendable).
+fileprivate final class TranslationResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _text: String?
+    private var _error: Error?
+    func setResult(_ t: String) { lock.lock(); defer { lock.unlock() }; _text = t }
+    func setError(_ e: Error) { lock.lock(); defer { lock.unlock() }; _error = e }
+    func getText() -> String? { lock.lock(); defer { lock.unlock() }; return _text }
+    func getError() -> Error? { lock.lock(); defer { lock.unlock() }; return _error }
 }
 
 private final class OneShotFlagBox: @unchecked Sendable {
@@ -283,24 +297,25 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             return self.handleVisionClassify(bodyJSON: body)
         case (.POST, "/v1/vision/landmarks"):
             return self.handleVisionLandmarks(bodyJSON: body)
+        // v1.15.0 — endpoints implementados (antes unsupported)
         case (.POST, "/v1/translate"):
-            return self.handleUnsupportedEndpoint("/v1/translate", reason: "Apple Translation ainda não está portado no AegisDaemon standalone")
+            return self.handleTranslate(bodyJSON: body)
         case (.POST, "/v1/nl/tag"):
-            return self.handleUnsupportedEndpoint("/v1/nl/tag", reason: "NLTagger detalhado ainda não está portado no AegisDaemon standalone")
+            return self.handleNLTag(bodyJSON: body)
         case (.POST, "/v1/nl/sentiment"):
-            return self.handleUnsupportedEndpoint("/v1/nl/sentiment", reason: "NLTagger sentiment ainda não está portado no AegisDaemon standalone")
+            return self.handleNLSentiment(bodyJSON: body)
         case (.POST, "/v1/nl/language-detect"):
-            return self.handleUnsupportedEndpoint("/v1/nl/language-detect", reason: "NLLanguageRecognizer detalhado ainda não está portado no AegisDaemon standalone")
+            return self.handleNLLanguageDetect(bodyJSON: body)
         case (.POST, "/v1/vision/saliency"):
-            return self.handleUnsupportedEndpoint("/v1/vision/saliency", reason: "Vision saliency ainda não está portado no AegisDaemon standalone")
-        case (.POST, "/v1/vision/feature-print"):
-            return self.handleUnsupportedEndpoint("/v1/vision/feature-print", reason: "Vision feature-print ainda não está portado no AegisDaemon standalone")
-        case (.POST, "/v1/vision/aesthetics"):
-            return self.handleUnsupportedEndpoint("/v1/vision/aesthetics", reason: "Vision aesthetics ainda não está portado no AegisDaemon standalone")
+            return self.handleVisionSaliency(bodyJSON: body)
         case (.POST, "/v1/vision/barcode"):
-            return self.handleUnsupportedEndpoint("/v1/vision/barcode", reason: "Vision barcode ainda não está portado no AegisDaemon standalone")
+            return self.handleVisionBarcode(bodyJSON: body)
         case (.POST, "/v1/vision/document"):
-            return self.handleUnsupportedEndpoint("/v1/vision/document", reason: "Vision document layout ainda não está portado no AegisDaemon standalone")
+            return self.handleVisionDocument(bodyJSON: body)
+        case (.POST, "/v1/vision/feature-print"):
+            return self.handleUnsupportedEndpoint("/v1/vision/feature-print", reason: "Vision feature-print pendente (v1.16 — requer VNFeaturePrintObservation custom pipeline)")
+        case (.POST, "/v1/vision/aesthetics"):
+            return self.handleUnsupportedEndpoint("/v1/vision/aesthetics", reason: "Vision aesthetics pendente (v1.16 — VNCalculateImageAestheticsScoresRequest iOS 17+)")
         case (.POST, "/v1/data-detect"):
             return self.handleUnsupportedEndpoint("/v1/data-detect", reason: "NSDataDetector ainda não está portado no AegisDaemon standalone")
         case (.POST, "/v1/spotlight/search"):
@@ -472,10 +487,14 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             "vision_available": visionAvailable,
             "speech_available": speechAvailable,
             "model": modelName,
-            "version": "1.4.0",
+            "version": "1.15.0",
             "platform": platform,
             "endpoints": endpoints,
-            "endpoint_count": endpoints.count
+            "endpoint_count": endpoints.count,
+            "translate_available": {
+                if #available(iOS 17.4, macOS 14.4, *) { return true }
+                return false
+            }()
         ]
     }
 
@@ -1159,7 +1178,7 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         var score = 1
         let charCount = text.count
 
-        if charCount >= 500 { score += 0 } else { return 1 }
+        if charCount >= 500 { score = max(1, score) } else { return 1 }
         if charCount >= 800 { score += 1 }
 
         if text.contains("```") { score += 1 }
@@ -1513,7 +1532,8 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 if overlap.isEmpty { continue }
             } else {
                 let queryTokens = Set(query.lowercased().split(separator: " ").map(String.init))
-                overlap = concepts.filter { queryTokens.contains($0.lowercased()) || conceptsLower.contains($0.lowercased()) && queryTokens.contains($0.lowercased()) }
+                // v1.15.0 fix: segundo && era redundante (conceptsLower ⊇ concepts.lowercased).
+                overlap = concepts.filter { queryTokens.contains($0.lowercased()) }
             }
 
             let boostedScore = cand.cosine * (1.0 + 0.2 * Float(overlap.count))
@@ -2323,6 +2343,370 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         #else
         return Response(status: .serviceUnavailable, payload: [
             "error": "FoundationModels framework não disponível neste build (compilar em iOS 26+ SDK)"
+        ])
+        #endif
+    }
+
+    // MARK: - v1.15.0 Novos handlers (antes unsupported)
+
+    // MARK: /v1/translate (Translation framework — iOS 17.4+, macOS 14.4+)
+    private func handleTranslate(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"target\": \"pt\"}"
+            ])
+        }
+        let targetLang = (json["target"] as? String) ?? "pt"
+        let sourceLang = json["source"] as? String  // nil = auto-detect
+
+        #if canImport(Translation)
+        guard #available(iOS 17.4, macOS 14.4, *) else {
+            return Response(status: .serviceUnavailable, payload: [
+                "error": "Translation requer iOS 17.4+ ou macOS 14.4+",
+                "min_ios": "17.4",
+                "min_macos": "14.4"
+            ])
+        }
+
+        // Semaphore sync bridge — mesmo padrão de ASP/Spotlight (Thread.detachNewThread já no caller).
+        let sem = DispatchSemaphore(value: 0)
+        let resultBox = TranslationResultBox()
+
+        Task {
+            do {
+                let targetLocale = Locale.Language(identifier: targetLang)
+                let sourceLocale = sourceLang.map { Locale.Language(identifier: $0) }
+                let config = TranslationSession.Configuration(
+                    source: sourceLocale,
+                    target: targetLocale
+                )
+                let session = TranslationSession(configuration: config)
+                let response = try await session.translate(text)
+                resultBox.setResult(response.targetText)
+            } catch {
+                resultBox.setError(error)
+            }
+            sem.signal()
+        }
+
+        let waitResult = sem.wait(timeout: .now() + .seconds(30))
+        if waitResult == .timedOut {
+            return Response(status: .requestTimeout, payload: [
+                "error": "Translation timeout (30s)"
+            ])
+        }
+        if let err = resultBox.getError() {
+            return Response(status: .internalServerError, payload: [
+                "error": "Translation falhou: \(err.localizedDescription)"
+            ])
+        }
+        return Response(status: .ok, payload: [
+            "translated_text": resultBox.getText() ?? "",
+            "source_language": sourceLang ?? "auto",
+            "target_language": targetLang,
+            "model": "apple-translation",
+            "framework": "Translation"
+        ])
+        #else
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "Translation framework não disponível neste build (compile com iOS 17.4+ SDK)"
+        ])
+        #endif
+    }
+
+    // MARK: /v1/nl/tag (NLTagger — iOS 13+)
+    private func handleNLTag(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\", \"schemes\": [\"nameType\",\"lexicalClass\",\"lemma\"]}"
+            ])
+        }
+        let requestedSchemes = (json["schemes"] as? [String]) ?? ["nameType", "lexicalClass", "lemma"]
+        let lang = (json["language"] as? String) ?? "pt"
+
+        var nlSchemes: [NLTagScheme] = []
+        for s in requestedSchemes {
+            switch s {
+            case "nameType":    nlSchemes.append(.nameType)
+            case "lexicalClass": nlSchemes.append(.lexicalClass)
+            case "lemma":       nlSchemes.append(.lemma)
+            case "language":    nlSchemes.append(.language)
+            default: break
+            }
+        }
+        if nlSchemes.isEmpty { nlSchemes = [.nameType, .lexicalClass] }
+
+        let tagger = NLTagger(tagSchemes: nlSchemes)
+        tagger.string = text
+        if let nlLang = NLLanguage(rawValue: lang) {
+            tagger.setLanguage(nlLang, range: text.startIndex..<text.endIndex)
+        }
+
+        var tokens: [[String: Any]] = []
+        tagger.enumerateTags(
+            in: text.startIndex..<text.endIndex,
+            unit: .word,
+            scheme: nlSchemes.first ?? .lexicalClass,
+            options: [.omitWhitespace, .omitPunctuation]
+        ) { tag, tokenRange in
+            var entry: [String: Any] = [
+                "token": String(text[tokenRange]),
+                "range_start": text.distance(from: text.startIndex, to: tokenRange.lowerBound),
+                "range_end": text.distance(from: text.startIndex, to: tokenRange.upperBound),
+            ]
+            if let t = tag { entry["tag"] = t.rawValue }
+            // Coleta todas as schemes solicitadas
+            for scheme in nlSchemes {
+                let (schemeTag, _) = tagger.tag(at: tokenRange.lowerBound, unit: .word, scheme: scheme)
+                if let st = schemeTag {
+                    entry[scheme.rawValue] = st.rawValue
+                }
+            }
+            tokens.append(entry)
+            return true
+        }
+
+        return Response(status: .ok, payload: [
+            "tokens": tokens,
+            "count": tokens.count,
+            "language": lang,
+            "schemes": requestedSchemes,
+            "model": "NLTagger"
+        ])
+    }
+
+    // MARK: /v1/nl/sentiment (NLTagger sentimentScore — iOS 13+)
+    private func handleNLSentiment(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\"}"
+            ])
+        }
+        let lang = (json["language"] as? String) ?? "pt"
+
+        let tagger = NLTagger(tagSchemes: [.sentimentScore])
+        tagger.string = text
+        if let nlLang = NLLanguage(rawValue: lang) {
+            tagger.setLanguage(nlLang, range: text.startIndex..<text.endIndex)
+        }
+
+        let (sentimentTag, _) = tagger.tag(at: text.startIndex, unit: .paragraph, scheme: .sentimentScore)
+        let score = sentimentTag.flatMap { Double($0.rawValue) } ?? 0.0
+        let label: String
+        if score > 0.1 { label = "positive" }
+        else if score < -0.1 { label = "negative" }
+        else { label = "neutral" }
+
+        return Response(status: .ok, payload: [
+            "score": score,
+            "label": label,
+            "language": lang,
+            "model": "NLTagger sentimentScore"
+        ])
+    }
+
+    // MARK: /v1/nl/language-detect (NLLanguageRecognizer — iOS 13+)
+    private func handleNLLanguageDetect(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let text = json["text"] as? String, !text.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"text\": \"...\"}"
+            ])
+        }
+        let maxHypotheses = (json["max_hypotheses"] as? Int) ?? 5
+
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+
+        let dominant = recognizer.dominantLanguage?.rawValue ?? "und"
+        let hypotheses = recognizer.languageHypotheses(withMaximum: maxHypotheses)
+        let hypothesisList: [[String: Any]] = hypotheses
+            .sorted { $0.value > $1.value }
+            .map { lang, confidence in
+                ["language": lang.rawValue, "confidence": Double(confidence)]
+            }
+
+        return Response(status: .ok, payload: [
+            "dominant_language": dominant,
+            "hypotheses": hypothesisList,
+            "model": "NLLanguageRecognizer"
+        ])
+    }
+
+    // MARK: /v1/vision/saliency (VNGenerateAttentionBasedSaliencyImageRequest — iOS 13+)
+    private func handleVisionSaliency(bodyJSON: String) -> Response {
+        #if !canImport(Vision)
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "Vision framework indisponível neste build"
+        ])
+        #else
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"...\"}"
+            ])
+        }
+
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        guard let data = try? Data(contentsOf: url),
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            return Response(status: .badRequest, payload: [
+                "error": "não foi possível ler/decodificar imagem em \(path)"
+            ])
+        }
+
+        let request = VNGenerateAttentionBasedSaliencyImageRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return Response(status: .internalServerError, payload: [
+                "error": "Vision saliency falhou: \(error.localizedDescription)"
+            ])
+        }
+
+        var salientRegions: [[String: Any]] = []
+        if let obs = request.results?.first as? VNSaliencyImageObservation {
+            if let salientObjects = obs.salientObjects {
+                salientRegions = salientObjects.map { obj in
+                    [
+                        "confidence": Float(obj.confidence),
+                        "bounding_box": [
+                            "x": Float(obj.boundingBox.origin.x),
+                            "y": Float(obj.boundingBox.origin.y),
+                            "width": Float(obj.boundingBox.size.width),
+                            "height": Float(obj.boundingBox.size.height),
+                        ]
+                    ]
+                }
+            }
+        }
+
+        return Response(status: .ok, payload: [
+            "salient_regions": salientRegions,
+            "count": salientRegions.count,
+            "path": path,
+            "model": "VNGenerateAttentionBasedSaliencyImageRequest"
+        ])
+        #endif
+    }
+
+    // MARK: /v1/vision/barcode (VNDetectBarcodesRequest — iOS 13+)
+    private func handleVisionBarcode(bodyJSON: String) -> Response {
+        #if !canImport(Vision)
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "Vision framework indisponível neste build"
+        ])
+        #else
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"...\"}"
+            ])
+        }
+
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        guard let data = try? Data(contentsOf: url),
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            return Response(status: .badRequest, payload: [
+                "error": "não foi possível ler/decodificar imagem em \(path)"
+            ])
+        }
+
+        let request = VNDetectBarcodesRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return Response(status: .internalServerError, payload: [
+                "error": "Vision barcode falhou: \(error.localizedDescription)"
+            ])
+        }
+
+        let barcodes: [[String: Any]] = (request.results ?? []).map { obs in
+            [
+                "payload": obs.payloadStringValue ?? "",
+                "symbology": obs.symbology.rawValue,
+                "confidence": Float(obs.confidence),
+                "bounding_box": [
+                    "x": Float(obs.boundingBox.origin.x),
+                    "y": Float(obs.boundingBox.origin.y),
+                    "width": Float(obs.boundingBox.size.width),
+                    "height": Float(obs.boundingBox.size.height),
+                ]
+            ]
+        }
+
+        return Response(status: .ok, payload: [
+            "barcodes": barcodes,
+            "count": barcodes.count,
+            "path": path,
+            "model": "VNDetectBarcodesRequest"
+        ])
+        #endif
+    }
+
+    // MARK: /v1/vision/document (VNDetectDocumentSegmentationRequest — iOS 15+)
+    private func handleVisionDocument(bodyJSON: String) -> Response {
+        #if !canImport(Vision)
+        return Response(status: .serviceUnavailable, payload: [
+            "error": "Vision framework indisponível neste build"
+        ])
+        #else
+        guard let json = Self.parseJSON(bodyJSON),
+              let path = json["path"] as? String, !path.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"path\": \"...\"}"
+            ])
+        }
+
+        guard #available(iOS 15.0, macOS 12.0, *) else {
+            return Response(status: .serviceUnavailable, payload: [
+                "error": "VNDetectDocumentSegmentationRequest requer iOS 15+ / macOS 12+"
+            ])
+        }
+
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        guard let data = try? Data(contentsOf: url),
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            return Response(status: .badRequest, payload: [
+                "error": "não foi possível ler/decodificar imagem em \(path)"
+            ])
+        }
+
+        let request = VNDetectDocumentSegmentationRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return Response(status: .internalServerError, payload: [
+                "error": "Vision document segmentation falhou: \(error.localizedDescription)"
+            ])
+        }
+
+        let segments: [[String: Any]] = (request.results ?? []).map { obs in
+            [
+                "confidence": Float(obs.confidence),
+                "bounding_box": [
+                    "x": Float(obs.boundingBox.origin.x),
+                    "y": Float(obs.boundingBox.origin.y),
+                    "width": Float(obs.boundingBox.size.width),
+                    "height": Float(obs.boundingBox.size.height),
+                ]
+            ]
+        }
+
+        return Response(status: .ok, payload: [
+            "document_segments": segments,
+            "count": segments.count,
+            "path": path,
+            "model": "VNDetectDocumentSegmentationRequest"
         ])
         #endif
     }

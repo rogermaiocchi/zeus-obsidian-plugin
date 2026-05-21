@@ -8,13 +8,16 @@ import FoundationModels
 /// Bootstrap do MLX Apple-Twin no daemon iOS. Chamar uma vez no startup
 /// do AegisDaemon, idealmente em `AegisDaemon.start()` (antes do listen()).
 ///
+/// v1.15.0 — Motor migrado de Gemma 4 E2B/E4B para Qwen 2.5 3B-Instruct 4-bit.
+/// Um único modelo para todos os devices (iPhone + iPad), ~1.8 GB int4.
+/// Vantagens: melhor PT-BR, RAM menor no iPad, JSON determinístico.
+///
 /// Política:
 ///   • Se FoundationModels estiver `.available` → não wire-a o twin (Apple
 ///     Intelligence cobre). Twin fica nil → cadeia de fallback em
 ///     AegisHTTPHandlers usa direto o FM.
-///   • Se FM indisponível → escolhe E2B (iPhone) ou E4B (iPad) baseado em
-///     `UIDevice.current.userInterfaceIdiom` e RAM disponível.
-///   • Pesos são On-Demand Resource (ODR) com tag "gemma-twin". Se ainda
+///   • Se FM indisponível → carrega Qwen 2.5 3B-Instruct 4-bit (único modelo).
+///   • Pesos são On-Demand Resource (ODR) com tag "qwen-twin". Se ainda
 ///     não baixaram, dispara o download e mantém o twin como nil até estar pronto.
 
 public enum MLXAppleTwinBootstrap {
@@ -30,35 +33,26 @@ public enum MLXAppleTwinBootstrap {
         }
         #endif
 
-        // 2) Escolhe variante baseada no device idiom + RAM
-        //
-        // Fase 2 parity (v1.0.0-fase2-parity): em iPad é OBRIGATÓRIO usar E4B
-        // mesmo em modelos com 6GB. As tarefas pesadas (graph_extract + agent Q&A
-        // com contexto recuperado) saturam E2B; E4B suporta com folga.
-        // iPhone fica em E2B (8GB+) ou E2B-Q3 (6GB legado).
-        let idiom = currentIdiom()
-        let totalRAM = ProcessInfo.processInfo.physicalMemory // bytes
+        // 2) Qwen 2.5 3B-Instruct 4-bit — único modelo para todos os devices.
+        // v1.15.0: elimina a divisão E2B/E4B (Gemma). O Qwen 3B cabe em
+        // qualquer iPhone A14+ ou iPad com 4 GB+ de RAM livre (~1.8 GB int4).
+        // RAM check: avisa se <3.5 GB livre mas ainda tenta (dispositivos iOS
+        // gerenciam memória dinamicamente — o OS pagina agressivamente).
+        let totalRAM = ProcessInfo.processInfo.physicalMemory
         let ramGB = Double(totalRAM) / 1_073_741_824.0
-
-        // Fase A v1.0.0: usa pesos STOCK do Gemma 4 + few-shot prompting.
-        // O nome de resource segue o esquema gemma-twin-vX.Y onde X.Y é a versão
-        // do PACK (não do app). v1.0 = stock; v1.1+ = adapters fundidos pela Fase B.
-        // O bootstrap tenta sempre a versão mais recente disponível em cache ODR.
-        let twinVersion = currentTwinVersion()  // ex.: "v1.0" (stock) ou "v1.2" (Fase B)
-        let resourceName: String
-        if idiom == "pad" {
-            // iPad SEMPRE recebe E4B — paridade total Mac↔iOS exige capacidade.
-            resourceName = "gemma-4-e4b-it-q4-mlx-\(twinVersion)"
-        } else if ramGB >= 7.5 {
-            resourceName = "gemma-4-e2b-it-q4-mlx-\(twinVersion)"      // iPhone 15 Pro+/16/17 (8GB+)
-        } else {
-            resourceName = "gemma-4-e2b-it-q3-mlx-low-\(twinVersion)"  // iPhone 6GB legado
+        if ramGB < 3.5 {
+            NSLog("[AppleTwin] AVISO: dispositivo com \(String(format: "%.1f", ramGB)) GB RAM — Qwen 3B pode ser paginado pelo OS.")
         }
-        NSLog("[AppleTwin] device=\(idiom) ramGB=\(ramGB) twinVersion=\(twinVersion) → variante=\(resourceName)")
+
+        // Nome do resource segue esquema qwen-twin-vX.Y onde X.Y é a versão
+        // do pack (v1.0 = stock Qwen 2.5-3B-Instruct + few-shot Fase A;
+        //          v1.1+ = adapters LoRA PT-BR da Fase B, distribuídos via ODR).
+        let twinVersion = currentTwinVersion()
+        let resourceName = "zeus-qwen2.5-3b-instruct-4bit-\(twinVersion)"
+        NSLog("[AppleTwin] ramGB=\(String(format: "%.1f", ramGB)) twinVersion=\(twinVersion) → variante=\(resourceName)")
 
         // 3) Pede On-Demand Resource (cancela se já em cache)
-        //    Tag inclui versão para que Fase B publique novos packs sem rebuild.
-        let odrTag = "gemma-twin-\(twinVersion)"
+        let odrTag = "qwen-twin-\(twinVersion)"
         requestODR(tag: odrTag) { result in
             switch result {
             case .failure(let err):
@@ -70,7 +64,7 @@ public enum MLXAppleTwinBootstrap {
                     return
                 }
                 #if canImport(MLXLLM)
-                let runner = MLXGemmaTwinRunner(
+                let runner = MLXQwenRunner(
                     modelURL: modelURL,
                     systemPrompt: AppleTwinSystemPrompt.canonical
                 )
@@ -98,23 +92,6 @@ public enum MLXAppleTwinBootstrap {
             }
         }
         return "v1.0"
-    }
-
-    private static func currentIdiom() -> String {
-        #if canImport(UIKit)
-        // Indireto via runtime para não exigir import UIKit no daemon target.
-        if let cls = NSClassFromString("UIDevice"),
-           let inst = (cls as? NSObject.Type)?.value(forKey: "currentDevice") as? NSObject {
-            let raw = inst.value(forKey: "userInterfaceIdiom") as? Int ?? -1
-            // 0 = phone, 1 = pad, 2 = tv, 5 = mac
-            switch raw {
-            case 0: return "phone"
-            case 1: return "pad"
-            default: return "other"
-            }
-        }
-        #endif
-        return "phone"
     }
 
     private static func requestODR(tag: String, completion: @escaping (Result<URL, Error>) -> Void) {

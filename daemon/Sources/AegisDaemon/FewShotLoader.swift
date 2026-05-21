@@ -176,4 +176,23 @@ public enum FewShotLoader {
         }
         return out
     }
+
+    /// Renderiza os exemplos no template ChatML (Qwen 2.5-Instruct).
+    /// Usado pelo MLXQwenRunner em substituição ao renderTurns() do Gemma.
+    public static func renderTurnsQwen(_ task: FewShotTask) -> String {
+        guard let pack = load(task) else { return "" }
+        var out = ""
+        for ex in pack.examples.prefix(5) {
+            var userPayload = ex.input.rendered
+            if let inst = ex.instructions {
+                userPayload = "[instruções: \(inst)]\n\(userPayload)"
+            }
+            if let style = ex.style {
+                userPayload = "[style: \(style)]\n\(userPayload)"
+            }
+            out += "<|im_start|>user\n\(userPayload)<|im_end|>\n"
+            out += "<|im_start|>assistant\n\(ex.output.rendered)<|im_end|>\n"
+        }
+        return out
+    }
 }

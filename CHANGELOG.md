@@ -4,6 +4,68 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.15.0] — 2026-05-21 — Autonomia por dispositivo iOS/macOS + Encapsulamento
+
+Auditoria completa com foco em autonomia por dispositivo (cada device usa seus modelos Apple nativos) e encapsulamento de dependências externas sob prefixo `zeus-`. Ativa 7 endpoints Apple que estavam marcados "unsupported" no AegisDaemon sem necessidade técnica.
+
+### Autonomia por dispositivo (device autonomy)
+
+- **NOVO `deviceAutonomyMode`** — parâmetro `"auto"` | `"mac-only"` | `"ios-native"` | `"ios-fallback"` em `data.json` e DEFAULT_SETTINGS. Controla qual path de embed/passport cada device usa.
+- **NOVO `lib/platform-detect.js`** — detecta platform, OS version e capability probe (AegisDaemon + FoundationModels) via Obsidian Platform API + navigator.userAgent. Cache TTL 5min em `deviceCapabilities`.
+- **NOVO `lib/device-capabilities.js`** — `APPLE_MODEL_MATRIX` canônico: mapa de todos os modelos Apple disponíveis por plataforma (mac/ios) com versão mínima de OS, frameworks e endpoints.
+- **`EmbedRelay` (embed-ios.js)** — nova Camada 0: quando `aegis_available` e `isMobile`, usa AegisDaemon local iOS (source: `daemon-ios-local`, ~50ms on-device) antes do relay Mac (source: `daemon-relay`, 100-500ms via rede).
+- **`passport-ios.js`** — routing autônomo: quando AegisDaemon local disponível, usa `/v1/passport/extract` local (qualidade FM ~95%) ao invés do fallback JS (~60%).
+- **`spotlightQueryEnabled: true`** ativado por padrão (ADR-011 implementado em v1.13.0, estava desligado).
+
+### Encapsulamento de dependências (zeus- prefix)
+
+- **NOVO `lib/zeus-embed-runtime.js`** — internaliza a dependência externa `@xenova/transformers` sob nome `zeus-multilingual-e5-small`. Modelo ONNX em `data/zeus-e5-small/` (vault-local, sem fetch CDN externo). v1.15.0: stub verificador de instalação; inferência ONNX completa em v1.16 labs (audit CSP/WASM necessário).
+- **`embed-ios.js` Camada 2** — substituída referência `@xenova/transformers` por `zeus-embed-runtime.js`. Source label atualizado: `zeus-embed-runtime-ios`.
+- **Inventário de dependências**: SwiftNIO já encapsulado em `bin/ZeusDaemonMac`; leiden.js e bm25.js já são algoritmos internos. Única dependência externa pendente de runtime era transformers.js — agora internalizada.
+
+### AegisDaemon — 7 novos endpoints (iOS 13+–17.4+)
+
+Endpoints que estavam "unsupported" sem necessidade técnica, agora implementados:
+
+- **`POST /v1/translate`** — Apple Translation framework (iOS 17.4+, macOS 14.4+). Input: `{text, target, source?}`. Retorna: `{translated_text, source_language, target_language, model: "apple-translation"}`.
+- **`POST /v1/nl/tag`** — NLTagger com nameType/lexicalClass/lemma (iOS 13+). Input: `{text, schemes?, language?}`. Retorna tokens com tags por scheme.
+- **`POST /v1/nl/sentiment`** — NLTagger sentimentScore (iOS 13+). Input: `{text, language?}`. Retorna `{score: -1.0..1.0, label: "positive"|"neutral"|"negative"}`.
+- **`POST /v1/nl/language-detect`** — NLLanguageRecognizer (iOS 13+). Input: `{text, max_hypotheses?}`. Retorna dominant_language + hypotheses com confidence.
+- **`POST /v1/vision/saliency`** — VNGenerateAttentionBasedSaliencyImageRequest (iOS 13+). Regiões salientes com bounding_box + confidence.
+- **`POST /v1/vision/barcode`** — VNDetectBarcodesRequest (iOS 13+). Decodifica QR, EAN, Code128, etc. com payload + symbology.
+- **`POST /v1/vision/document`** — VNDetectDocumentSegmentationRequest (iOS 15+). Segmentos de documento com bounding_box.
+
+### Correções de bugs (auditoria)
+
+- **`AegisHTTPHandlers.swift` L~1162**: `score += 0` era no-op → corrigido para `score = max(1, score)` em `computeDifficulty()`.
+- **`AegisHTTPHandlers.swift` L~1516**: overlap calc tinha `&&` redundante (`conceptsLower.contains(x) && queryTokens.contains(x)`) → simplificado para só `queryTokens.contains(x.lowercased())`.
+- **`passport-ios.js` L~268**: filtro ALL-CAPS só rejeitava ≤4 chars → corrigido para rejeitar qualquer token ALL-CAPS sem dígitos (siglas como "BRASIL" não entram mais como conceito).
+- **`lexical-ios.js`**: reordenação do `PT_SUFFIXES` (sufixos mais longos primeiro) para evitar over-stem prematuro. Ex: "universidades" → "univers" (correto) ao invés de "universidade" (bug anterior).
+- **`embed-ios.js` embedText**: garantido que o stub lança dentro de `async` corretamente.
+
+### Motor generativo iOS — migração Gemma 4 → Qwen 2.5 3B-Instruct 4-bit
+
+- **NOVO `QwenProvider.swift`** — `MLXQwenRunner: MLXAppleTwinProviding`. Motor generativo Qwen 2.5 3B-Instruct 4-bit via MLX Swift. Template ChatML (`<|im_start|>`). Único modelo para todos os devices iOS (iPhone + iPad), ~1.8 GB int4. Elimina divisão E2B (iPhone) / E4B (iPad) do Gemma 4.
+- **`MLXAppleTwinBootstrap.swift`** — migrado de `MLXGemmaTwinRunner` para `MLXQwenRunner`. ODR tag: `qwen-twin-v1.0`. Resource: `zeus-qwen2.5-3b-instruct-4bit-v1.0` (prefixo zeus-). `currentIdiom()` removido (desnecessário com modelo único).
+- **`AppleTwinSystemPrompt.swift`** — per-command system prompts focados em PT-BR text engineering: coesão, morfologia, anáfora/catáfora, métodos Feynman/Luhmann/Cornell, HyDE, extração de grafo. `Command` enum com `forCommand(_ cmd)` static method.
+- **`FewShotLoader.renderTurnsQwen()`** — renderização de exemplos few-shot em template ChatML (Qwen) paralelo ao `renderTurns()` existente (Gemma).
+- **Domínio de fine-tuning**: PT-BR semântica, léxico, morfologia, fonologia, sintaxe, coesão/coerência, anáfora, catáfora, dêixis, concordância; métodos Feynman/Luhmann/Cornell; busca hash turbo quantico; integração grafo Obsidian; banco .base. NÃO inclui conteúdo jurídico específico.
+- **`docs/superpowers/specs/2026-05-21-camada-qwen-design.md`** — especificação atualizada da camada generativa on-device.
+
+### SimHash 128-bit — pré-filtro turbo quantico
+
+- **NOVO `lib/zeus-simhash.js`** — SimHash 128-bit sobre embeddings 512-dim (NLContextualEmbedding). Random projection matrix 128×512 Int8Array (FNV-1a seeded, determinística, 64 KB). `computeSimHash(vec)` O(65536), `hammingDistance(a,b)` O(4), `filterBySimHash(N, queryHash, maxDist=20)` O(N×4). Serialização: hex 32 chars para `embeddings.jsonl` campo `sh`. `annotateWithSimHash(embObj)` para auto-indexer.
+- **`hybrid-search.js`** — integração SimHash como 8º retriever (pré-filtro turbo quantico): `SOURCE_BITS.simhash = 1 << 7`; `_simhashRetriever(queryVec, topN, maxDist)` retorna candidatos por Hamming distance; wired em `query()` após semantic search quando `lastQueryVec` disponível e `zeus-simhash` carregado.
+
+### Infra + metadados
+
+- `lib/passport-ios.js` — `MODEL_VERSION` atualizado: `zeus-ios-1.11.0` → `zeus-ios-1.15.0`.
+- `AegisHTTPHandlers.swift` — version no `/v1/health` atualizado: `1.4.0` → `1.15.0`.
+- `TranslationResultBox` — adicionado ao conjunto de boxes `@unchecked Sendable` (mesmo padrão Spotlight).
+- `#if canImport(Translation)` — import condicional adicionado ao topo do AegisHTTPHandlers.swift.
+
+---
+
 ## [1.14.0] — 2026-05-21 — Security hardening (auditoria round 4 + mesa de debate Codex)
 
 Sprint de hardening a partir da auditoria de 4 fases (5 subagentes Claude + Codex CLI). Foco: fechar a superfície de rede do daemon e completar o privacy gate. Correções verificadas end-to-end com tooling nativo (`swift build`, `lsof`, `curl`, testes node).

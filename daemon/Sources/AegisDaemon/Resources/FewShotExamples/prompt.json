@@ -1,19 +1,19 @@
 {
   "task": "prompt",
-  "captured_from": "curated (estilo apple-foundationmodels)",
-  "captured_at": "2026-05-16",
+  "captured_from": "zeus-codex-neural-core-v1.15.1",
+  "captured_at": "2026-05-21",
   "examples": [
     {
-      "input": "Liste em três bullets os pilares do método Feynman aplicado a estudo de direito.",
-      "output": "- Identificar a tese e explicá-la em linguagem leiga, sem jargão.\n- Detectar lacunas no entendimento ao tentar a explicação, retornando aos textos quando necessário.\n- Simplificar e analogizar até que a explicação caiba em uma frase, validando o domínio do conceito."
+      "input": "Explique anáfora e catáfora em linguística textual PT-BR com exemplos.",
+      "output": "Anáfora e catáfora são mecanismos de coesão referencial que articulam elementos textuais por meio de remissão entre referentes. A anáfora opera retrospectivamente: um termo remete a um referente já introduzido no texto. Em 'Maria chegou ao seminário. Ela apresentou sua pesquisa', o pronome 'ela' retoma anaforicamente 'Maria', mantendo a cadeia referencial sem repetição lexical. A catáfora opera prospectivamente: um termo antecipa um referente que será introduzido na sequência. Em 'Isto resume tudo: o conhecimento exige método', o demonstrativo 'isto' aponta catafóricamente para a proposição subsequente. Ambos os recursos são essenciais para a progressão temática do texto e para a economia expressiva do PT-BR; seu uso inadequado produz ambiguidade referencial ou quebra de coesão."
     },
     {
-      "input": "Diferencie obrigação de fazer e obrigação de dar em uma frase.",
-      "output": "Obrigação de fazer impõe ao devedor uma conduta positiva ou negativa específica; obrigação de dar impõe a entrega de coisa certa ou incerta ao credor."
+      "input": "Descreva o método Feynman de aprendizado como técnica de compressão de conhecimento.",
+      "output": "O método Feynman é uma técnica de compressão cognitiva que opera em quatro etapas recursivas. Na primeira, o aprendiz seleciona um conceito e tenta explicá-lo por escrito em linguagem simples, como se estivesse ensinando a alguém sem conhecimento prévio da área. Na segunda, identifica lacunas e imprecisões na própria explicação — os pontos onde a linguagem técnica serviu de muleta sem compreensão real. Na terceira, retorna às fontes primárias para preencher essas lacunas. Na quarta, reescreve a explicação com maior economia e clareza, eliminando jargões desnecessários e substituindo-os por analogias precisas. O resultado é uma nota de alta densidade informacional: cada palavra carrega carga semântica máxima porque passou pelo filtro da reelaboração ativa. No contexto de um vault Obsidian, notas Feynman funcionam como nós de alta conectividade, pois articulam conceitos complexos em linguagem que facilita tanto a recuperação mnemônica quanto o link semântico com outras notas."
     },
     {
-      "input": "Explique em três linhas o conceito de embedding semântico.",
-      "output": "Embedding semântico é a representação vetorial de um texto em um espaço de alta dimensão, no qual a proximidade geométrica entre vetores reflete similaridade de significado. Modelos como NLContextualEmbedding produzem esses vetores aplicando redes neurais treinadas em grandes corpora. A técnica fundamenta busca semântica, classificação e recuperação para RAG."
+      "input": "Explique o padrão turbo quantico de busca: SHA-256 exact + SimHash pre-filtro + cosine exato.",
+      "output": "O padrão turbo quantico de busca implementa uma cascata de três estágios de filtragem progressiva para maximizar precisão e minimizar custo computacional. No primeiro estágio, um hash SHA-256 do texto da consulta é comparado contra uma tabela de hashes pré-computados do vault: qualquer nota com hash idêntico é retornada imediatamente como correspondência exata, sem necessidade de cálculo vetorial. No segundo estágio, o SimHash — uma técnica de locality-sensitive hashing (LSH) — gera uma assinatura binária compacta de 64 bits para a consulta e compara-a, via distância de Hamming, contra as assinaturas pré-computadas de todas as notas; apenas aquelas com distância abaixo de um limiar (pré-filtro) avançam para o próximo estágio. No terceiro e mais custoso estágio, os embeddings densos das notas pré-filtradas são comparados com o embedding da consulta via similaridade cossenoidal exata, produzindo o ranking final de relevância. A cascata reduz drasticamente o número de operações de produto escalar em espaços de alta dimensão: em vaults com milhares de notas, o SimHash elimina tipicamente 90–95% dos candidatos antes do cálculo cossenoidal, tornando o pipeline viável para execução on-device em tempo real."
     }
   ]
 }

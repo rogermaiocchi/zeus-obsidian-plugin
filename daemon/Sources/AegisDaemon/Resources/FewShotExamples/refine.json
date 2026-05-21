@@ -1,22 +1,22 @@
 {
   "task": "refine",
-  "captured_from": "curated (estilo apple-foundationmodels)",
-  "captured_at": "2026-05-16",
+  "captured_from": "zeus-codex-neural-core-v1.15.1",
+  "captured_at": "2026-05-21",
   "examples": [
     {
-      "input": "Cara, tá faltando documento no processo, manda logo aí.",
-      "instructions": "Reescreva em tom institucional, mantendo o sentido.",
-      "output": "Identificamos a ausência de documento essencial nos autos. Solicito o envio com brevidade para regularização."
+      "input": "Os alunos fizeram uma análise bastante detalhados sobre os morfemas derivacionais presentes nos textos escolhidos, e todos ficaram satisfeitos com os resultados obtidos nas pesquisas.",
+      "instructions": "Corrija a concordância nominal e mantenha o registro formal.",
+      "output": "Os alunos fizeram uma análise bastante detalhada sobre os morfemas derivacionais presentes nos textos escolhidos, e todos ficaram satisfeitos com os resultados obtidos nas pesquisas."
     },
     {
-      "input": "Excelentissimo julgador, o autor vem requerer a presente acao tendo em vista os documentos acostados e por isso pede vossa excelencia que defira o pedido.",
-      "instructions": "Corrija ortografia e melhore clareza.",
-      "output": "Excelentíssimo Julgador, o autor requer a presente ação com base nos documentos acostados aos autos e pede o deferimento do pedido."
+      "input": "O pesquisador preferiu assistir o documentário completo antes de redigir a resenha, pois queria namorar com os dados empíricos antes de propor qualquer conclusão.",
+      "instructions": "Corrija a regência verbal dos dois verbos sublinhados e ajuste o registro acadêmico.",
+      "output": "O pesquisador preferiu assistir ao documentário completo antes de redigir a resenha, pois queria namorar os dados empíricos antes de propor qualquer conclusão."
     },
     {
-      "input": "preciso q vc me manda a procuracao ate amanha cedo se nao vai dar ruim no protocolo",
-      "instructions": "Reescreva em tom profissional para mensagem ao cliente.",
-      "output": "Solicito o envio da procuração até amanhã pela manhã. Sem ela, não conseguiremos efetuar o protocolo dentro do prazo."
+      "input": "A dêixis espacial, que os linguistas estudam há décadas, ela pode ser entendida como o conjunto de expressões cujo significado depende do contexto de enunciação, o que torna difícil a sua análise fora de situações reais de uso.",
+      "instructions": "Elimine a ambiguidade da oração subordinada, remova o pronome pleonástico e reestruture o período para maior clareza sintática.",
+      "output": "A dêixis espacial — estudada por linguistas há décadas — compreende o conjunto de expressões cujo significado depende do contexto de enunciação, o que torna sua análise inadequada fora de situações reais de uso."
     }
   ]
 }

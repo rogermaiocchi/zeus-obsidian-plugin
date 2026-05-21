@@ -1,50 +1,112 @@
 {
   "task": "graph_extract",
-  "captured_from": "curated (estilo apple-foundationmodels)",
-  "captured_at": "2026-05-16",
+  "captured_from": "zeus-codex-neural-core-v1.15.1",
+  "captured_at": "2026-05-21",
   "examples": [
     {
       "input": {
-        "text": "A Lei nº 13.954/2019 alterou substancialmente o regime previdenciário dos militares federais. O Supremo Tribunal Federal, no Tema 1.150, firmou tese sobre a constitucionalidade da contribuição. O TJDFT passou a sobrestar feitos análogos.",
-        "domain": "juridico"
+        "text": "O pipeline de NLP clássico percorre as etapas de tokenização, análise morfológica, análise sintática e análise semântica em sequência. A tokenização segmenta o texto em unidades mínimas (tokens). A morfologia analisa a estrutura interna dos tokens: radical, afixos derivacionais e flexionais. A sintaxe examina as relações de dependência entre tokens na oração. A semântica, por fim, interpreta o significado composicional das estruturas identificadas nas etapas anteriores.",
+        "domain": "linguistica"
       },
       "output": {
         "entities": [
-          {"id": "lei_13954_2019", "type": "Lei", "name": "Lei nº 13.954/2019"},
-          {"id": "regime_prev_militar", "type": "Conceito", "name": "Regime previdenciário dos militares federais"},
-          {"id": "stf", "type": "Org", "name": "Supremo Tribunal Federal"},
-          {"id": "tema_1150", "type": "Doc", "name": "Tema 1.150 do STF"},
-          {"id": "tjdft", "type": "Org", "name": "TJDFT"}
+          {"id": "pipeline_nlp", "type": "Conceito", "name": "Pipeline de NLP"},
+          {"id": "tokenizacao", "type": "Conceito", "name": "Tokenização"},
+          {"id": "morfologia", "type": "Conceito", "name": "Análise morfológica"},
+          {"id": "sintaxe", "type": "Conceito", "name": "Análise sintática"},
+          {"id": "semantica", "type": "Conceito", "name": "Análise semântica"},
+          {"id": "token", "type": "Conceito", "name": "Token"},
+          {"id": "dependencia_sintatica", "type": "Conceito", "name": "Relação de dependência"}
         ],
         "relations": [
-          {"subject": "lei_13954_2019", "predicate": "altera", "object": "regime_prev_militar"},
-          {"subject": "stf", "predicate": "firma_tese", "object": "tema_1150"},
-          {"subject": "tema_1150", "predicate": "trata_de", "object": "lei_13954_2019"},
-          {"subject": "tjdft", "predicate": "sobresta_feitos_aguardando", "object": "tema_1150"}
+          {"subject": "pipeline_nlp", "predicate": "inclui_etapa", "object": "tokenizacao"},
+          {"subject": "pipeline_nlp", "predicate": "inclui_etapa", "object": "morfologia"},
+          {"subject": "pipeline_nlp", "predicate": "inclui_etapa", "object": "sintaxe"},
+          {"subject": "pipeline_nlp", "predicate": "inclui_etapa", "object": "semantica"},
+          {"subject": "tokenizacao", "predicate": "produz", "object": "token"},
+          {"subject": "morfologia", "predicate": "analisa_estrutura_de", "object": "token"},
+          {"subject": "sintaxe", "predicate": "examina", "object": "dependencia_sintatica"},
+          {"subject": "semantica", "predicate": "interpreta_resultado_de", "object": "sintaxe"}
         ],
-        "domain": "juridico"
+        "triples": [
+          ["pipeline_nlp", "inclui_etapa", "tokenizacao"],
+          ["pipeline_nlp", "inclui_etapa", "morfologia"],
+          ["pipeline_nlp", "inclui_etapa", "sintaxe"],
+          ["pipeline_nlp", "inclui_etapa", "semantica"],
+          ["tokenizacao", "produz", "token"],
+          ["morfologia", "analisa_estrutura_de", "token"],
+          ["sintaxe", "examina", "dependencia_sintatica"],
+          ["semantica", "interpreta_resultado_de", "sintaxe"]
+        ],
+        "domain": "linguistica"
       }
     },
     {
       "input": {
-        "text": "O AegisDaemon é um serviço Swift que roda em iOS e macOS expondo endpoints HTTP em 127.0.0.1:2223. Em iOS, embarca o MLX Swift carregando o Gemma 4 fine-tunado. O MetassistemaApp orquestra o AegisDaemon.",
+        "text": "Um grafo de conhecimento representa o domínio como um conjunto de entidades ligadas por relações tipadas, formalizando o conhecimento como triplas sujeito-predicado-objeto. As entidades podem ser conceitos, instâncias ou literais. As relações são predicados que expressam como as entidades se conectam semanticamente. As triplas são a unidade mínima de asserção do grafo. A inferência sobre o grafo permite derivar relações implícitas a partir das relações explicitamente declaradas.",
+        "domain": "linguistica"
+      },
+      "output": {
+        "entities": [
+          {"id": "grafo_conhecimento", "type": "Conceito", "name": "Grafo de conhecimento"},
+          {"id": "entidade", "type": "Conceito", "name": "Entidade"},
+          {"id": "relacao_tipada", "type": "Conceito", "name": "Relação tipada"},
+          {"id": "tripla", "type": "Conceito", "name": "Tripla sujeito-predicado-objeto"},
+          {"id": "inferencia", "type": "Conceito", "name": "Inferência"},
+          {"id": "predicado", "type": "Conceito", "name": "Predicado semântico"}
+        ],
+        "relations": [
+          {"subject": "grafo_conhecimento", "predicate": "composto_de", "object": "entidade"},
+          {"subject": "grafo_conhecimento", "predicate": "composto_de", "object": "relacao_tipada"},
+          {"subject": "tripla", "predicate": "unidade_minima_de", "object": "grafo_conhecimento"},
+          {"subject": "relacao_tipada", "predicate": "expressa_por", "object": "predicado"},
+          {"subject": "inferencia", "predicate": "opera_sobre", "object": "grafo_conhecimento"},
+          {"subject": "inferencia", "predicate": "deriva", "object": "relacao_tipada"}
+        ],
+        "triples": [
+          ["grafo_conhecimento", "composto_de", "entidade"],
+          ["grafo_conhecimento", "composto_de", "relacao_tipada"],
+          ["tripla", "unidade_minima_de", "grafo_conhecimento"],
+          ["relacao_tipada", "expressa_por", "predicado"],
+          ["inferencia", "opera_sobre", "grafo_conhecimento"],
+          ["inferencia", "deriva", "relacao_tipada"]
+        ],
+        "domain": "linguistica"
+      }
+    },
+    {
+      "input": {
+        "text": "O pipeline de busca do Zeus combina embeddings semânticos gerados pela NLContextualEmbedding com BM25 esparso para recuperação léxica. Na fase de re-ranking, os escores dos dois sistemas são fundidos via Reciprocal Rank Fusion (RRF), que pondera os rankings sem depender de calibração de escores absolutos. O pré-filtro SimHash reduz o espaço de candidatos antes do cálculo cossenoidal exato, tornando o pipeline viável on-device. O re-ranking estrutural adiciona um bônus de relevância a notas adjacentes no grafo do vault.",
         "domain": "tech"
       },
       "output": {
         "entities": [
-          {"id": "aegis_daemon", "type": "Doc", "name": "AegisDaemon"},
-          {"id": "mlx_swift", "type": "Conceito", "name": "MLX Swift"},
-          {"id": "gemma_4", "type": "Doc", "name": "Gemma 4"},
-          {"id": "metassistema_app", "type": "Doc", "name": "MetassistemaApp"},
-          {"id": "ios", "type": "Conceito", "name": "iOS"},
-          {"id": "macos", "type": "Conceito", "name": "macOS"}
+          {"id": "pipeline_zeus", "type": "Conceito", "name": "Pipeline de busca Zeus"},
+          {"id": "nlcontextualembedding", "type": "Doc", "name": "NLContextualEmbedding"},
+          {"id": "bm25", "type": "Conceito", "name": "BM25"},
+          {"id": "rrf", "type": "Conceito", "name": "Reciprocal Rank Fusion (RRF)"},
+          {"id": "simhash", "type": "Conceito", "name": "SimHash"},
+          {"id": "similaridade_cossenoidal", "type": "Conceito", "name": "Similaridade cossenoidal"},
+          {"id": "reranking_estrutural", "type": "Conceito", "name": "Re-ranking estrutural"},
+          {"id": "grafo_vault", "type": "Conceito", "name": "Grafo do vault Obsidian"}
         ],
         "relations": [
-          {"subject": "aegis_daemon", "predicate": "roda_em", "object": "ios"},
-          {"subject": "aegis_daemon", "predicate": "roda_em", "object": "macos"},
-          {"subject": "aegis_daemon", "predicate": "embarca", "object": "mlx_swift"},
-          {"subject": "mlx_swift", "predicate": "carrega", "object": "gemma_4"},
-          {"subject": "metassistema_app", "predicate": "orquestra", "object": "aegis_daemon"}
+          {"subject": "pipeline_zeus", "predicate": "usa", "object": "nlcontextualembedding"},
+          {"subject": "pipeline_zeus", "predicate": "usa", "object": "bm25"},
+          {"subject": "pipeline_zeus", "predicate": "funde_rankings_via", "object": "rrf"},
+          {"subject": "simhash", "predicate": "pre_filtra_candidatos_para", "object": "similaridade_cossenoidal"},
+          {"subject": "reranking_estrutural", "predicate": "usa", "object": "grafo_vault"},
+          {"subject": "rrf", "predicate": "pondera", "object": "nlcontextualembedding"},
+          {"subject": "rrf", "predicate": "pondera", "object": "bm25"}
+        ],
+        "triples": [
+          ["pipeline_zeus", "usa", "nlcontextualembedding"],
+          ["pipeline_zeus", "usa", "bm25"],
+          ["pipeline_zeus", "funde_rankings_via", "rrf"],
+          ["simhash", "pre_filtra_candidatos_para", "similaridade_cossenoidal"],
+          ["reranking_estrutural", "usa", "grafo_vault"],
+          ["rrf", "pondera", "nlcontextualembedding"],
+          ["rrf", "pondera", "bm25"]
         ],
         "domain": "tech"
       }

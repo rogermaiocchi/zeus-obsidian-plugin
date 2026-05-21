@@ -90,13 +90,37 @@ public final class MLXQwenRunner: MLXAppleTwinProviding, @unchecked Sendable {
         }
     }
 
+    // MARK: - API genérica (compatível com runFoundationModel do handler)
+
+    /// Interface genérica para o fallback MLX no AegisHTTPHandlers.
+    /// Mapeia task name → few-shot + system prompt correto, assim o handler
+    /// não precisa conhecer a estrutura interna do Qwen.
+    public func runGeneric(
+        instructions: String,
+        prompt: String,
+        maxTokens: Int,
+        task: String,
+        inlineExamples: [(input: String, output: String)] = []
+    ) -> Result<String, Error> {
+        let fewShotTask = FewShotTask(rawValue: task)
+        let sysOverride = AppleTwinSystemPrompt.forCommandNamed(task) ?? instructions
+        return runQwen(
+            prompt,
+            systemOverride: sysOverride,
+            maxTokens: maxTokens,
+            fewShotTask: fewShotTask,
+            inlineExamples: inlineExamples.isEmpty ? nil : inlineExamples
+        )
+    }
+
     // MARK: - Inferência ChatML
 
     private func runQwen(
         _ userTurn: String,
         systemOverride: String? = nil,
         maxTokens: Int,
-        fewShotTask: FewShotTask? = nil
+        fewShotTask: FewShotTask? = nil,
+        inlineExamples: [(input: String, output: String)]? = nil
     ) -> Result<String, Error> {
         if ProcessInfo.processInfo.thermalState == .critical {
             return .failure(MLXAppleTwinError.thermalCritical)
@@ -110,7 +134,15 @@ public final class MLXQwenRunner: MLXAppleTwinProviding, @unchecked Sendable {
         if b.maxTokens == 0 { return .failure(MLXAppleTwinError.thermalCritical) }
 
         let sys = systemOverride ?? systemPrompt
-        let fewShot = fewShotTask != nil ? FewShotLoader.renderTurnsQwen(fewShotTask!) : ""
+
+        // Few-shot: bundle (tarefa canônica) + vault-local inline (vault-specific, maior prioridade).
+        // Ordem: bundle pares → inline pares → turno do usuário.
+        // Inline exemplos vêm do FewShotCache.js (aprendizado contínuo on-device).
+        let bundleFewShot = fewShotTask != nil ? FewShotLoader.renderTurnsQwen(fewShotTask!) : ""
+        let inlineFewShot: String = (inlineExamples ?? []).prefix(3).map { ex in
+            "<|im_start|>user\n\(ex.input)<|im_end|>\n<|im_start|>assistant\n\(ex.output)<|im_end|>\n"
+        }.joined()
+        let fewShot = bundleFewShot + inlineFewShot
 
         // Template ChatML — Qwen 2.5-Instruct padrão.
         let prompt = """
@@ -169,34 +201,62 @@ public final class MLXQwenRunner: MLXAppleTwinProviding, @unchecked Sendable {
         return .success(obj)
     }
 
-    // MARK: - MLXAppleTwinProviding (7 funções)
+    // MARK: - MLXAppleTwinProviding (7 funções — protocolo base, sem inline examples)
 
     public func prompt(instruction: String, maxTokens: Int, deterministic: Bool) -> Result<String, Error> {
         return runQwen(instruction, maxTokens: maxTokens, fewShotTask: .prompt)
     }
 
     public func summarize(text: String, maxTokens: Int) -> Result<String, Error> {
+        return summarize(text: text, maxTokens: maxTokens, inlineExamples: [])
+    }
+
+    public func refine(text: String, instructions: String?, maxTokens: Int) -> Result<String, Error> {
+        return refine(text: text, instructions: instructions, maxTokens: maxTokens, inlineExamples: [])
+    }
+
+    public func enrich(noteContent: String, notePath: String?) -> Result<[String: Any], Error> {
+        return enrich(noteContent: noteContent, notePath: notePath, inlineExamples: [])
+    }
+
+    public func hyde(query: String, style: String, maxTokens: Int) -> Result<String, Error> {
+        return hyde(query: query, style: style, maxTokens: maxTokens, inlineExamples: [])
+    }
+
+    public func agentQuery(question: String, context: [String], pattern: String) -> Result<String, Error> {
+        return agentQuery(question: question, context: context, pattern: pattern, inlineExamples: [])
+    }
+
+    public func graphExtract(text: String, domain: String) -> Result<[String: Any], Error> {
+        return graphExtract(text: text, domain: domain, inlineExamples: [])
+    }
+
+    // MARK: - Variantes com inline examples (aprendizado contínuo on-device)
+
+    public func summarize(text: String, maxTokens: Int, inlineExamples: [(input: String, output: String)]) -> Result<String, Error> {
         let userTurn = "Sumarize o texto a seguir em prosa contínua, fiel ao original, no mesmo idioma:\n\n\(text)"
         return runQwen(
             userTurn,
             systemOverride: AppleTwinSystemPrompt.forCommand(.summarize),
             maxTokens: maxTokens,
-            fewShotTask: .summarize
+            fewShotTask: .summarize,
+            inlineExamples: inlineExamples.isEmpty ? nil : inlineExamples
         )
     }
 
-    public func refine(text: String, instructions: String?, maxTokens: Int) -> Result<String, Error> {
+    public func refine(text: String, instructions: String?, maxTokens: Int, inlineExamples: [(input: String, output: String)]) -> Result<String, Error> {
         let directive = instructions ?? "Reescreva mantendo o sentido, melhore clareza, gramática e fluidez. Mantenha o idioma."
         let userTurn = "[instruções: \(directive)]\n\(text)"
         return runQwen(
             userTurn,
             systemOverride: AppleTwinSystemPrompt.forCommand(.refine),
             maxTokens: maxTokens,
-            fewShotTask: .refine
+            fewShotTask: .refine,
+            inlineExamples: inlineExamples.isEmpty ? nil : inlineExamples
         )
     }
 
-    public func enrich(noteContent: String, notePath: String?) -> Result<[String: Any], Error> {
+    public func enrich(noteContent: String, notePath: String?, inlineExamples: [(input: String, output: String)]) -> Result<[String: Any], Error> {
         let userTurn = """
         Analise a nota a seguir e devolva APENAS um JSON estrito (sem fences, sem comentários) com:
           suggested_links: [{title, path, reason}]
@@ -210,24 +270,26 @@ public final class MLXQwenRunner: MLXAppleTwinProviding, @unchecked Sendable {
             userTurn,
             systemOverride: AppleTwinSystemPrompt.forCommand(.enrich),
             maxTokens: 600,
-            fewShotTask: .enrich
+            fewShotTask: .enrich,
+            inlineExamples: inlineExamples.isEmpty ? nil : inlineExamples
         ) {
         case .failure(let e): return .failure(e)
         case .success(let raw): return parseJSONObject(raw, taskTag: "enrich")
         }
     }
 
-    public func hyde(query: String, style: String, maxTokens: Int) -> Result<String, Error> {
+    public func hyde(query: String, style: String, maxTokens: Int, inlineExamples: [(input: String, output: String)]) -> Result<String, Error> {
         let userTurn = "[style: \(style)]\n\(query)"
         return runQwen(
             userTurn,
             systemOverride: AppleTwinSystemPrompt.forCommand(.hyde),
             maxTokens: maxTokens,
-            fewShotTask: .hyde
+            fewShotTask: .hyde,
+            inlineExamples: inlineExamples.isEmpty ? nil : inlineExamples
         )
     }
 
-    public func agentQuery(question: String, context: [String], pattern: String) -> Result<String, Error> {
+    public func agentQuery(question: String, context: [String], pattern: String, inlineExamples: [(input: String, output: String)]) -> Result<String, Error> {
         var blob: [String: Any] = ["question": question, "pattern": pattern]
         if !context.isEmpty { blob["context"] = context }
         let json = (try? JSONSerialization.data(withJSONObject: blob, options: [.prettyPrinted]))
@@ -236,11 +298,12 @@ public final class MLXQwenRunner: MLXAppleTwinProviding, @unchecked Sendable {
             json,
             systemOverride: AppleTwinSystemPrompt.forCommand(.agent_query),
             maxTokens: 700,
-            fewShotTask: .agent_query
+            fewShotTask: .agent_query,
+            inlineExamples: inlineExamples.isEmpty ? nil : inlineExamples
         )
     }
 
-    public func graphExtract(text: String, domain: String) -> Result<[String: Any], Error> {
+    public func graphExtract(text: String, domain: String, inlineExamples: [(input: String, output: String)]) -> Result<[String: Any], Error> {
         let blob: [String: Any] = ["text": text, "domain": domain]
         let json = (try? JSONSerialization.data(withJSONObject: blob, options: [.prettyPrinted]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? text
@@ -248,7 +311,8 @@ public final class MLXQwenRunner: MLXAppleTwinProviding, @unchecked Sendable {
             json,
             systemOverride: AppleTwinSystemPrompt.forCommand(.graph_extract),
             maxTokens: 700,
-            fewShotTask: .graph_extract
+            fewShotTask: .graph_extract,
+            inlineExamples: inlineExamples.isEmpty ? nil : inlineExamples
         ) {
         case .failure(let e): return .failure(e)
         case .success(let raw): return parseJSONObject(raw, taskTag: "graph_extract")

@@ -46,8 +46,7 @@ public enum AppleTwinSystemPrompt {
 
     /// Retorna o system prompt especializado para cada comando.
     /// Usado pelo QwenRunner para passar per-task context ao modelo.
-    public static func forCommand(_ cmd: Command) -> String {
-        switch cmd {
+    public static func forCommand(_ cmd: Command) -> String {        switch cmd {
 
         case .summarize:
             // Feynman compression: one_line_summary fiel ao original.
@@ -140,6 +139,21 @@ public enum AppleTwinSystemPrompt {
             Devolva APENAS JSON estrito: \
             {entities:[{name,type,wikilink}], relations:[{from,to,type,why}], triples:[{s,r,o}]}
             """
+        }
+    }
+
+    /// Converte nome de tarefa (string do extraPayload) para o system prompt correspondente.
+    /// Usado pelo fallback MLX em `runFoundationModel()` para injetar contexto PT-BR correto.
+    public static func forCommandNamed(_ name: String) -> String? {
+        switch name {
+        case "summarize":    return forCommand(.summarize)
+        case "refine":       return forCommand(.refine)
+        case "enrich":       return forCommand(.enrich)
+        case "prompt":       return forCommand(.prompt)
+        case "hyde":         return forCommand(.hyde)
+        case "agent_query":  return forCommand(.agent_query)
+        case "graph_extract": return forCommand(.graph_extract)
+        default: return nil
         }
     }
 }

@@ -2978,6 +2978,7 @@ class ZeusPlugin extends Plugin {
       console.log('[zeus] generated per-device deviceId (localStorage):', _localDeviceId);
     }
     // settings.deviceId fica em memória apenas — overrides do coordinator com o per-device.
+    const _persistedDeviceId = this.settings.deviceId;  // v1.14 — valor vindo do data.json (pode ser legado)
     this.settings.deviceId = _localDeviceId;
     this.coordinator.deviceId = _localDeviceId;
 
@@ -2991,10 +2992,13 @@ class ZeusPlugin extends Plugin {
         console.warn('[zeus] auto-indexer start failed:', e.message);
       }
     }
-    // IMPORTANTE: nunca persistir deviceId no data.json. Se já estiver lá (legado), limpar.
-    if (_localDeviceId) {
-      // Forçar deviceId vazio no que será salvo via loadData/saveSettings
-      // Não chamamos saveSettings() aqui — settings.deviceId fica só em runtime.
+    // v1.14 — codex #6 / S8 Check 3: flush de deviceId legado. Se o data.json
+    // sincronizado (iCloud) ainda tinha deviceId persistido, regrava SEM ele
+    // (saveSettings já filtra deviceId via destructuring). Guard evita write
+    // em todo boot: só flusha quando havia valor stale no disco.
+    if (_persistedDeviceId) {
+      console.log('[zeus] flush deviceId legado do data.json sincronizado');
+      try { await this.saveSettings(); } catch (e) { console.warn('[zeus] flush deviceId falhou:', e.message); }
     }
     // v0.10.0 — Background scheduler for stale-passport detection + claim-coordinated re-extract
     this.scheduler = new PassportScheduler(this, {

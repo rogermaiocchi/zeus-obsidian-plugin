@@ -24,8 +24,11 @@ import Darwin
 // MARK: - Argument parsing
 
 struct ZeusArgs {
-    // Default 0.0.0.0 para aceitar conexões Tailscale (cross-device)
-    var host: String = "0.0.0.0"
+    // v1.14 — default loopback-only (codex CRIT #1). Bind seguro por padrão:
+    // o LaunchAgent/auto-spawn já passam --host 127.0.0.1. Para cross-device via
+    // Tailscale, exigir --host 0.0.0.0 EXPLÍCITO + ZEUS_DAEMON_TOKEN no ambiente
+    // (o handler recusa requisições não-loopback sem token — ver isAuthorized).
+    var host: String = "127.0.0.1"
     var port: Int = 2223
     var vaultPath: String? = nil
 

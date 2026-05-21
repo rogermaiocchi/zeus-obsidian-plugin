@@ -168,6 +168,32 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         self.vaultURL = vaultURL
     }
 
+    // MARK: - Auth (v1.14 — codex CRIT #2/#3)
+    // Loopback é confiável (on-device-first). Requisições não-loopback exigem
+    // X-Zeus-Token igual a env ZEUS_DAEMON_TOKEN. Fail-closed: sem token
+    // configurado, todo peer remoto é recusado mesmo se bound em 0.0.0.0.
+    static func isLoopback(_ addr: SocketAddress?) -> Bool {
+        guard let ip = addr?.ipAddress else { return false }
+        return ip == "127.0.0.1" || ip == "::1" || ip == "::ffff:127.0.0.1"
+    }
+
+    static func isAuthorized(remote: SocketAddress?, head: HTTPRequestHead) -> Bool {
+        if isLoopback(remote) { return true }
+        guard let token = ProcessInfo.processInfo.environment["ZEUS_DAEMON_TOKEN"],
+              !token.isEmpty else { return false }
+        guard let provided = head.headers.first(name: "X-Zeus-Token")
+                ?? head.headers.first(name: "x-zeus-token") else { return false }
+        return constantTimeEquals(provided, token)
+    }
+
+    static func constantTimeEquals(_ a: String, _ b: String) -> Bool {
+        let ab = Array(a.utf8), bb = Array(b.utf8)
+        if ab.count != bb.count { return false }
+        var diff: UInt8 = 0
+        for i in 0..<ab.count { diff |= ab[i] ^ bb[i] }
+        return diff == 0
+    }
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         switch self.unwrapInboundIn(data) {
         case .head(let head):
@@ -208,6 +234,14 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             headers.add(name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS")
             headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type")
             self.writeRaw(context: context, status: .noContent, headers: headers, body: nil)
+            return
+        }
+
+        // v1.14 — Auth gate (codex CRIT #2/#3). /v1/health aberto para discovery;
+        // todo o resto (incl. /v1/cmd) exige loopback OU X-Zeus-Token válido.
+        if path != "/v1/health" && !Self.isAuthorized(remote: context.remoteAddress, head: head) {
+            self.writeJSON(context: context, status: .unauthorized,
+                           dict: ["error": "unauthorized: non-loopback request requires valid X-Zeus-Token"])
             return
         }
 
@@ -1611,11 +1645,20 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
 
     // MARK: - Claude CLI (não-interativo via --print)
 
-    private func runClaudeCLI(args: [String]) -> String {
-        let claudeBin = "/Users/maiocchi/.local/bin/claude"
+    // v1.14 — resolve claude bin sem path pessoal hardcoded (codex MED #9).
+    static func resolveClaudeBin() -> String? {
+        let fm = FileManager.default
+        if let env = ProcessInfo.processInfo.environment["ZEUS_CLAUDE_BIN"],
+           !env.isEmpty, fm.isExecutableFile(atPath: env) { return env }
+        let home = NSHomeDirectory()
+        let candidates = ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        for c in candidates where fm.isExecutableFile(atPath: c) { return c }
+        return nil
+    }
 
-        guard FileManager.default.fileExists(atPath: claudeBin) else {
-            return "Claude CLI não encontrado em \(claudeBin)"
+    private func runClaudeCLI(args: [String]) -> String {
+        guard let claudeBin = Self.resolveClaudeBin() else {
+            return "Claude CLI não encontrado (defina ZEUS_CLAUDE_BIN ou instale em ~/.local/bin, /opt/homebrew/bin ou /usr/local/bin)"
         }
 
         // Bloqueia flags interativas ou perigosas

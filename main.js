@@ -991,8 +991,10 @@ var require_zeus_http_client = __commonJS({
         return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(this.baseUrl || "");
       }
       _isPrivatePath(path2, payload = {}) {
-        if (!path2 || typeof path2 !== "string") return false;
-        if (/^Clientes\//i.test(path2.replace(/^\/+/, ""))) return true;
+        if (typeof path2 === "string" && path2) {
+          if (/^Clientes\//i.test(path2.replace(/^\/+/, ""))) return true;
+          if (/(^|\/)Clientes\//i.test(path2)) return true;
+        }
         if (payload && payload.privacy && /sigiloso/i.test(String(payload.privacy))) return true;
         return false;
       }
@@ -1085,7 +1087,10 @@ var require_zeus_http_client = __commonJS({
         }
         throw new Error("Nenhum transporte HTTP dispon\xEDvel (sem obsidian.requestUrl, sem fetch)");
       }
-      async _post(endpoint, body, timeoutMs = 6e4) {
+      async _post(endpoint, body, timeoutMs = 6e4, privacyCtx = null) {
+        const privacyPath = privacyCtx && (privacyCtx._privacyPath || privacyCtx.privacyPath) || (body && typeof body === "object" ? body.path || body.note_path || body.notePath || body.image_path || null : null);
+        const privacyTag = privacyCtx && privacyCtx.privacy || (body && typeof body === "object" ? body.privacy : null);
+        this._assertRawContentAllowed(endpoint, { _privacyPath: privacyPath, privacy: privacyTag });
         const ctrl = new (typeof AbortController !== "undefined" ? AbortController : class {
           constructor() {
             this.signal = null;
@@ -1128,8 +1133,12 @@ var require_zeus_http_client = __commonJS({
       // High-level API mirroring afm CLI subcommands
       async embed(text, options = {}) {
         const { _privacyPath, privacyPath, privacy, ...wireOptions } = options || {};
-        this._assertRawContentAllowed("/v1/embed", { _privacyPath, privacyPath, privacy });
-        return await this._post("/v1/embed", { text, ...wireOptions });
+        return await this._post(
+          "/v1/embed",
+          { text, ...wireOptions },
+          6e4,
+          { _privacyPath: _privacyPath || privacyPath, privacy }
+        );
       }
       // v1.3.0 — afm refine (Writing Tools nativo)
       // mode: "proofread|rewrite|simplify"; tone para rewrite: "academic|professional|casual"
@@ -1154,10 +1163,12 @@ var require_zeus_http_client = __commonJS({
         if (!Array.isArray(texts)) {
           throw new Error("embedBatch: requer array de strings");
         }
+        const { _privacyPath, privacyPath, privacy, ...wireOptions } = options || {};
+        const privacyCtx = { _privacyPath: _privacyPath || privacyPath, privacy };
         const vectors = [];
         let dim = 0, model = "";
         for (const t of texts) {
-          const r = await this._post("/v1/embed", { text: t, ...options }, 3e4);
+          const r = await this._post("/v1/embed", { text: t, ...wireOptions }, 3e4, privacyCtx);
           const v = r.vectors && r.vectors[0] || r.vector;
           if (!Array.isArray(v)) throw new Error('embedBatch: daemon n\xE3o retornou vetor para "' + (t || "").slice(0, 40) + '..."');
           vectors.push(v);
@@ -7843,6 +7854,7 @@ var ZeusPlugin = class extends Plugin {
         }
         console.log("[zeus] generated per-device deviceId (localStorage):", _localDeviceId);
       }
+      const _persistedDeviceId = this.settings.deviceId;
       this.settings.deviceId = _localDeviceId;
       this.coordinator.deviceId = _localDeviceId;
       this.autoIndexer = new AutoIndexer(this);
@@ -7854,7 +7866,13 @@ var ZeusPlugin = class extends Plugin {
           console.warn("[zeus] auto-indexer start failed:", e.message);
         }
       }
-      if (_localDeviceId) {
+      if (_persistedDeviceId) {
+        console.log("[zeus] flush deviceId legado do data.json sincronizado");
+        try {
+          await this.saveSettings();
+        } catch (e) {
+          console.warn("[zeus] flush deviceId falhou:", e.message);
+        }
       }
       this.scheduler = new PassportScheduler(this, {
         intervalMs: this.settings.schedulerIntervalMs || 15 * 60 * 1e3

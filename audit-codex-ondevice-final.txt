@@ -1,0 +1,2505 @@
+2026-05-21T15:56:24.332323Z ERROR codex_core::session: failed to load skill /Users/rogermaiocchi/dev/Apple-notes/SKILL.md: invalid description: exceeds maximum length of 1024 characters
+2026-05-21T15:56:24.332639Z ERROR codex_core::session: failed to load skill /Users/rogermaiocchi/dotfiles/shared/skills/lead-conversao/SKILL.md: invalid YAML: mapping values are not allowed in this context at line 2 column 277
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019e4b40-9590-7390-8744-fe6c3cb53186
+--------
+user
+Confirmação final (read-only): o Roger quer arquitetura ON-DEVICE pura, sem relay. Eu
+removi a superfície de relay que você apontou (EmbedRelay/embedRelay, iosEmbedRelayEnabled,
+mesh peers, token de auth no client, textos Tailscale, validação loopback de zeusDaemonUrl).
+Verifique LENDO O CÓDIGO se sobrou QUALQUER superfície de relay/remoto executável ou
+enganosa em main.source.js, lib/zeus-http-client.js, lib/embed-ios.js. Confirme:
+1. Nenhuma referência executável a EmbedRelay/embedRelay/_zeusGetMeshPeers/token/allowRemote.
+2. discoverDaemonUrl só usa loopback; zeusDaemonUrl não-loopback é rejeitado/ignorado.
+3. embed-ios.js LocalDaemonEmbed só fala com daemon local (loopback); source 'daemon-local'.
+4. iOS degrada gracioso (sem daemon → lanes JS), macOS auto-spawna o daemon local.
+Diga FECHADO se está on-device puro, ou liste o que sobrou (file:line). Conciso.
+
+codex
+Vou verificar só leitura nos três arquivos indicados, focando nas superfícies de relay/remoto e no fluxo daemon local/iOS/macOS. Usarei as skills de contexto e graphify apenas no mínimo necessário para orientar a inspeção.
+exec
+/bin/zsh -lc "sed -n '1,220p' /Users/rogermaiocchi/dotfiles/shared/skills/context-orchestrator/SKILL.md" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+---
+name: context-orchestrator
+description: >
+  Use at the START of every session to minimize context window usage.
+  Analyzes the user's task, selects a context profile, and loads ONLY relevant
+  memory files and tool schemas. Trigger: /orchestrate or automatically when
+  the first user message arrives. Use when context overflow occurs, when
+  starting a new task, or when "prompt is too long" errors appear.
+---
+
+# Context Orchestrator v2
+
+Orquestrador de contexto baseado em retrieval seletivo por tags, decay scoring,
+attention sinks, e retrieval progressivo (SwiftMem + MemGPT + A-MEM + MemoryBank +
+StreamingLLM + Stanford Generative Agents + ByteRover + ITR + WISE).
+
+---
+
+## Protocolo de Boot (executar na primeira mensagem)
+
+### Passo 1 — Classificar a tarefa
+
+Ler a primeira mensagem do usuario e classificar em um ou mais perfis:
+
+| Perfil | Palavras-chave de match | Tags MEMORY.md |
+|--------|------------------------|----------------|
+| `juridico` | processo, caso, cliente, CNJ, OAB, peticao, audiencia, prazo | `#juridico` |
+| `vault` | vault, obsidian, nota, pasta, template, frontmatter, diario, governanca | `#vault #governanca` |
+| `bot` | capivara, whatsapp, webhook, evolution, piper, tts, telefone | `#bot` |
+| `infra` | vps, docker, container, deploy, gcp, nginx, traefik, ssh, servidor | `#infraestrutura` |
+| `rag` | embedding, semantica, neo4j, colbert, ner, busca, indexacao | `#rag` |
+| `codigo` | bug, feature, refactor, teste, api, endpoint, funcao, modulo | (nenhuma memoria especifica) |
+| `geral` | (nenhum match acima) | somente Core |
+
+### Passo 2 — Retrieval com Decay Scoring (Tsinghua MemoryBank + Stanford)
+
+Abrir `MEMORY.md` (ja esta no contexto). Filtrar por tags do perfil detectado.
+Ranquear usando formula composta:
+
+```
+score = (0.4 * tag_relevance) + (0.3 * imp/5) + (0.3 * recency_score)
+
+Onde:
+  tag_relevance = 1.0 se tag faz match direto, 0.5 se tag pai faz match
+  imp = campo imp: do MEMORY.md (1-5), normalizado para 0-1
+  recency_score = max(0, 1 - dias_desde_modified/90)
+    → arquivo acessado hoje = 1.0
+    → arquivo de 30 dias atras = 0.67
+    → arquivo de 90+ dias = 0.0 (candidato a archival/prune)
+```
+
+```
+REGRA: Carregar NO MAXIMO 3-5 arquivos por sessao (score > 0.4).
+REGRA: Itens [CORE] so carregam se NENHUM perfil especifico fizer match.
+REGRA: Itens #desativado NUNCA carregam automaticamente.
+REGRA: Ao carregar um arquivo, atualizar seu frontmatter:
+       modified: (data de hoje)
+       Isso renova a recency e evita decay excessivo.
+```
+
+Exemplo de filtragem (SQL-like com scoring):
+```sql
+SELECT file, (0.4*tag_match + 0.3*imp/5 + 0.3*recency) AS score
+FROM MEMORY
+WHERE tags INTERSECT (#bot)
+  AND tier != 'archival'
+ORDER BY score DESC
+LIMIT 3;
+```
+
+### Passo 3 — Carregar tools por ITR per-step (95% token reduction)
+
+NAO fazer ToolSearch de todos os tools. Aplicar **Instruction-Tool Retrieval (ITR)**:
+a cada PASSO da tarefa, carregar SOMENTE os tools necessarios para aquele passo.
+
+```
+REGRA CRITICA: Nunca fazer ToolSearch("computer-use") a menos que
+o usuario EXPLICITAMENTE peca para controlar a tela.
+28+ tools de computer-use = ~3000 tokens desperdicados.
+
+REGRA: Nunca fazer ToolSearch em lote ("*" ou queries amplas).
+REGRA: Um servidor MCP por vez, sob demanda, quando o passo exigir.
+REGRA: Antes de fazer ToolSearch, perguntar: "Este passo PRECISA
+       deste tool, ou posso resolver com Read/Write/Edit/Bash/Grep/Glob?"
+```
+
+| Perfil | Tools permitidos via ToolSearch | Bloqueados por padrao |
+|--------|-------------------------------|----------------------|
+| `juridico` | Docling, Calendar, Gmail | computer-use, Chrome, Preview, Drive |
+| `vault` | nenhum extra | TODOS os MCPs |
+| `bot` | nenhum extra | TODOS os MCPs |
+| `infra` | nenhum extra | TODOS os MCPs |
+| `rag` | nenhum extra | computer-use, Chrome, Calendar |
+| `codigo` | nenhum extra | computer-use, Chrome, Docling |
+| `geral` | sob demanda | TODOS por padrao |
+
+**Tool Usage Log** (Berkeley BFCL V4): manter mentalmente uma lista de tools
+ja carregados nesta sessao. Nunca fazer ToolSearch de um tool ja carregado.
+
+### Passo 4 — Orcamento de contexto com Attention Sinks (MIT StreamingLLM)
+
+**Principio dos Attention Sinks (MIT Han Lab):** LLMs ancoram atencao
+desproporcional nos tokens iniciais do contexto. Ao compactar:
+
+```
+REGRA ATTENTION SINK: Nunca descartar o system prompt, CLAUDE.md,
+e o MEMORY.md durante compactacao. Eles sao os "attention sinks" —
+ancoras que orientam todo o comportamento subsequente.
+
+REGRA: Ao compactar conversa, preservar:
+  1. System prompt + CLAUDE.md (cabeca — attention sink)
+  2. Ultimos 5-8 turnos (cauda — contexto imediato)
+  3. Descartar turnos intermediarios primeiro (meio)
+  Isso segue o padrao head+tail do StreamingLLM.
+```
+
+Budget estimado:
+
+| Componente | Tokens | Tier (WISE) | Compactavel? |
+|------------|--------|-------------|-------------|
+| System prompt | ~5000 | Imutavel | Nao |
+| CLAUDE.md + MEMORY.md | ~3000 | Imutavel | Nao |
+| Deferred tool names | ~2000 | Imutavel | Nao |
+| Skills list | ~2000 | Imutavel | Parcial |
+| Tool schemas carregados | ~500-3000 | Mutavel | Sim (evitar carregar) |
+| Memorias carregadas | ~1000-5000 | Mutavel | Sim (max 3-5 arquivos) |
+| Conversa | cresce | Mutavel | Sim (compactacao auto) |
+| **Budget total** | ~200000 | — | — |
+
+---
+
+## Tiers de Memoria (Zhejiang WISE + USTC MemoryLLM)
+
+Cada arquivo de memoria pertence a um tier:
+
+| Tier | Descricao | Carregamento | Exemplos |
+|------|-----------|-------------|----------|
+| **Imutavel** | Regras e identidade que nunca mudam | Sempre (via CLAUDE.md) | Estilo, perfil, vault precedencia |
+| **Core** | Estado ativo dos projetos principais | Sob demanda por tag match | project_whatsapp_bot, project_vault |
+| **Recall** | Projetos secundarios e feedback especifico | Sob demanda se score > 0.4 | feedback_mermaid, project_gcp |
+| **Archival** | Projetos desativados, historico | Nunca automatico | project_qwen4b, project_pdf_annotator |
+
+```
+REGRA: Tiers sao determinados pelo campo imp: no MEMORY.md:
+  imp:5 = Imutavel ou Core (sempre/quase-sempre relevante)
+  imp:4 = Core (carrega quando perfil faz match)
+  imp:3 = Recall (carrega se score > 0.4)
+  imp:2 = Recall (carrega sob demanda explicita)
+  imp:1 = Archival (nunca carrega automaticamente)
+```
+
+---
+
+## Retrieval Progressivo em 3 Niveis (ByteRover Context Tree)
+
+Resolver queries no nivel mais raso possivel antes de carregar mais contexto:
+
+```
+Nivel 1 — MEMORY.md index (ja no contexto, ~70 linhas)
+  → Responde: "que projetos existem?", "qual tag usar?", "onde fica X?"
+  → Se resolve aqui, NAO carregar nenhum arquivo.
+
+Nivel 2 — Carregar 1-3 arquivos por tag match (score > 0.5)
+  → Responde: "qual o estado do bot?", "como funciona o vault?"
+  → Ler SOMENTE os arquivos top-ranked.
+
+Nivel 3 — Carregar arquivos auxiliares + ponteiros para vault
+  → Responde: "preciso dos detalhes da arquitetura X"
+  → Ler ponteiros em project_vault_state.md para arquivos do vault
+  → Ou usar Agent tool para pesquisa profunda (nao infla contexto principal)
+```
+
+```
+REGRA: Maioria das queries resolve no Nivel 1 ou 2.
+REGRA: Nivel 3 so com necessidade confirmada.
+REGRA: Se Nivel 3 envolver leitura de >3 arquivos, usar Agent tool
+       (subagente tem contexto proprio, protege o principal).
+```
+
+---
+
+## Confidence Tags (Graphify Pattern)
+
+Cada memoria carrega um nivel de confianca no frontmatter:
+
+| Confidence | Significado | Acao no retrieval |
+|------------|-------------|-------------------|
+| `verified` | Usuario confirmou explicitamente ou dado extraido de fonte primaria | Prioridade maxima |
+| `inferred` | Extraido de contexto de sessao, nao confirmado | Usar mas validar se critico |
+| `stale` | >60 dias sem acesso, informacao pode estar desatualizada | Verificar antes de usar |
+
+```
+REGRA: Ao criar nova memoria, marcar confidence: inferred
+REGRA: Quando usuario confirma informacao → promover para verified
+REGRA: Durante /consolidate-memory, memorias com recency < 0.3 → stale
+REGRA: Memorias stale + imp:1 → candidatas a exclusao
+```
+
+---
+
+## Adjacency Retrieval (Graphify Graph Pattern)
+
+Alem de tag match, usar vizinhanca no grafo de memorias.
+Mapa completo: `references/adjacency.md`
+
+```
+Protocolo de retrieval com adjacencia:
+
+1. Tag match → top 1-3 arquivos (Nivel 2 normal)
+2. Para cada arquivo carregado, consultar adjacency.md:
+   → Listar vizinhos 1-hop
+   → Se vizinho tem score > 0.5 e budget permite → carregar tambem
+3. Bridge check: se query cruza 2+ perfis,
+   priorizar memorias bridge (conectam clusters)
+   → Ver tabela de bridges em adjacency.md
+```
+
+Exemplo:
+```
+Query: "status do bot no VPS"
+
+exec
+/bin/zsh -lc "sed -n '1,220p' /Users/rogermaiocchi/dotfiles/shared/skills/graphify/SKILL.md" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+---
+name: graphify
+description: "any input (code, docs, papers, images, videos) to knowledge graph. Use when user asks any question about a codebase, documents, or project content - especially if graphify-out/ exists, treat the question as a /graphify query."
+trigger: /graphify
+---
+
+# /graphify
+
+Turn any folder of files into a navigable knowledge graph with community detection, an honest audit trail, and three outputs: interactive HTML, GraphRAG-ready JSON, and a plain-language GRAPH_REPORT.md.
+
+## Usage
+
+```
+/graphify                                             # full pipeline on current directory → Obsidian vault
+/graphify <path>                                      # full pipeline on specific path
+/graphify https://github.com/<owner>/<repo>           # clone repo then run full pipeline on it
+/graphify https://github.com/<owner>/<repo> --branch <branch>  # clone a specific branch
+/graphify <url1> <url2> ...                           # clone multiple repos, build each, merge into one cross-repo graph
+/graphify <path> --mode deep                          # thorough extraction, richer INFERRED edges
+/graphify <path> --update                             # incremental - re-extract only new/changed files
+/graphify <path> --directed                            # build directed graph (preserves edge direction: source→target)
+/graphify <path> --whisper-model medium                # use a larger Whisper model for better transcription accuracy
+/graphify <path> --cluster-only                       # rerun clustering on existing graph
+/graphify <path> --no-viz                             # skip visualization, just report + JSON
+/graphify <path> --html                               # (HTML is generated by default - this flag is a no-op)
+/graphify <path> --svg                                # also export graph.svg (embeds in Notion, GitHub)
+/graphify <path> --graphml                            # export graph.graphml (Gephi, yEd)
+/graphify <path> --neo4j                              # generate graphify-out/cypher.txt for Neo4j
+/graphify <path> --neo4j-push bolt://localhost:7687   # push directly to Neo4j
+/graphify <path> --mcp                                # start MCP stdio server for agent access
+/graphify <path> --watch                              # watch folder, auto-rebuild on code changes (no LLM needed)
+/graphify <path> --wiki                               # build agent-crawlable wiki (index.md + one article per community)
+/graphify <path> --obsidian --obsidian-dir ~/vaults/my-project  # write vault to custom path (e.g. existing vault)
+/graphify add <url>                                   # fetch URL, save to ./raw, update graph
+/graphify add <url> --author "Name"                   # tag who wrote it
+/graphify add <url> --contributor "Name"              # tag who added it to the corpus
+/graphify query "<question>"                          # BFS traversal - broad context
+/graphify query "<question>" --dfs                    # DFS - trace a specific path
+/graphify query "<question>" --budget 1500            # cap answer at N tokens
+/graphify path "AuthModule" "Database"                # shortest path between two concepts
+/graphify explain "SwinTransformer"                   # plain-language explanation of a node
+```
+
+## What graphify is for
+
+Drop any folder of code, docs, papers, images, or video into graphify and get a queryable knowledge graph. Persistent across sessions, honest audit trail (EXTRACTED/INFERRED/AMBIGUOUS), community detection surfaces cross-document connections you wouldn't think to ask about.
+
+## What You Must Do When Invoked
+
+If no path was given, use `.` (current directory). Do not ask the user for a path.
+
+If the path argument starts with `https://github.com/` or `http://github.com/`, treat it as a GitHub URL — run Step 0 before anything else, then continue with the resolved local path.
+
+Follow these steps in order. Do not skip steps.
+
+### Step 0 - Clone GitHub repo(s) (only if a GitHub URL was given)
+
+**Single repo:**
+```bash
+LOCAL_PATH=$(graphify clone <github-url> [--branch <branch>])
+# Use LOCAL_PATH as the target for all subsequent steps
+```
+
+**Multiple repos (cross-repo graph):**
+```bash
+# Clone each repo, run the full pipeline on each, then merge
+graphify clone <url1>   # → ~/.graphify/repos/<owner1>/<repo1>
+graphify clone <url2>   # → ~/.graphify/repos/<owner2>/<repo2>
+# Run /graphify on each local path to produce their graph.json files
+# Then merge:
+graphify merge-graphs \
+  ~/.graphify/repos/<owner1>/<repo1>/graphify-out/graph.json \
+  ~/.graphify/repos/<owner2>/<repo2>/graphify-out/graph.json \
+  --out graphify-out/cross-repo-graph.json
+```
+
+Graphify clones into `~/.graphify/repos/<owner>/<repo>` and reuses existing clones on repeat runs. Each node in the merged graph carries a `repo` attribute so you can filter by origin.
+
+### Step 1 - Ensure graphify is installed
+
+```bash
+# Detect the correct Python interpreter (handles uv tool, pipx, venv, system installs)
+PYTHON=""
+GRAPHIFY_BIN=$(which graphify 2>/dev/null)
+# 1. uv tool installs — most reliable on modern Mac/Linux
+if [ -z "$PYTHON" ] && command -v uv >/dev/null 2>&1; then
+    _UV_PY=$(uv tool run graphifyy python -c "import sys; print(sys.executable)" 2>/dev/null)
+    if [ -n "$_UV_PY" ]; then PYTHON="$_UV_PY"; fi
+fi
+# 2. Read shebang from graphify binary (pipx and direct pip installs)
+if [ -z "$PYTHON" ] && [ -n "$GRAPHIFY_BIN" ]; then
+    _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | tr -d '#!')
+    case "$_SHEBANG" in
+        *[!a-zA-Z0-9/_.-]*) ;;
+        *) "$_SHEBANG" -c "import graphify" 2>/dev/null && PYTHON="$_SHEBANG" ;;
+    esac
+fi
+# 3. Fall back to python3
+if [ -z "$PYTHON" ]; then PYTHON="python3"; fi
+"$PYTHON" -c "import graphify" 2>/dev/null || "$PYTHON" -m pip install graphifyy -q 2>/dev/null || "$PYTHON" -m pip install graphifyy -q --break-system-packages 2>&1 | tail -3
+# Write interpreter path for all subsequent steps (persists across invocations)
+mkdir -p graphify-out
+"$PYTHON" -c "import sys; open('graphify-out/.graphify_python', 'w').write(sys.executable)"
+# Save scan root so `graphify update` (no args) knows where to look next time
+echo "$(cd INPUT_PATH && pwd)" > graphify-out/.graphify_root
+```
+
+If the import succeeds, print nothing and move straight to Step 2.
+
+**In every subsequent bash block, replace `python3` with `$(cat graphify-out/.graphify_python)` to use the correct interpreter.**
+
+### Step 2 - Detect files
+
+```bash
+$(cat graphify-out/.graphify_python) -c "
+import json
+from graphify.detect import detect
+from pathlib import Path
+result = detect(Path('INPUT_PATH'))
+print(json.dumps(result))
+" > graphify-out/.graphify_detect.json
+```
+
+Replace INPUT_PATH with the actual path the user provided. Do NOT cat or print the JSON - read it silently and present a clean summary instead:
+
+```
+Corpus: X files · ~Y words
+  code:     N files (.py .ts .go ...)
+  docs:     N files (.md .txt ...)
+  papers:   N files (.pdf ...)
+  images:   N files
+  video:    N files (.mp4 .mp3 ...)
+```
+
+Omit any category with 0 files from the summary.
+
+Then act on it:
+- If `total_files` is 0: stop with "No supported files found in [path]."
+- If `skipped_sensitive` is non-empty: mention file count skipped, not the file names.
+- If `total_words` > 2,000,000 OR `total_files` > 200: show the warning and the top 5 subdirectories by file count, then ask which subfolder to run on. Wait for the user's answer before proceeding.
+- Otherwise: proceed directly to Step 2.5 if video files were detected, or Step 3 if not.
+
+### Step 2.5 - Transcribe video / audio files (only if video files detected)
+
+Skip this step entirely if `detect` returned zero `video` files.
+
+Video and audio files cannot be read directly. Transcribe them to text first, then treat the transcripts as doc files in Step 3.
+
+**Strategy:** Read the god nodes from `graphify-out/.graphify_detect.json` (or the analysis file if it exists from a previous run). You are already a language model — write a one-sentence domain hint yourself from those labels. Then pass it to Whisper as the initial prompt. No separate API call needed.
+
+**However**, if the corpus has *only* video files and no other docs/code, use the generic fallback prompt: `"Use proper punctuation and paragraph breaks."`
+
+**Step 1 - Write the Whisper prompt yourself.**
+
+Read the top god node labels from detect output or analysis, then compose a short domain hint sentence, for example:
+
+- Labels: `transformer, attention, encoder, decoder` → `"Machine learning research on transformer architectures and attention mechanisms. Use proper punctuation and paragraph breaks."`
+- Labels: `kubernetes, deployment, pod, helm` → `"DevOps discussion about Kubernetes deployments and Helm charts. Use proper punctuation and paragraph breaks."`
+
+Set it as `WHISPER_PROMPT` to use in the next command.
+
+**Step 2 - Transcribe:**
+
+```bash
+GRAPHIFY_WHISPER_MODEL=base  # or whatever --whisper-model the user passed
+$(cat graphify-out/.graphify_python) -c "
+import json, os
+from pathlib import Path
+from graphify.transcribe import transcribe_all
+
+detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text())
+video_files = detect.get('files', {}).get('video', [])
+prompt = os.environ.get('GRAPHIFY_WHISPER_PROMPT', 'Use proper punctuation and paragraph breaks.')
+
+transcript_paths = transcribe_all(video_files, initial_prompt=prompt)
+print(json.dumps(transcript_paths))
+" > graphify-out/.graphify_transcripts.json
+```
+
+After transcription:
+- Read the transcript paths from `graphify-out/.graphify_transcripts.json`
+- Add them to the docs list before dispatching semantic subagents in Step 3B
+- Print how many transcripts were created: `Transcribed N video file(s) -> treating as docs`
+- If transcription fails for a file, print a warning and continue with the rest
+
+**Whisper model:** Default is `base`. If the user passed `--whisper-model <name>`, set `GRAPHIFY_WHISPER_MODEL=<name>` in the environment before running the command above.
+
+### Step 3 - Extract entities and relationships
+
+**Before starting:** note whether `--mode deep` was given. You must pass `DEEP_MODE=true` to every subagent in Step B2 if it was. Track this from the original invocation - do not lose it.
+
+This step has two parts: **structural extraction** (deterministic, free) and **semantic extraction** (LLM, costs tokens).
+
+**Before dispatching subagents:** check whether `MOONSHOT_API_KEY` is set. If it is NOT set, print this one-liner to the user:
+> Tip: set `MOONSHOT_API_KEY` to use Kimi K2.6 for semantic extraction — 3x cheaper, richer graphs (`pip install 'graphifyy[kimi]'`).
+
+Print it once, then continue. If `MOONSHOT_API_KEY` IS set, use `graphify.llm.extract_corpus_parallel(files, backend="kimi")` for semantic extraction instead of dispatching Claude subagents.
+
+**Run Part A (AST) and Part B (semantic) in parallel. Dispatch all semantic subagents AND start AST extraction in the same message. Both can run simultaneously since they operate on different file types. Merge results in Part C as before.**
+
+Note: Parallelizing AST + semantic saves 5-15s on large corpora. AST is deterministic and fast; start it while subagents are processing docs/papers.
+
+#### Part A - Structural extraction for code files
+
+For any code files detected, run AST extraction in parallel with Part B subagents:
+
+```bash
+$(cat graphify-out/.graphify_python) -c "
+import sys, json
+from graphify.extract import collect_files, extract
+from pathlib import Path
+import json
+
+code_files = []
+detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text())
+for f in detect.get('files', {}).get('code', []):
+    code_files.extend(collect_files(Path(f)) if Path(f).is_dir() else [Path(f)])
+
+if code_files:
+    result = extract(code_files, cache_root=Path('.'))
+
+codex
+A tarefa é perfil **código**; não vou carregar memórias nem MCPs extras. A pipeline graphify completa escreveria `graphify-out/`, então nesta confirmação read-only vou fazer inspeção direta com `rg`/leitura dos arquivos.
+exec
+/bin/zsh -lc "rg -n \"EmbedRelay|embedRelay|_zeusGetMeshPeers|token|allowRemote|iosEmbedRelayEnabled|mesh|Tailscale|zeusDaemonUrl|discoverDaemonUrl|LocalDaemonEmbed|daemon-local|loopback|127\\.0\\.0\\.1|localhost|::1|spawn|daemon|lanes JS|lane\" main.source.js lib/zeus-http-client.js lib/embed-ios.js" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 104ms:
+lib/embed-ios.js:2: * embed-ios.js — iOS embed schema versionado + embed via daemon LOCAL.
+lib/embed-ios.js:6: *   CAMADA 1 — daemon Apple-nativo LOCAL (loopback). No Mac, o daemon local
+lib/embed-ios.js:7: *     (ZeusDaemonMac, auto-spawn) computa NLContextualEmbedding 512-dim e
+lib/embed-ios.js:9: *     há daemon (sandbox) → o índice já vem pronto do Mac via sync; a busca usa
+lib/embed-ios.js:10: *     as lanes JS. Sem Tailscale, sem rota remota.
+lib/embed-ios.js:23: *   embeddings.jsonl  — 512-dim NLContextualEmbedding (Apple Mac/iOS daemon)
+lib/embed-ios.js:38: *       source: 'daemon-mac' | 'daemon-local' | 'transformers-ios',
+lib/embed-ios.js:193:// LocalDaemonEmbed — embed via daemon Apple-nativo LOCAL (loopback).
+lib/embed-ios.js:195:// (127.0.0.1, auto-spawn) → NLContextualEmbedding 512-dim. No iOS não há daemon
+lib/embed-ios.js:196:// (sandbox) → tryEmbed retorna {ok:false, reason:'daemon-unreachable'} gracioso,
+lib/embed-ios.js:197:// e a busca cai nas lanes JS. Sem relay/Tailscale.
+lib/embed-ios.js:200:class LocalDaemonEmbed {
+lib/embed-ios.js:206:   * Tenta embed via daemon HTTP LOCAL (loopback).
+lib/embed-ios.js:215:      if (!available) return { ok: false, reason: 'daemon-unreachable' };
+lib/embed-ios.js:226:        source: 'daemon-local',
+lib/embed-ios.js:235:module.exports.LocalDaemonEmbed = LocalDaemonEmbed;
+lib/zeus-http-client.js:2: * ZeusHttpClient — daemon HTTP transport (v0.9 padrão Aegis — full Apple ecosystem + PIA)
+lib/zeus-http-client.js:4: * Cliente HTTP que fala com o daemon Swift nativo LOCAL em 127.0.0.1:2223.
+lib/zeus-http-client.js:5: * v1.15 — ON-DEVICE puro: setBaseUrl/constructor COAGEM qualquer URL não-loopback
+lib/zeus-http-client.js:6: * para o loopback default. O client é estruturalmente incapaz de falar com host
+lib/zeus-http-client.js:7: * remoto — sem relay, sem Tailscale. Substitui o child_process.spawn no hot path.
+lib/zeus-http-client.js:29: *   POST /v1/prompt                 body: {instruction, max_tokens, deterministic}
+lib/zeus-http-client.js:53:// v1.15 — ON-DEVICE puro: o transporte só fala loopback. Qualquer URL não-loopback
+lib/zeus-http-client.js:54:// (config legado, discovery, qualquer caller) é coagida para o default loopback —
+lib/zeus-http-client.js:56:const ZEUS_LOOPBACK_DEFAULT = 'http://127.0.0.1:2223';
+lib/zeus-http-client.js:60:  if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]|::1)(:\d+)?(\/|$)/i.test(u)) return u;
+lib/zeus-http-client.js:61:  try { console.warn('[zeus] URL não-loopback recusada (on-device puro), usando loopback:', u); } catch (_) {}
+lib/zeus-http-client.js:70:    this.HEALTH_TTL_MS = 30000;   // re-probe daemon health every 30s
+lib/zeus-http-client.js:75:      bytesIn: 0,        // bytes received from daemon (response payload)
+lib/zeus-http-client.js:76:      bytesOut: 0,       // bytes sent to daemon (request payload)
+lib/zeus-http-client.js:83:    // a PERMISSÃO enviada no header; o daemon sinaliza POSSIBILIDADE de cloud.
+lib/zeus-http-client.js:87:    //   'auto'   → header X-Zeus-Allow-Pcc:auto; daemon flags possibility when load exceeds on-device
+lib/zeus-http-client.js:88:    // v1.15 — codex #5: "used" virou "possible". O daemon NÃO consegue medir uso
+lib/zeus-http-client.js:110:   * Snapshot of current metrics + estimated token cost.
+lib/zeus-http-client.js:111:   * Heuristic: 1 token ~= 4 bytes for English/Portuguese text (very rough).
+lib/zeus-http-client.js:155:    this.baseUrl = _zeusCoerceLoopback(url);   // v1.15 — chokepoint: só loopback
+lib/zeus-http-client.js:160:    return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(this.baseUrl || '');
+lib/zeus-http-client.js:177:        `privacy-gate: ${endpoint} recusou enviar conteúdo sigiloso para daemon remoto (${this.baseUrl})`,
+lib/zeus-http-client.js:219:  // v1.15 — codex #5: o daemon sinaliza `X-Zeus-Pcc-Possible: 1` quando cloud era
+lib/zeus-http-client.js:351:    // v1.5 — daemon /v1/embed só aceita single `text`. Antes da v1.5 isso caía
+lib/zeus-http-client.js:355:    // BATCH=20 já. Eventualmente daemon ganha `{texts:[...]}` nativo.
+lib/zeus-http-client.js:366:      if (!Array.isArray(v)) throw new Error('embedBatch: daemon não retornou vetor para "' + (t || '').slice(0, 40) + '..."');
+lib/zeus-http-client.js:386:    // v1.5 — daemon /v1/ocr handler exige `image_path` (ou `image_base64`).
+lib/zeus-http-client.js:416:    // options: { max_tokens, deterministic, prewarm, _privacyPath, privacy }
+lib/zeus-http-client.js:419:      max_tokens: options.max_tokens || 300,
+lib/zeus-http-client.js:481:  // v1.7 — Spotlight via CSSearchableIndex programático (requer daemon ≥ v1.7,
+lib/zeus-http-client.js:484:  // o daemon bundled ainda for v1.0.0 (HTTP 404).
+lib/zeus-http-client.js:504:      if (/domain_hint obrigat[oó]rio|unsupported_on_aegis_daemon/i.test(nativeMessage)) {
+lib/zeus-http-client.js:545:   * Batch extract passports for many notes in one daemon call.
+lib/zeus-http-client.js:559:   * token-efficient first probe for agents.
+lib/zeus-http-client.js:614:  // o daemon retorna 501 com `hint` acionável apontando para o comando do plugin
+main.source.js:3: * v0.7.0 — Full Apple ecosystem coverage via Aegis daemon. Novos endpoints consumidos:
+main.source.js:12: * v0.6.0 — Aegis-pattern HTTP daemon transport (ADR-018): plugin agnóstico de plataforma,
+main.source.js:13: *           mesmo código TS chama daemon Swift nativo via requestUrl em Mac/iPhone/iPad/MacBook.
+main.source.js:14: *           v0.5: modular extensions (afm-daemon, hierarchical, multi-vector).
+main.source.js:32: * Camadas de reasoning (opcionais, default OFF — janela 4096 tokens com
+main.source.js:174:// fall through to `spawn/path/fs` only when guarded by `if (universal.IS_NODE)`.
+main.source.js:182:const spawn = universal.nodeChildProcess ? universal.nodeChildProcess.spawn : null;
+main.source.js:187:const ZeusHttpClient = require('./lib/zeus-http-client');    // v0.6: Aegis-pattern daemon HTTP transport (ADR-018)
+main.source.js:193:const DaemonLifecycle = require('./lib/daemon-lifecycle');               // v1.5: auto-spawn bin/ZeusDaemonMac (autonomia total Mac)
+main.source.js:198:const EmbedIosLib = require('./lib/embed-ios');                           // embed iOS schema versionado + embed via daemon LOCAL (on-device)
+main.source.js:201:const LexicalIosIndex = require('./lib/lexical-ios');                    // v1.11: BM25 persistido com stems pt-BR para iOS sem daemon (Feature I)
+main.source.js:213:// superfície de execução. iOS degrada gracioso quando daemon não é alcançável.
+main.source.js:227:  audioEngine: 'auto',                   // sa|sf|auto — daemon escolhe melhor disponível
+main.source.js:235:  // FoundationModels reasoning layer (janela 4096 tokens; chunking hierárquico NexusSum
+main.source.js:254:  // v0.6.0 — Aegis-pattern HTTP daemon (ADR-018)
+main.source.js:255:  zeusDaemonUrl: 'http://127.0.0.1:2223',   // local daemon loopback (on-device puro; sem rota remota)
+main.source.js:256:  daemonPreferredOverSpawn: true,            // ADR-018 fase E++: HTTP-first em todos hot paths; spawn é fallback no Mac
+main.source.js:271:  // v1.1 — Status bar: token-saved metrics
+main.source.js:273:  statusBarRefreshIntervalMs: 30000,        // 30s refresh para tokens metrics
+main.source.js:274:  rawTokenBaseline: 1250,                   // tokens médios sem PIA por request (~5KB/4)
+main.source.js:277:  // PERMISSÃO que o client envia, e o daemon sinaliza POSSIBILIDADE de cloud.
+main.source.js:280:  // 'auto'   = client permite PCC; daemon sinaliza possibilidade quando a carga excede on-device
+main.source.js:303:  // v1.15 — embed on-device puro. macOS: embed via daemon Apple-nativo LOCAL
+main.source.js:304:  //   (loopback, 512-dim NLContextualEmbedding). iOS: sem daemon → lê o
+main.source.js:306:  //   lanes JS. CAMADA 2 (labs, default OFF): transformers.js local 384-dim.
+main.source.js:350:// HTTP-only dispatcher (ADR-018 Aegis pattern, v1.5 — autonomous daemon)
+main.source.js:352:// Plugin v1.5 abandona o caminho child_process.spawn — toda operação Apple
+main.source.js:353:// passa pelo daemon HTTP local (bin/ZeusDaemonMac auto-spawned no Mac via
+main.source.js:357:async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs /* spawnArgs, stdinText, timeoutMs ignorados */) {
+main.source.js:358:  if (!plugin.httpClient || typeof plugin.httpClient[daemonMethod] !== 'function') {
+main.source.js:359:    throw new Error(`Daemon method indisponível: ${daemonMethod}`);
+main.source.js:363:    throw new Error(`Daemon HTTP fora do ar (${plugin.httpClient.baseUrl}) — ${daemonMethod} não pôde rodar`);
+main.source.js:365:  const result = await plugin.httpClient[daemonMethod](...daemonArgs);
+main.source.js:366:  return { source: 'daemon', result };
+main.source.js:370:// ferramentas do próprio OS"). Sem relay/mesh. Cada device usa o daemon Apple-nativo
+main.source.js:371:// LOCAL (loopback): macOS auto-spawna bin/ZeusDaemonMac; iOS, sem daemon on-device
+main.source.js:372:// (sandbox do plugin não roda código nativo), degrada para as lanes JS puras sobre os
+main.source.js:380://   macOS roda seu próprio daemon nativo em 127.0.0.1:2223 (ZeusDaemonMac, auto-spawn).
+main.source.js:381://   iOS não roda daemon (sandbox) → degrada para JS puro sobre índices sincronizados.
+main.source.js:382://   O cache só persiste loopback — não há rota remota.
+main.source.js:383:const ZEUS_LOCAL_DAEMON_KEY = 'zeus.daemon.url';        // cached URL string (sempre 127.0.0.1:* quando cacheado)
+main.source.js:384:const ZEUS_LOCAL_DAEMON_TS_KEY = 'zeus.daemon.ts';      // cached at (ms)
+main.source.js:389:  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(url);
+main.source.js:411:    // Só cacheia loopback — URL remota não é "estado estável" do device.
+main.source.js:413:      dbg('[zeus] cache skip — URL não é loopback (sempre re-probe local primeiro):', url);
+main.source.js:421:// v1.4.1 — On-device-first daemon discovery.
+main.source.js:424://   1. 127.0.0.1:2223  — daemon LOCAL Apple-nativo (ZeusDaemonMac no Mac, auto-spawn)
+main.source.js:425://   2. localhost:2223  — alternativa de hostname para o mesmo loopback
+main.source.js:426://   3. settings.zeusDaemonUrl — override (default 127.0.0.1; sincronizado via iCloud)
+main.source.js:428:// Probes em paralelo com timeout curto (1500ms); loopback sempre vence.
+main.source.js:429:async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 1500) {
+main.source.js:437:    // loopback primeiro (daemon local Apple-nativo daquele device), depois o override.
+main.source.js:438:    push('http://127.0.0.1:2223');
+main.source.js:439:    push('http://localhost:2223');
+main.source.js:440:    // override só se for loopback (on-device puro; ignora URL remota legada em data.json)
+main.source.js:441:    if (_zeusIsLoopback(plugin.settings.zeusDaemonUrl)) push(plugin.settings.zeusDaemonUrl);
+main.source.js:445:  // Probe em paralelo — mas pondera resultado pela posição (loopback ganha de remoto).
+main.source.js:450:      return ok ? { url, idx, loopback: _zeusIsLoopback(url) } : null;
+main.source.js:460:    console.warn('[zeus] adaptive daemon discovery → NENHUM daemon local respondeu');
+main.source.js:461:    // on-device puro: volta ao loopback default (nunca uma URL remota legada).
+main.source.js:462:    return _zeusIsLoopback(plugin.settings.zeusDaemonUrl) ? plugin.settings.zeusDaemonUrl : 'http://127.0.0.1:2223';
+main.source.js:465:  // Prioriza loopback (on-device); loopback sempre vence (on-device puro).
+main.source.js:466:  const loopback = winners.find(w => w.loopback);
+main.source.js:467:  const chosen = loopback || winners.sort((a, b) => a.idx - b.idx)[0];
+main.source.js:469:  dbg('[zeus] adaptive daemon discovery → using', chosen.url,
+main.source.js:470:    chosen.loopback ? '(LOCAL on-device daemon ✓)' : '(local)');
+main.source.js:472:  _zeusSetLocalDaemonUrl(chosen.url);   // só cacheia se for loopback (helper filtra)
+main.source.js:480:    if (!spawn) { resolve({}); return; }
+main.source.js:481:    const child = spawn('/usr/bin/mdls', ['-plist', '-', absPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+main.source.js:542:      // aocr (text in image) — HTTP-first via daemon ocr()
+main.source.js:551:        if (r.source === 'daemon') {
+main.source.js:558:      // av classify (top-N categories) — HTTP-first via daemon visionClassify()
+main.source.js:567:        if (r.source === 'daemon') {
+main.source.js:574:      // av landmarks (face detection) — HTTP-first via daemon visionLandmarks()
+main.source.js:583:        if (r.source === 'daemon') {
+main.source.js:592:      // acs metadata (Spotlight: EXIF, GPS, dates, camera, dimensions) — Mac only, no daemon path
+main.source.js:732:      if (r.source === 'daemon') {
+main.source.js:740:      const spawnArgs = ['ocr', absPath, '-o', 'text', '-l', 'pt-BR,en'];
+main.source.js:741:      if (isPdf && this.plugin.settings.aocrPdfStructured) spawnArgs.push('--structured');
+main.source.js:746:        spawnArgs,
+main.source.js:755:      // If --structured fails (macOS <26 or experimental issue), retry without (spawn-only fallback)
+main.source.js:848:    if (r.source === 'daemon') {
+main.source.js:1025:  // daemon embed must succeed for search to work).
+main.source.js:1057:      if (r.source === 'daemon') {
+main.source.js:1139:// Fits FoundationModels 4096-token window easily (short generation, no tools).
+main.source.js:1157:        [instruction, { max_tokens: 300, deterministic: true, prewarm: true, timeoutMs: 90000 }],
+main.source.js:1158:        ['prompt', instruction, '--deterministic', '--max-tokens', '300', '--prewarm'],
+main.source.js:1160:        90000   // cold spawn ~30-60s; rede idle pode estender
+main.source.js:1163:      if (r.source === 'daemon') {
+main.source.js:1189:    // HTTP-first: daemon graphExtract() works on iOS too. v0.11 uses vault.adapter
+main.source.js:1204:      if (r.source === 'daemon') {
+main.source.js:1546:  // Size limit: FoundationModels janela é 4096 tokens (~10K chars com safety margin).
+main.source.js:1552:    // ADR-018 fase E++: enrich agora roteia via daemon HTTP (works on iOS).
+main.source.js:1594:        // Read note content for daemon path — vault.adapter works on Mac and iOS.
+main.source.js:1610:        if (r.source === 'daemon') {
+main.source.js:1624:          ? 'FoundationModels janela 4096 tokens insuficiente para esta nota + vault context. Tente sub-folder menor ou nota mais curta.'
+main.source.js:1665:    if (r.source === 'daemon') {
+main.source.js:1693:    input.placeholder = 'Ex: Quais notas tratam de Aegis e qual a sua relação com Tailscale?';
+main.source.js:1737:      text: 'Retorna passports (concepts + summary + domain + difficulty) sem conteúdo bruto — token-eficiente.',
+main.source.js:1742:    input.placeholder = 'Query: ex. arquitetura Aegis com Tailscale';
+main.source.js:2140:    // ADR-018 fase E++: enrich agora suporta iOS via daemon HTTP — gate só pelo setting.
+main.source.js:2240:    const daemonSection = container.createDiv({ cls: 'zeus-status-section' });
+main.source.js:2241:    daemonSection.createDiv({ cls: 'zeus-status-section-title', text: 'Daemon HTTP' });
+main.source.js:2245:      this._addStatusRow(daemonSection, 'URL', this.plugin.settings.zeusDaemonUrl);
+main.source.js:2246:      this._addStatusRow(daemonSection, 'Status', health.status || 'unreachable', health.status === 'ok' ? 'ok' : 'err');
+main.source.js:2247:      this._addStatusRow(daemonSection, 'Platform', health.platform || '?');
+main.source.js:2248:      this._addStatusRow(daemonSection, 'Endpoints', String((health.endpoints || []).length));
+main.source.js:2249:      this._addStatusRow(daemonSection, 'Tools', String(tools.length));
+main.source.js:2250:      this._addStatusRow(daemonSection, 'NLContextualEmbedding', health.nl_available ? '✓' : '✗', health.nl_available ? 'ok' : 'err');
+main.source.js:2251:      this._addStatusRow(daemonSection, 'Vision', health.vision_available ? '✓' : '✗', health.vision_available ? 'ok' : 'err');
+main.source.js:2252:      this._addStatusRow(daemonSection, 'FoundationModels', health.fm_available ? '✓' : '✗', health.fm_available ? 'ok' : 'warn');
+main.source.js:2254:        this._addStatusRow(daemonSection, 'Translation', health.translation_available ? '✓' : '✗', health.translation_available ? 'ok' : 'warn');
+main.source.js:2257:      this._addStatusRow(daemonSection, 'Status', 'UNREACHABLE: ' + e.message.slice(0, 60), 'err');
+main.source.js:2304:    const probeBtn = actions.createEl('button', { text: '⚡ Probe daemon' });
+main.source.js:2343:    desc.appendText(' para PDFs/imagens. Sem BM25 próprio, sem tokenizer próprio, sem bge-micro-v2.');
+main.source.js:2346:    const _lcStatus = (this.plugin.daemonLifecycle && this.plugin.daemonLifecycle.lastStatus) || null;
+main.source.js:2348:      ? `${_lcStatus.running ? 'ALIVE' : 'DEAD'} (${_lcStatus.source}) — ${this.plugin.daemonLifecycle.url}`
+main.source.js:2352:      .setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 não responde. iOS lê os índices sincronizados via iCloud (read-only) e busca nas lanes JS. Estado: ${_lcLabel}`);
+main.source.js:2371:    new Setting(containerEl).setName('Aegis-pattern HTTP daemon (v0.6, ADR-018)').setHeading();
+main.source.js:2374:      .setName('Zeus daemon URL (sincronizado via iCloud)')
+main.source.js:2375:      .setDesc('URL do daemon LOCAL (loopback). Mantenha em http://127.0.0.1:2223 — o plugin é on-device puro: macOS auto-spawna o ZeusDaemonMac local; iOS lê os índices sincronizados. Apenas URLs loopback (127.0.0.1/localhost/::1) são aceitas; URL remota é rejeitada (sem relay).')
+main.source.js:2376:      .addText(t => t.setValue(this.plugin.settings.zeusDaemonUrl).setPlaceholder('http://127.0.0.1:2223').onChange(async v => {
+main.source.js:2377:        // v1.15 — on-device puro: rejeita URL não-loopback (sem rota remota).
+main.source.js:2379:          new Notice('Zeus: só URLs loopback (127.0.0.1/localhost) são aceitas — arquitetura on-device, sem relay.', 8000);
+main.source.js:2380:          t.setValue(this.plugin.settings.zeusDaemonUrl);
+main.source.js:2383:        this.plugin.settings.zeusDaemonUrl = v || 'http://127.0.0.1:2223';
+main.source.js:2385:        this.plugin.httpClient.setBaseUrl(this.plugin.settings.zeusDaemonUrl);
+main.source.js:2391:      .setName('Forçar redescoberta de daemon agora')
+main.source.js:2392:      .setDesc('Limpa cache localStorage e re-prova 127.0.0.1 + settings (on-device). Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use após instalar/subir o daemon local.')
+main.source.js:2395:        const n = new Notice('Zeus: redescobrindo daemon…', 0);
+main.source.js:2397:          const url = await discoverDaemonUrl(this.plugin);
+main.source.js:2403:            new Notice(`Zeus: daemon ${isLocal ? 'LOCAL on-device ✓' : 'local'} em ${url}`, 6000);
+main.source.js:2405:            const macHint = 'macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent.';
+main.source.js:2407:            new Notice(`Zeus: nenhum daemon respondeu.\n${isMac() ? macHint : iosHint}`, 12000);
+main.source.js:2417:      .setName('Prefer daemon over child_process (EXPERIMENTAL)')
+main.source.js:2418:      .setDesc('Quando ON: hot path tenta HTTP daemon primeiro, fallback child_process se daemon indisponível. Requer daemon rodando no device. Em iOS, esta é a ÚNICA forma de embed/enrich novos (Capacitor bloqueia spawn). Default OFF até daemon estar deployado.')
+main.source.js:2419:      .addToggle(t => t.setValue(this.plugin.settings.daemonPreferredOverSpawn).onChange(async v => {
+main.source.js:2420:        this.plugin.settings.daemonPreferredOverSpawn = v;
+main.source.js:2465:      .setDesc('Roda `metafm enrich` na nota ativa: FoundationModels lê notas relacionadas via tool-calling e sugere links + conexões. LIMITAÇÃO: FoundationModels tem janela 4096 tokens — system prompt + tool descrições consomem ~1500, sobrando ~2500 para o conteúdo da nota + tool responses. Notas >~2KB ou vault com muitos folders pode estourar (skip silencioso). Default off; ligue se trabalhar com notas curtas. Cache por SHA.')
+main.source.js:2488:      .setDesc('Quando ON, comandos de indexação populam data/image-features.jsonl com vetor 768-dim por imagem. Habilita o comando "encontrar imagens similares à atual". Requer daemon Zeus rodando (Mac).')
+main.source.js:2498:      .setDesc('Permite o comando "Zeus: buscar via Spotlight nativo" consultar o índice macOS via CSSearchQuery exposto pelo daemon. Funciona apenas no Mac.')
+main.source.js:2584:    metricsDesc.appendText('Status bar exibe contagem de docs indexados e, opcionalmente, tokens economizados via ');
+main.source.js:2589:      .setName('Mostrar tokens economizados no status bar')
+main.source.js:2599:      .setDesc('Atualiza tokens economizados periodicamente. Default 30000 (30s). Aumente para reduzir overhead, diminua para feedback mais responsivo.')
+main.source.js:2623:      .setDesc('Zera contadores de tokens, bytes e requests do HTTP client. Útil após mudar baseline ou debugar.')
+main.source.js:2637:    pccDesc.appendText(' (notas grandes, agent multi-step com janela 4096 estourada). Requer macOS 26+ Apple Intelligence ativo no device do daemon.');
+main.source.js:2641:      .setDesc('off = só on-device (privacy máximo, default). opt-in = client envia header X-Zeus-Allow-Pcc:1; Apple decide caso a caso. auto = client permite PCC; o daemon apenas sinaliza POSSIBILIDADE quando a carga excede on-device — o routing real é decidido pela Apple (sem API pública de controle/inspeção).')
+main.source.js:2645:        .addOption('auto', 'auto — daemon decide')
+main.source.js:2665:      .setDesc('Inspeciona o modo atual e a contagem de requests onde cloud (PCC) era POSSÍVEL. O daemon não consegue medir uso real de cloud — Apple não expõe API de inspeção; este número é heurístico.')
+main.source.js:2871:    // de `afmBin` (spawn child_process). Mantemos a assinatura por compat —
+main.source.js:2873:    // caem para o daemon HTTP via `plugin.httpClient` no caminho moderno.
+main.source.js:2876:    // v0.6.0 — ADR-018 Aegis-pattern HTTP daemon client (works on ALL devices: Mac+iOS uniform)
+main.source.js:2879:    // funciona para ELE, mesmo que settings.zeusDaemonUrl (sincronizado) aponte para outro device.
+main.source.js:2880:    const _initialDaemonUrl = _zeusGetLocalDaemonUrl() || this.settings.zeusDaemonUrl;
+main.source.js:2881:    if (_initialDaemonUrl !== this.settings.zeusDaemonUrl) {
+main.source.js:2882:      dbg('[zeus] using per-device cached daemon URL:', _initialDaemonUrl, '(settings:', this.settings.zeusDaemonUrl, ')');
+main.source.js:2886:    // v1.5 — Daemon lifecycle: se 127.0.0.1:2223 não responder, plugin sobe
+main.source.js:2888:    // iOS: child_process indisponível → status `no-spawn`, plugin segue em modo
+main.source.js:2890:    this.daemonLifecycle = new DaemonLifecycle(this);
+main.source.js:2902:        const status = await this.daemonLifecycle.ensureRunning();
+main.source.js:2903:        dbg('[zeus] daemon lifecycle:', status);
+main.source.js:2905:        // um daemon local em 127.0.0.1:2223, redireciona httpClient pra ele,
+main.source.js:2907:        // esse rebase, plugin spawna localmente mas continua falando com peer
+main.source.js:2915:        console.warn('[zeus] daemon lifecycle ensureRunning failed:', e.message);
+main.source.js:2926:    // geradas em iOS sem daemon. Precisa estar disponível ANTES do AutoIndexer
+main.source.js:2934:    // v1.15 — embed on-device: daemon local (loopback) + transformers.js labs
+main.source.js:2936:    this.embedLocalDaemon = new EmbedIosLib.LocalDaemonEmbed(this);
+main.source.js:3012:    // verifica se há tasks deixadas por iOS via iCloud e processa via daemon.
+main.source.js:3013:    // Boot consume após 20s (deixa daemon estabilizar + iCloud sync inicial).
+main.source.js:3026:                // Mac processa com daemon FM via buildOne (que prefere daemon).
+main.source.js:3090:    // v0.6.1 — Adaptive daemon discovery (async, doesn't block onload)
+main.source.js:3100:          // URL atual morta — re-prova loopback + settings (on-device) em paralelo.
+main.source.js:3101:          const discovered = await discoverDaemonUrl(this);
+main.source.js:3103:            dbg('[zeus] adapting daemon URL from', activeUrl, 'to', discovered);
+main.source.js:3111:        // Probe daemon capabilities to log what's available
+main.source.js:3114:        dbg('[zeus] daemon health:', health.status, '| platform:', health.platform, '| endpoints:', (health.endpoints || []).length, '| tools:', tools.length, '| url:', activeUrl);
+main.source.js:3117:          new Notice(`Zeus: daemon ${health.platform || '?'} ${isLocal ? 'LOCAL ✓' : 'local'} · ${(health.endpoints || []).length} endpoints`);
+main.source.js:3119:          // v1.4.1 — Instruções per-platform: cada device tem infra Apple nativa para rodar seu daemon.
+main.source.js:3120:          const macHint = 'macOS: o plugin auto-spawna bin/ZeusDaemonMac; se falhar, rode `bash daemon/scripts/install-mac-daemon.sh` (LaunchAgent).';
+main.source.js:3121:          const iosHint = 'iOS: sem daemon on-device (esperado) — busca roda nas lanes JS sobre os índices computados no Mac e sincronizados via iCloud.';
+main.source.js:3123:          new Notice(`Zeus: daemon local indisponível em ${activeUrl}.\n${platformHint}`, 15000);
+main.source.js:3245:      id: 'zeus-daemon-status',
+main.source.js:3246:      name: 'Zeus: status do daemon HTTP (lifecycle)',
+main.source.js:3248:        const lc = this.daemonLifecycle;
+main.source.js:3251:        const spawnedByUs = lc.spawnedByUs ? ' (spawned by plugin)' : '';
+main.source.js:3252:        new Notice(`Daemon ${last.running ? 'ALIVE' : 'DEAD'}: ${last.source}${spawnedByUs} · ${lc.url}`, 6000);
+main.source.js:3256:      id: 'zeus-http-daemon-probe',
+main.source.js:3257:      name: 'Zeus: probe HTTP daemon (Aegis-pattern, ADR-018)',
+main.source.js:3259:        const n = new Notice(`Probing ${this.settings.zeusDaemonUrl}…`, 0);
+main.source.js:3265:          dbg('[zeus] HTTP daemon health:', health, 'tools:', tools);
+main.source.js:3356:          const tags = (r && (r.tags || r.tokens)) || [];
+main.source.js:3357:          const preview = Array.isArray(tags) ? tags.slice(0, 20).map(t => (t.lemma || t.tag || t.token)).join(' ') : JSON.stringify(r).slice(0, 200);
+main.source.js:3359:          new Notice(`Lemma: ${tags.length || '?'} tokens (preview no console; JSON no clipboard)`);
+main.source.js:3602:        if (!isMac()) { new Notice('PIA build: requer daemon no Mac'); return; }
+main.source.js:3733:    // v1.1 — refresh periódico do status bar com token-saved + PCC indicator.
+main.source.js:3800:          // Re-embed single file: read content, call daemon /v1/embed, update searcher.embeddings
+main.source.js:3837:          // Resolver path absoluto (daemon precisa de path absoluto)
+main.source.js:4157:    // codex audit MED A/F: computa domain_hint no JS para que daemon não caia
+main.source.js:4158:    // em "com.maiocchi.zeus.default" quando spawned sem --vault. Hash do
+main.source.js:4245:              new Notice('Zeus Spotlight: daemon bundled não suporta /v1/spotlight/index. Rebuild via `node scripts/build-release.mjs`.', 9000);
+main.source.js:4287:              new Notice('Zeus Spotlight purge: daemon bundled não suporta. Rebuild necessário.', 7000);
+main.source.js:4501:          new Notice(`Zeus lexical-ios: ${r.N} notas, ${r.vocab} tokens (${r.elapsedMs}ms)`);
+main.source.js:4525:            `${h.path} (score ${h.score.toFixed(2)}, ${h.matched_tokens.length} match)`,
+main.source.js:4536:    // v1.15 — embed status: daemon local (on-device) + transformers.js labs
+main.source.js:4539:      name: 'Zeus: status embed (daemon local + transformers.js)',
+main.source.js:4543:          // Camada 1: daemon local (loopback)
+main.source.js:4546:            lines.push(`  Camada 1 (daemon local Apple-nativo): ${probe.ok ? '✓ OK' : '✗ ' + probe.reason}`);
+main.source.js:4574:            '(ZeusDaemonMac, auto-spawn) e persistido em data/embeddings.jsonl. Esse índice',
+main.source.js:4577:            'No iOS o plugin NÃO roda daemon (sandbox não executa código nativo): ele LÊ o',
+main.source.js:4578:            'embeddings.jsonl sincronizado e roda a busca nas lanes JS puras',
+main.source.js:4586:          new Notice('Embed iOS: índice é computado no Mac e sincronizado; iOS busca via JS lanes. Instruções no clipboard.', 12000);
+main.source.js:4658:    if (this.daemonLifecycle) {
+main.source.js:4659:      try { await this.daemonLifecycle.stop(); } catch (e) { console.warn('[zeus] daemon lifecycle stop:', e.message); }
+main.source.js:4734:    } else if (state === 'daemon-down') {
+main.source.js:4735:      text = `⚠️ Zeus daemon offline`;
+main.source.js:4738:      // v1.1 — token-saved metrics
+main.source.js:4755:  // Cada request via daemon devolve um passport compacto (~300B) ao invés do
+main.source.js:4756:  // conteúdo bruto (~5KB médio). Estimativa: tokens_saved = (raw_baseline -
+main.source.js:4757:  // actual_tokens) por request, somado ao longo da sessão.
+
+exec
+/bin/zsh -lc 'wc -l main.source.js lib/zeus-http-client.js lib/embed-ios.js' in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+    4807 main.source.js
+     639 lib/zeus-http-client.js
+     239 lib/embed-ios.js
+    5685 total
+
+exec
+/bin/zsh -lc 'git status --short' in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 2602ms:
+2026-05-21 12:56:50.612 xcodebuild[16677:17995019]  DVTFilePathFSEvents: Failed to start fs event stream.
+2026-05-21 12:56:50.903 xcodebuild[16677:17995018] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead
+git: error: couldn't create cache file '/tmp/xcrun_db-8OisYY8N' (errno=Operation not permitted)
+2026-05-21 12:56:51.606 xcodebuild[16684:17995053]  DVTFilePathFSEvents: Failed to start fs event stream.
+2026-05-21 12:56:51.759 xcodebuild[16684:17995052] [MT] DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR from confstr(3), error = Error Domain=NSPOSIXErrorDomain Code=5 "Input/output error". Using NSCachesDirectory instead.
+?? .codex-final.txt
+?? .codex-ondevice-confirm.txt
+?? audit-claude-vs-codex.md
+?? audit-codex-ios-debate.txt
+?? audit-codex-ondevice-confirm.txt
+?? audit-codex-ondevice-final.txt
+?? audit-codex-raw.txt
+?? audit-codex-relay-confirm.txt
+?? audit-codex-round4.md
+?? audit-codex-round5-confirm.txt
+?? audit-codex-round5-raw.txt
+?? audit-codex-round5.md
+?? audit-fase1-estrutural.md
+?? audit-fase3-conformidade.md
+?? audit-final-consolidado.md
+?? audit-os-ios-100.md
+
+codex
+A primeira varredura não mostrou os identificadores de relay removidos; agora vou ler os trechos de controle onde a decisão realmente acontece: coerção de URL, descoberta, lifecycle, client HTTP e embed local.
+exec
+/bin/zsh -lc "nl -ba main.source.js | sed -n '370,475p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+   370	// ferramentas do próprio OS"). Sem relay/mesh. Cada device usa o daemon Apple-nativo
+   371	// LOCAL (loopback): macOS auto-spawna bin/ZeusDaemonMac; iOS, sem daemon on-device
+   372	// (sandbox do plugin não roda código nativo), degrada para as lanes JS puras sobre os
+   373	// índices computados no Mac e sincronizados via iCloud. NENHUMA topologia de rede no
+   374	// fonte (removido o TAILSCALE_MESH hardcoded da auditoria v1.15) e nenhum peer remoto.
+   375	
+   376	// v1.4.1 — Per-device cache: localStorage não é sincronizado via iCloud, então cada device
+   377	// memoriza sua própria URL funcional. Evita re-discovery em todo startup.
+   378	//
+   379	// IMPORTANTE — arquitetura on-device-first (Apple-native em TODOS os devices):
+   380	//   macOS roda seu próprio daemon nativo em 127.0.0.1:2223 (ZeusDaemonMac, auto-spawn).
+   381	//   iOS não roda daemon (sandbox) → degrada para JS puro sobre índices sincronizados.
+   382	//   O cache só persiste loopback — não há rota remota.
+   383	const ZEUS_LOCAL_DAEMON_KEY = 'zeus.daemon.url';        // cached URL string (sempre 127.0.0.1:* quando cacheado)
+   384	const ZEUS_LOCAL_DAEMON_TS_KEY = 'zeus.daemon.ts';      // cached at (ms)
+   385	const ZEUS_LOCAL_DAEMON_TTL_MS = 12 * 60 * 60 * 1000;   // 12h — re-probe periodicamente
+   386	
+   387	function _zeusIsLoopback(url) {
+   388	  if (!url) return false;
+   389	  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(url);
+   390	}
+   391	
+   392	function _zeusGetLocalDaemonUrl() {
+   393	  try {
+   394	    if (typeof window === 'undefined' || !window.localStorage) return null;
+   395	    const url = window.localStorage.getItem(ZEUS_LOCAL_DAEMON_KEY);
+   396	    const ts = parseInt(window.localStorage.getItem(ZEUS_LOCAL_DAEMON_TS_KEY) || '0', 10);
+   397	    if (!url || !ts) return null;
+   398	    if (Date.now() - ts > ZEUS_LOCAL_DAEMON_TTL_MS) return null;
+   399	    return url;
+   400	  } catch { return null; }
+   401	}
+   402	
+   403	function _zeusSetLocalDaemonUrl(url) {
+   404	  try {
+   405	    if (typeof window === 'undefined' || !window.localStorage) return;
+   406	    if (!url) {
+   407	      window.localStorage.removeItem(ZEUS_LOCAL_DAEMON_KEY);
+   408	      window.localStorage.removeItem(ZEUS_LOCAL_DAEMON_TS_KEY);
+   409	      return;
+   410	    }
+   411	    // Só cacheia loopback — URL remota não é "estado estável" do device.
+   412	    if (!_zeusIsLoopback(url)) {
+   413	      dbg('[zeus] cache skip — URL não é loopback (sempre re-probe local primeiro):', url);
+   414	      return;
+   415	    }
+   416	    window.localStorage.setItem(ZEUS_LOCAL_DAEMON_KEY, url);
+   417	    window.localStorage.setItem(ZEUS_LOCAL_DAEMON_TS_KEY, String(Date.now()));
+   418	  } catch {}
+   419	}
+   420	
+   421	// v1.4.1 — On-device-first daemon discovery.
+   422	//
+   423	// Ordem fixa de candidatos (ON-DEVICE puro — sem rota remota):
+   424	//   1. 127.0.0.1:2223  — daemon LOCAL Apple-nativo (ZeusDaemonMac no Mac, auto-spawn)
+   425	//   2. localhost:2223  — alternativa de hostname para o mesmo loopback
+   426	//   3. settings.zeusDaemonUrl — override (default 127.0.0.1; sincronizado via iCloud)
+   427	//
+   428	// Probes em paralelo com timeout curto (1500ms); loopback sempre vence.
+   429	async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 1500) {
+   430	  const ordered = [];
+   431	  const seen = new Set();
+   432	  const push = (u) => { if (u && !seen.has(u)) { seen.add(u); ordered.push(u); } };
+   433	
+   434	  if (candidates) {
+   435	    for (const u of candidates) push(u);
+   436	  } else {
+   437	    // loopback primeiro (daemon local Apple-nativo daquele device), depois o override.
+   438	    push('http://127.0.0.1:2223');
+   439	    push('http://localhost:2223');
+   440	    // override só se for loopback (on-device puro; ignora URL remota legada em data.json)
+   441	    if (_zeusIsLoopback(plugin.settings.zeusDaemonUrl)) push(plugin.settings.zeusDaemonUrl);
+   442	  }
+   443	
+   444	  const ZeusHttpClientLocal = require('./lib/zeus-http-client');
+   445	  // Probe em paralelo — mas pondera resultado pela posição (loopback ganha de remoto).
+   446	  const probes = ordered.map((url, idx) => (async () => {
+   447	    try {
+   448	      const client = new ZeusHttpClientLocal(url);
+   449	      const ok = await client.isAvailable(probeTimeoutMs);
+   450	      return ok ? { url, idx, loopback: _zeusIsLoopback(url) } : null;
+   451	    } catch { return null; }
+   452	  })());
+   453	
+   454	  const results = await Promise.allSettled(probes);
+   455	  const winners = results
+   456	    .filter(r => r.status === 'fulfilled' && r.value)
+   457	    .map(r => r.value);
+   458	
+   459	  if (winners.length === 0) {
+   460	    console.warn('[zeus] adaptive daemon discovery → NENHUM daemon local respondeu');
+   461	    // on-device puro: volta ao loopback default (nunca uma URL remota legada).
+   462	    return _zeusIsLoopback(plugin.settings.zeusDaemonUrl) ? plugin.settings.zeusDaemonUrl : 'http://127.0.0.1:2223';
+   463	  }
+   464	
+   465	  // Prioriza loopback (on-device); loopback sempre vence (on-device puro).
+   466	  const loopback = winners.find(w => w.loopback);
+   467	  const chosen = loopback || winners.sort((a, b) => a.idx - b.idx)[0];
+   468	
+   469	  dbg('[zeus] adaptive daemon discovery → using', chosen.url,
+   470	    chosen.loopback ? '(LOCAL on-device daemon ✓)' : '(local)');
+   471	
+   472	  _zeusSetLocalDaemonUrl(chosen.url);   // só cacheia se for loopback (helper filtra)
+   473	  return chosen.url;
+   474	}
+   475	
+
+exec
+/bin/zsh -lc "nl -ba main.source.js | sed -n '2368,2408p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+  2368	      .setDesc('Usa RecognizeDocumentsRequest layout-aware para PDFs. EXPERIMENTAL. Fallback automático para aocr regular.')
+  2369	      .addToggle(t => t.setValue(this.plugin.settings.aocrPdfStructured).onChange(async v => { this.plugin.settings.aocrPdfStructured = v; await this.plugin.saveSettings(); }));
+  2370	
+  2371	    new Setting(containerEl).setName('Aegis-pattern HTTP daemon (v0.6, ADR-018)').setHeading();
+  2372	
+  2373	    new Setting(containerEl)
+  2374	      .setName('Zeus daemon URL (sincronizado via iCloud)')
+  2375	      .setDesc('URL do daemon LOCAL (loopback). Mantenha em http://127.0.0.1:2223 — o plugin é on-device puro: macOS auto-spawna o ZeusDaemonMac local; iOS lê os índices sincronizados. Apenas URLs loopback (127.0.0.1/localhost/::1) são aceitas; URL remota é rejeitada (sem relay).')
+  2376	      .addText(t => t.setValue(this.plugin.settings.zeusDaemonUrl).setPlaceholder('http://127.0.0.1:2223').onChange(async v => {
+  2377	        // v1.15 — on-device puro: rejeita URL não-loopback (sem rota remota).
+  2378	        if (v && !_zeusIsLoopback(v)) {
+  2379	          new Notice('Zeus: só URLs loopback (127.0.0.1/localhost) são aceitas — arquitetura on-device, sem relay.', 8000);
+  2380	          t.setValue(this.plugin.settings.zeusDaemonUrl);
+  2381	          return;
+  2382	        }
+  2383	        this.plugin.settings.zeusDaemonUrl = v || 'http://127.0.0.1:2223';
+  2384	        await this.plugin.saveSettings();
+  2385	        this.plugin.httpClient.setBaseUrl(this.plugin.settings.zeusDaemonUrl);
+  2386	        // v1.4.1 — Limpa cache localStorage para que o novo valor seja reprobado.
+  2387	        _zeusSetLocalDaemonUrl(null);
+  2388	      }));
+  2389	
+  2390	    new Setting(containerEl)
+  2391	      .setName('Forçar redescoberta de daemon agora')
+  2392	      .setDesc('Limpa cache localStorage e re-prova 127.0.0.1 + settings (on-device). Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use após instalar/subir o daemon local.')
+  2393	      .addButton(b => b.setButtonText('Redescobrir').setCta().onClick(async () => {
+  2394	        _zeusSetLocalDaemonUrl(null);
+  2395	        const n = new Notice('Zeus: redescobrindo daemon…', 0);
+  2396	        try {
+  2397	          const url = await discoverDaemonUrl(this.plugin);
+  2398	          this.plugin.httpClient.setBaseUrl(url);
+  2399	          const ok = await this.plugin.httpClient.isAvailable(1500);
+  2400	          n.hide();
+  2401	          if (ok) {
+  2402	            const isLocal = _zeusIsLoopback(url);
+  2403	            new Notice(`Zeus: daemon ${isLocal ? 'LOCAL on-device ✓' : 'local'} em ${url}`, 6000);
+  2404	          } else {
+  2405	            const macHint = 'macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent.';
+  2406	            const iosHint = 'iOS: abra o app Aegis para iniciar o AegisDaemon (porta 2223 embedada).';
+  2407	            new Notice(`Zeus: nenhum daemon respondeu.\n${isMac() ? macHint : iosHint}`, 12000);
+  2408	          }
+
+exec
+/bin/zsh -lc "nl -ba main.source.js | sed -n '2868,3128p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+  2868	      ? path.join(this.vaultRoot, this.manifest.dir, DATA_DIR_NAME)
+  2869	      : universal.joinPath(this.manifest.dir, DATA_DIR_NAME);
+  2870	    // v1.5 — HierarchicalProcessor e MultiVectorEmbedder herdaram dependência
+  2871	    // de `afmBin` (spawn child_process). Mantemos a assinatura por compat —
+  2872	    // passamos null: ambos os módulos verificam o binário antes de invocar e
+  2873	    // caem para o daemon HTTP via `plugin.httpClient` no caminho moderno.
+  2874	    this.hierarchical = new HierarchicalProcessor(null, this.settings.hierarchicalThreshold);
+  2875	    this.multiVector = new MultiVectorEmbedder(null, pluginDataPath);
+  2876	    // v0.6.0 — ADR-018 Aegis-pattern HTTP daemon client (works on ALL devices: Mac+iOS uniform)
+  2877	    // v1.4.1 — Prefer per-device cached URL (localStorage, NÃO sincronizado via iCloud).
+  2878	    // Isso garante que cada device (Mac mini, MacBook, iPad, iPhone) use a URL que
+  2879	    // funciona para ELE, mesmo que settings.zeusDaemonUrl (sincronizado) aponte para outro device.
+  2880	    const _initialDaemonUrl = _zeusGetLocalDaemonUrl() || this.settings.zeusDaemonUrl;
+  2881	    if (_initialDaemonUrl !== this.settings.zeusDaemonUrl) {
+  2882	      dbg('[zeus] using per-device cached daemon URL:', _initialDaemonUrl, '(settings:', this.settings.zeusDaemonUrl, ')');
+  2883	    }
+  2884	    this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
+  2885	
+  2886	    // v1.5 — Daemon lifecycle: se 127.0.0.1:2223 não responder, plugin sobe
+  2887	    // bin/ZeusDaemonMac sozinho (autonomia "drop-in" sem launchctl manual).
+  2888	    // iOS: child_process indisponível → status `no-spawn`, plugin segue em modo
+  2889	    // degradado read-only consumindo data/embeddings.jsonl syncado do Mac.
+  2890	    this.daemonLifecycle = new DaemonLifecycle(this);
+  2891	    if (isMac()) {
+  2892	      // v1.6 — inicia FSEvents watcher para observability de iCloud sync. NÃO
+  2893	      // dispara re-embed (codex HIGH #3 — vault.on já cobre); só mede latência
+  2894	      // do adapter Obsidian vs FSEvents pra detectar quando o adapter perdeu sync.
+  2895	      try {
+  2896	        const ws = this.nativeWatcher.start();
+  2897	        dbg('[zeus] native-watcher:', ws);
+  2898	      } catch (e) {
+  2899	        console.warn('[zeus] native-watcher start failed:', e.message);
+  2900	      }
+  2901	      try {
+  2902	        const status = await this.daemonLifecycle.ensureRunning();
+  2903	        dbg('[zeus] daemon lifecycle:', status);
+  2904	        // v1.5.1 — fix P2 codex review: quando o lifecycle sobe (ou reaproveita)
+  2905	        // um daemon local em 127.0.0.1:2223, redireciona httpClient pra ele,
+  2906	        // sobrescrevendo cache antigo. Sem
+  2907	        // esse rebase, plugin spawna localmente mas continua falando com peer
+  2908	        // remoto — "drop-in/on-device" não cumprido.
+  2909	        if (status && status.running && status.url && this.httpClient.baseUrl !== status.url) {
+  2910	          dbg('[zeus] httpClient rebase:', this.httpClient.baseUrl, '→', status.url);
+  2911	          this.httpClient.setBaseUrl(status.url);
+  2912	          _zeusSetLocalDaemonUrl(status.url);
+  2913	        }
+  2914	      } catch (e) {
+  2915	        console.warn('[zeus] daemon lifecycle ensureRunning failed:', e.message);
+  2916	      }
+  2917	    }
+  2918	
+  2919	    // v0.7.0 — image similarity search via feature-print cache
+  2920	    this.imageSimilarity = new ImageSimilaritySearch(this);
+  2921	    // v0.9.0 — Passport Index Architecture (PIA): MCP-first agent surface
+  2922	    this.passport = new PassportIndex(this);
+  2923	    this.basesGen = new BasesGenerator(this);
+  2924	
+  2925	    // v1.11 Feature H — IoQueue: fila iCloud-mediada para Mac consumir tarefas
+  2926	    // geradas em iOS sem daemon. Precisa estar disponível ANTES do AutoIndexer
+  2927	    // (que enfileira quando passport.buildOne falha em iOS).
+  2928	    this.ioQueue = new IoQueue(this);
+  2929	
+  2930	    // v1.11 Feature I — LexicalIosIndex (BM25 persistido com stems pt-BR).
+  2931	    // Build full é opt-in via settings.lexicalIosAutoBuild OU comando manual.
+  2932	    // Incrementals rodam via AutoIndexer ~30s após modify.
+  2933	    this.lexicalIos = new LexicalIosIndex(this);
+  2934	    // v1.15 — embed on-device: daemon local (loopback) + transformers.js labs
+  2935	    this.embedIos = new EmbedIosLib(this);
+  2936	    this.embedLocalDaemon = new EmbedIosLib.LocalDaemonEmbed(this);
+  2937	    if (this.settings.lexicalIosAutoBuild) {
+  2938	      setTimeout(async () => {
+  2939	        try {
+  2940	          dbg('[zeus.lexical-ios] auto-build starting…');
+  2941	          const r = await this.lexicalIos.build((msg, pct) => {
+  2942	            if (pct % 25 === 0) dbg(`[zeus.lexical-ios] ${pct}%`, msg);
+  2943	          });
+  2944	          dbg('[zeus.lexical-ios] auto-build done:', r);
+  2945	        } catch (e) {
+  2946	          console.warn('[zeus.lexical-ios] auto-build failed:', e.message);
+  2947	        }
+  2948	      }, 8000);
+  2949	    }
+  2950	
+  2951	    // v1.11.1 — codex HIGH #1: AutoIndexer movido para DEPOIS do coordinator setup.
+  2952	    // Antes, AutoIndexer.start() rodava sem coordinator.deviceId disponível —
+  2953	    // ioQueue.enqueue iOS detection (`/ios|ipad/i.test(deviceId)`) falhava silente.
+  2954	
+  2955	    // v0.10.0 — Cross-device coordination (claim/release via iCloud-synced locks)
+  2956	    this.coordinator = new DistributedCoordinator(this, {
+  2957	      deviceId: this.settings.deviceId || undefined,
+  2958	      ttlMs: this.settings.coordTtlMs || 60_000,
+  2959	    });
+  2960	    // v1.4.2 — deviceId é PER-DEVICE: armazenado em localStorage (NÃO sincronizado via iCloud).
+  2961	    // data.json sincronizado entre Mac mini, MacBook, iPad, iPhone — persistir deviceId lá
+  2962	    // contaminaria todos os devices fazendo eles assumirem a identidade do último que escreveu.
+  2963	    // localStorage é per-Obsidian-install, isolado por device.
+  2964	    const ZEUS_LOCAL_DEVICE_ID_KEY = 'zeus.device.id';
+  2965	    let _localDeviceId = null;
+  2966	    try {
+  2967	      if (typeof window !== 'undefined' && window.localStorage) {
+  2968	        _localDeviceId = window.localStorage.getItem(ZEUS_LOCAL_DEVICE_ID_KEY);
+  2969	      }
+  2970	    } catch (_) {}
+  2971	    if (!_localDeviceId) {
+  2972	      _localDeviceId = this.coordinator.deviceId;  // generated by DistributedCoordinator
+  2973	      try {
+  2974	        if (typeof window !== 'undefined' && window.localStorage) {
+  2975	          window.localStorage.setItem(ZEUS_LOCAL_DEVICE_ID_KEY, _localDeviceId);
+  2976	        }
+  2977	      } catch (_) {}
+  2978	      dbg('[zeus] generated per-device deviceId (localStorage):', _localDeviceId);
+  2979	    }
+  2980	    // settings.deviceId fica em memória apenas — overrides do coordinator com o per-device.
+  2981	    const _persistedDeviceId = this.settings.deviceId;  // v1.14 — valor vindo do data.json (pode ser legado)
+  2982	    this.settings.deviceId = _localDeviceId;
+  2983	    this.coordinator.deviceId = _localDeviceId;
+  2984	
+  2985	    // v1.11.1 — AutoIndexer (movido para cá após coordinator pronto, codex HIGH #1).
+  2986	    this.autoIndexer = new AutoIndexer(this);
+  2987	    if (this.settings.autoIndexEnabled !== false) {
+  2988	      try {
+  2989	        const ai = this.autoIndexer.start();
+  2990	        dbg('[zeus] auto-indexer:', ai);
+  2991	      } catch (e) {
+  2992	        console.warn('[zeus] auto-indexer start failed:', e.message);
+  2993	      }
+  2994	    }
+  2995	    // v1.14 — codex #6 / S8 Check 3: flush de deviceId legado. Se o data.json
+  2996	    // sincronizado (iCloud) ainda tinha deviceId persistido, regrava SEM ele
+  2997	    // (saveSettings já filtra deviceId via destructuring). Guard evita write
+  2998	    // em todo boot: só flusha quando havia valor stale no disco.
+  2999	    if (_persistedDeviceId) {
+  3000	      dbg('[zeus] flush deviceId legado do data.json sincronizado');
+  3001	      try { await this.saveSettings(); } catch (e) { console.warn('[zeus] flush deviceId falhou:', e.message); }
+  3002	    }
+  3003	    // v0.10.0 — Background scheduler for stale-passport detection + claim-coordinated re-extract
+  3004	    this.scheduler = new PassportScheduler(this, {
+  3005	      intervalMs: this.settings.schedulerIntervalMs || 15 * 60 * 1000,
+  3006	    });
+  3007	    if (this.settings.schedulerEnabled) {
+  3008	      this.scheduler.start();
+  3009	    }
+  3010	
+  3011	    // v1.11 Feature H — Mac-side ioQueue consumer: periodicamente (15min)
+  3012	    // verifica se há tasks deixadas por iOS via iCloud e processa via daemon.
+  3013	    // Boot consume após 20s (deixa daemon estabilizar + iCloud sync inicial).
+  3014	    if (isMac() && this.ioQueue) {
+  3015	      const consumeAllPending = async () => {
+  3016	        try {
+  3017	          const tasks = await this.ioQueue.list();
+  3018	          if (tasks.length === 0) return;
+  3019	          dbg('[zeus.io-queue] consumindo', tasks.length, 'tasks pendentes');
+  3020	          for (const task of tasks) {
+  3021	            await this.ioQueue.consume(task, async (t) => {
+  3022	              if (t.type === 'passport') {
+  3023	                if (!this.passport || typeof this.passport.buildOne !== 'function') {
+  3024	                  return { ok: false, error: 'passport API indisponível' };
+  3025	                }
+  3026	                // Mac processa com daemon FM via buildOne (que prefere daemon).
+  3027	                let absPath = t.path;
+  3028	                if (t.path && !t.path.startsWith('/') && this.vaultRoot) {
+  3029	                  absPath = this.vaultRoot.replace(/\/$/, '') + '/' + t.path;
+  3030	                }
+  3031	                try {
+  3032	                  // Verifica se passport já existe E sha bate — alreadyDone idempotente.
+  3033	                  const existing = await this.passport.getPassport(t.path);
+  3034	                  if (existing && existing.sha === t.sha && existing.source !== 'ios-local') {
+  3035	                    return { ok: true, alreadyDone: true };
+  3036	                  }
+  3037	                  await this.passport.buildOne(absPath, []);
+  3038	                  return { ok: true };
+  3039	                } catch (e) {
+  3040	                  return { ok: false, error: e.message };
+  3041	                }
+  3042	              }
+  3043	              // Outros types (embed, spotlight) — Mac-side TODO; por enquanto,
+  3044	              // marca alreadyDone pra remover da fila (Mac auto-indexer já cobre).
+  3045	              return { ok: true, alreadyDone: true };
+  3046	            });
+  3047	          }
+  3048	        } catch (e) {
+  3049	          console.warn('[zeus.io-queue] consume loop failed:', e.message);
+  3050	        }
+  3051	      };
+  3052	      setTimeout(consumeAllPending, 20000);
+  3053	      // Periódico — 15min, mesmo intervalo do PassportScheduler para alinhar.
+  3054	      this._ioQueueIntervalId = setInterval(consumeAllPending, 15 * 60 * 1000);
+  3055	    }
+  3056	
+  3057	    // v1.8 — Multiplex auto-build (opt-in via settings). Roda em background
+  3058	    // após onLayoutReady para não bloquear o startup; falha silenciosa.
+  3059	    if (this.settings.multiplexAutoBuild) {
+  3060	      setTimeout(async () => {
+  3061	        try {
+  3062	          dbg('[zeus.multiplex] auto-build starting…');
+  3063	          await this.multiplex.buildFromVault((msg, pct) => {
+  3064	            if (pct % 25 === 0) dbg(`[zeus.multiplex] ${pct}%`, msg);
+  3065	          });
+  3066	          await this.multiplex.persist();
+  3067	          this._multiplexLoaded = true;
+  3068	          const s = this.multiplex.stats();
+  3069	          dbg('[zeus.multiplex] auto-build done:', s.total, 'edges');
+  3070	          // v1.9 — Leiden auto-run após multiplex pronto. Roda em sequência (não
+  3071	          // em paralelo) — Leiden depende do grafo congelado em memória.
+  3072	          if (this.settings.leidenAutoRun) {
+  3073	            try {
+  3074	              dbg('[zeus.leiden] auto-detect starting…');
+  3075	              const r = await this.leiden.detectCommunities({
+  3076	                resolution: this.settings.leidenResolution || 1.0,
+  3077	              });
+  3078	              await this.leiden.persist(r);
+  3079	              dbg('[zeus.leiden] auto-detect done:', r.stats.communityCount, 'comunidades, Q=', r.modularity.toFixed(3));
+  3080	            } catch (e2) {
+  3081	              console.warn('[zeus.leiden] auto-detect failed:', e2.message);
+  3082	            }
+  3083	          }
+  3084	        } catch (e) {
+  3085	          console.warn('[zeus.multiplex] auto-build failed:', e.message);
+  3086	        }
+  3087	      }, 5000);
+  3088	    }
+  3089	
+  3090	    // v0.6.1 — Adaptive daemon discovery (async, doesn't block onload)
+  3091	    // v1.4.1 — Discovery agora valida/refresh em paralelo: se cache localStorage
+  3092	    // está OK, isAvailable() responde rápido; se cache está stale, probes paralelos
+  3093	    // encontram URL viável em <2s e atualizam o cache + httpClient para os próximos calls.
+  3094	    this.app.workspace.onLayoutReady(async () => {
+  3095	      try {
+  3096	        // Primeiro: confirma se a URL atual (cache ou settings) responde. Se sim, evita re-probe.
+  3097	        const currentOk = await this.httpClient.isAvailable(1500);
+  3098	        let activeUrl = this.httpClient.baseUrl;
+  3099	        if (!currentOk) {
+  3100	          // URL atual morta — re-prova loopback + settings (on-device) em paralelo.
+  3101	          const discovered = await discoverDaemonUrl(this);
+  3102	          if (discovered && discovered !== activeUrl) {
+  3103	            dbg('[zeus] adapting daemon URL from', activeUrl, 'to', discovered);
+  3104	            this.httpClient.setBaseUrl(discovered);
+  3105	            activeUrl = discovered;
+  3106	          }
+  3107	        } else {
+  3108	          // URL atual funciona — refresh do timestamp do cache (sliding TTL).
+  3109	          _zeusSetLocalDaemonUrl(activeUrl);
+  3110	        }
+  3111	        // Probe daemon capabilities to log what's available
+  3112	        const health = await this.httpClient.health();
+  3113	        const tools = await this.httpClient.tools();
+  3114	        dbg('[zeus] daemon health:', health.status, '| platform:', health.platform, '| endpoints:', (health.endpoints || []).length, '| tools:', tools.length, '| url:', activeUrl);
+  3115	        if (health.status === 'ok') {
+  3116	          const isLocal = _zeusIsLoopback(activeUrl);
+  3117	          new Notice(`Zeus: daemon ${health.platform || '?'} ${isLocal ? 'LOCAL ✓' : 'local'} · ${(health.endpoints || []).length} endpoints`);
+  3118	        } else {
+  3119	          // v1.4.1 — Instruções per-platform: cada device tem infra Apple nativa para rodar seu daemon.
+  3120	          const macHint = 'macOS: o plugin auto-spawna bin/ZeusDaemonMac; se falhar, rode `bash daemon/scripts/install-mac-daemon.sh` (LaunchAgent).';
+  3121	          const iosHint = 'iOS: sem daemon on-device (esperado) — busca roda nas lanes JS sobre os índices computados no Mac e sincronizados via iCloud.';
+  3122	          const platformHint = isMac() ? macHint : iosHint;
+  3123	          new Notice(`Zeus: daemon local indisponível em ${activeUrl}.\n${platformHint}`, 15000);
+  3124	        }
+  3125	      } catch (e) {
+  3126	        console.warn('[zeus] adaptive discovery skipped:', e.message);
+  3127	      }
+  3128	    });
+
+exec
+/bin/zsh -lc "nl -ba lib/embed-ios.js | sed -n '1,239p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+exec
+/bin/zsh -lc "nl -ba lib/zeus-http-client.js | sed -n '1,230p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+     1	/*
+     2	 * embed-ios.js — iOS embed schema versionado + embed via daemon LOCAL.
+     3	 *
+     4	 * v1.15 — arquitetura ON-DEVICE pura (sem relay). Two-tier:
+     5	 *
+     6	 *   CAMADA 1 — daemon Apple-nativo LOCAL (loopback). No Mac, o daemon local
+     7	 *     (ZeusDaemonMac, auto-spawn) computa NLContextualEmbedding 512-dim e
+     8	 *     persiste em data/embeddings.jsonl, que sincroniza via iCloud. No iOS não
+     9	 *     há daemon (sandbox) → o índice já vem pronto do Mac via sync; a busca usa
+    10	 *     as lanes JS. Sem Tailscale, sem rota remota.
+    11	 *
+    12	 *   CAMADA 2 (opt-in labs, default OFF) — transformers.js + multilingual-e5-small
+    13	 *     ~118MB lazy-fetch via huggingface.co em primeiro use. Cache via Browser
+    14	 *     Cache API (NÃO IndexedDB — codex notou: Transformers.js usa env.useBrowserCache).
+    15	 *     Persiste em data/embeddings-ios.jsonl (384-dim, schema separado).
+    16	 *     Quality: e5 multilingual ~80% NLContextualEmbedding pt-BR. Latência:
+    17	 *     500-1500ms via WASM no WKWebView.
+    18	 *     v1.12 ENTREGA: stub + comando "instalar modelo" (copia instruções pro
+    19	 *     clipboard estilo MobileCLIP v1.9). Integração runtime transformers.js
+    20	 *     deferida pra ADR-011 v1.13 labs (precisa bundle config + CSP audit real).
+    21	 *
+    22	 * SCHEMA versionado (codex MED — separação rigorosa Mac×iOS):
+    23	 *   embeddings.jsonl  — 512-dim NLContextualEmbedding (Apple Mac/iOS daemon)
+    24	 *   embeddings-ios.jsonl — 384-dim multilingual-e5-small (transformers.js iOS)
+    25	 *
+    26	 *   Cada linha em ambos:
+    27	 *     {
+    28	 *       schema: 'zeus-embeddings-v1',
+    29	 *       path: 'note/path.md',
+    30	 *       sha: '...',
+    31	 *       mtime: 1700000000000,
+    32	 *       title: '...',
+    33	 *       model_id: 'apple-nlcontextual-pt-BR' | 'Xenova/multilingual-e5-small',
+    34	 *       model_revision: '...',         // commit/tag do modelo
+    35	 *       dim: 512 | 384,                // recusa carregar se mismatch
+    36	 *       device_class: 'mac' | 'ios' | 'ipad',
+    37	 *       text_sha: '...',               // hash do texto embedado (não do file)
+    38	 *       source: 'daemon-mac' | 'daemon-local' | 'transformers-ios',
+    39	 *       created_at: '2026-05-20T...',
+    40	 *       vec: [Float, ...],
+    41	 *     }
+    42	 *
+    43	 * RRF cross-dim: HybridSearch fuse() usa rank position (não cosine cross-dim),
+    44	 * portanto seguro adicionar embeddings-ios como 7º retriever desde que cada
+    45	 * device leia SÓ seu próprio jsonl (loader recusa dim mismatch).
+    46	 */
+    47	
+    48	'use strict';
+    49	
+    50	const universal = require('./universal-fs');
+    51	
+    52	const EMBED_IOS_FILE = 'embeddings-ios.jsonl';
+    53	const EMBED_IOS_DIM = 384;          // multilingual-e5-small
+    54	const EMBED_IOS_MODEL = 'Xenova/multilingual-e5-small';
+    55	const EMBED_MAC_DIM = 512;          // NLContextualEmbedding
+    56	const EMBED_MAC_MODEL = 'apple-nlcontextual-pt-BR';
+    57	
+    58	class EmbedIos {
+    59	  constructor(plugin) {
+    60	    this.plugin = plugin;
+    61	    this._entries = new Map();        // path → entry
+    62	    this._loaded = false;
+    63	    this._writePromise = null;        // mutex
+    64	  }
+    65	
+    66	  get _adapter() { return this.plugin.app.vault.adapter; }
+    67	  get dataPath() { return universal.joinPath(this.plugin.manifest.dir, 'data'); }
+    68	  get jsonlPath() { return universal.joinPath(this.dataPath, EMBED_IOS_FILE); }
+    69	
+    70	  async load() {
+    71	    if (this._loaded) return;
+    72	    if (!(await universal.adapterExists(this._adapter, this.jsonlPath))) {
+    73	      this._loaded = true;
+    74	      return;
+    75	    }
+    76	    try {
+    77	      const raw = await universal.adapterRead(this._adapter, this.jsonlPath);
+    78	      for (const line of raw.split('\n').filter(Boolean)) {
+    79	        try {
+    80	          const obj = JSON.parse(line);
+    81	          // codex MED: loader recusa dim mismatch (não truncar silente).
+    82	          if (!obj || !obj.path) continue;
+    83	          if (obj.dim !== EMBED_IOS_DIM) {
+    84	            console.warn('[zeus.embed-ios] skip linha dim mismatch:', obj.path, 'dim=', obj.dim);
+    85	            continue;
+    86	          }
+    87	          if (!Array.isArray(obj.vec) || obj.vec.length !== EMBED_IOS_DIM) {
+    88	            console.warn('[zeus.embed-ios] skip linha vec inválida:', obj.path);
+    89	            continue;
+    90	          }
+    91	          this._entries.set(obj.path, obj);
+    92	        } catch (e) { /* skip malformed */ }
+    93	      }
+    94	    } catch (e) {
+    95	      console.warn('[zeus.embed-ios] load failed:', e.message);
+    96	    }
+    97	    this._loaded = true;
+    98	  }
+    99	
+   100	  // Get entry por path (iOS-local 384-dim).
+   101	  async get(path) {
+   102	    await this.load();
+   103	    return this._entries.get(path) || null;
+   104	  }
+   105	
+   106	  // Persist atomic. Mutex serializa concorrentes (v1.8.1 pattern).
+   107	  async _persist() {
+   108	    if (this._writePromise) await this._writePromise.catch(() => {});
+   109	    this._writePromise = (async () => {
+   110	      try {
+   111	        await universal.adapterMkdir(this._adapter, this.dataPath);
+   112	        const lines = [];
+   113	        for (const e of this._entries.values()) lines.push(JSON.stringify(e));
+   114	        await universal.adapterWriteAtomic(this._adapter, this.jsonlPath, lines.join('\n'));
+   115	      } finally {
+   116	        this._writePromise = null;
+   117	      }
+   118	    })();
+   119	    return this._writePromise;
+   120	  }
+   121	
+   122	  // Upsert entry. Validate schema + dim.
+   123	  async upsert(entry) {
+   124	    await this.load();
+   125	    if (!entry || !entry.path) throw new Error('embed-ios.upsert: path obrigatório');
+   126	    if (entry.dim !== EMBED_IOS_DIM) throw new Error(`embed-ios.upsert: dim ${entry.dim} ≠ ${EMBED_IOS_DIM}`);
+   127	    if (!Array.isArray(entry.vec) || entry.vec.length !== EMBED_IOS_DIM) {
+   128	      throw new Error('embed-ios.upsert: vec inválido');
+   129	    }
+   130	    // Garante schema fields obrigatórios
+   131	    entry.schema = entry.schema || 'zeus-embeddings-v1';
+   132	    entry.model_id = entry.model_id || EMBED_IOS_MODEL;
+   133	    entry.created_at = entry.created_at || new Date().toISOString();
+   134	    entry.source = entry.source || 'transformers-ios';
+   135	    this._entries.set(entry.path, entry);
+   136	    await this._persist();
+   137	    return { upserted: entry.path, total: this._entries.size };
+   138	  }
+   139	
+   140	  // Removes entry (note deleted/renamed)
+   141	  async remove(path) {
+   142	    await this.load();
+   143	    if (this._entries.has(path)) {
+   144	      this._entries.delete(path);
+   145	      await this._persist();
+   146	      return { removed: true };
+   147	    }
+   148	    return { removed: false };
+   149	  }
+   150	
+   151	  // Stats
+   152	  async stats() {
+   153	    await this.load();
+   154	    return {
+   155	      schema: 'zeus-embeddings-v1',
+   156	      file: this.jsonlPath,
+   157	      model_id: EMBED_IOS_MODEL,
+   158	      dim: EMBED_IOS_DIM,
+   159	      count: this._entries.size,
+   160	      runtime_installed: await this._modelInstalled(),
+   161	    };
+   162	  }
+   163	
+   164	  // Check se transformers.js + modelo estão instalados (cache local)
+   165	  async _modelInstalled() {
+   166	    // v1.12: detecção stub — checa se ~/.zeus-ios-embed-model/ existe no
+   167	    // application support (futuro v1.13 labs gravará aqui após primeiro fetch).
+   168	    // Por enquanto sempre retorna false (sem runtime instalado).
+   169	    return false;
+   170	  }
+   171	
+   172	  /**
+   173	   * Embed um texto via transformers.js (lazy-load).
+   174	   * v1.12 ENTREGA: stub que retorna instrução acionável quando runtime ausente.
+   175	   * v1.13 labs implementará lazy-import xenova/transformers + modelo fetch.
+   176	   */
+   177	  async embedText(text) {
+   178	    if (!(await this._modelInstalled())) {
+   179	      throw new Error(
+   180	        'embed-ios runtime não instalado. Rode comando "Zeus: instalar modelo iOS embed". '
+   181	        + 'v1.12 ENTREGA é stub; runtime transformers.js completo em v1.13 labs (ADR-011).',
+   182	      );
+   183	    }
+   184	    // TODO v1.13: const { pipeline } = await import('@xenova/transformers');
+   185	    //             const ext = await pipeline('feature-extraction', EMBED_IOS_MODEL, { quantized: true });
+   186	    //             const out = await ext('query: ' + text, { pooling: 'mean', normalize: true });
+   187	    //             return Array.from(out.data);
+   188	    throw new Error('embed-ios.embedText: runtime não implementado em v1.12');
+   189	  }
+   190	}
+   191	
+   192	// =========================================================================
+   193	// LocalDaemonEmbed — embed via daemon Apple-nativo LOCAL (loopback).
+   194	// v1.15: on-device puro. No Mac, o httpClient fala com o ZeusDaemonMac local
+   195	// (127.0.0.1, auto-spawn) → NLContextualEmbedding 512-dim. No iOS não há daemon
+   196	// (sandbox) → tryEmbed retorna {ok:false, reason:'daemon-unreachable'} gracioso,
+   197	// e a busca cai nas lanes JS. Sem relay/Tailscale.
+   198	// =========================================================================
+   199	
+   200	class LocalDaemonEmbed {
+   201	  constructor(plugin) {
+   202	    this.plugin = plugin;
+   203	  }
+   204	
+   205	  /**
+   206	   * Tenta embed via daemon HTTP LOCAL (loopback).
+   207	   * Sucesso → retorna {ok: true, vec, dim, model, source}
+   208	   * Falha → retorna {ok: false, reason}  (não lança — gracioso)
+   209	   */
+   210	  async tryEmbed(text, options = {}) {
+   211	    if (!this.plugin.httpClient) return { ok: false, reason: 'no-httpClient' };
+   212	    if (!text || text.length < 2) return { ok: false, reason: 'text-too-short' };
+   213	    try {
+   214	      const available = await this.plugin.httpClient.isAvailable(1500);
+   215	      if (!available) return { ok: false, reason: 'daemon-unreachable' };
+   216	      const r = await this.plugin.httpClient.embed(text, options);
+   217	      const vec = (r && r.vectors && r.vectors[0]) || (r && r.vector) || null;
+   218	      if (!Array.isArray(vec) || vec.length !== EMBED_MAC_DIM) {
+   219	        return { ok: false, reason: `dim-mismatch: ${vec ? vec.length : 'null'}` };
+   220	      }
+   221	      return {
+   222	        ok: true,
+   223	        vec,
+   224	        dim: EMBED_MAC_DIM,
+   225	        model: (r && r.model) || EMBED_MAC_MODEL,
+   226	        source: 'daemon-local',
+   227	      };
+   228	    } catch (e) {
+   229	      return { ok: false, reason: (e.message || String(e)).slice(0, 100) };
+   230	    }
+   231	  }
+   232	}
+   233	
+   234	module.exports = EmbedIos;
+   235	module.exports.LocalDaemonEmbed = LocalDaemonEmbed;
+   236	module.exports.EMBED_IOS_DIM = EMBED_IOS_DIM;
+   237	module.exports.EMBED_IOS_MODEL = EMBED_IOS_MODEL;
+   238	module.exports.EMBED_MAC_DIM = EMBED_MAC_DIM;
+   239	module.exports.EMBED_MAC_MODEL = EMBED_MAC_MODEL;
+
+ succeeded in 0ms:
+     1	/*
+     2	 * ZeusHttpClient — daemon HTTP transport (v0.9 padrão Aegis — full Apple ecosystem + PIA)
+     3	 *
+     4	 * Cliente HTTP que fala com o daemon Swift nativo LOCAL em 127.0.0.1:2223.
+     5	 * v1.15 — ON-DEVICE puro: setBaseUrl/constructor COAGEM qualquer URL não-loopback
+     6	 * para o loopback default. O client é estruturalmente incapaz de falar com host
+     7	 * remoto — sem relay, sem Tailscale. Substitui o child_process.spawn no hot path.
+     8	 *
+     9	 * Mesmo código funciona em Mac, iPhone, iPad — porque usa Obsidian's
+    10	 * requestUrl API (bypass CORS oficial em mobile + Electron).
+    11	 *
+    12	 * v0.9 — Passport Index Architecture (PIA) endpoints:
+    13	 *   POST /v1/passport/extract        body: {path, domain_options}
+    14	 *   POST /v1/passport/batch-extract  body: {paths, domain_options}
+    15	 *   POST /v1/passport/find           body: {query, embeddings_jsonl_path, passports_jsonl_path,
+    16	 *                                            top_n, min_score, concept_filter}
+    17	 *   POST /v1/content/get             body: {path, vault_root, max_chars}
+    18	 *
+    19	 * v0.9 — Token metrics: this.metrics tracks bytes in/out per endpoint.
+    20	 *
+    21	 * Endpoints canônicos (per ADR-018) — v0.7 cobertura completa Apple frameworks:
+    22	 *   POST /v1/embed                  body: {text}                  → {vectors, dim, model, count}
+    23	 *   POST /v1/enrich                 body: {note_content, note_path, vault_summary}
+    24	 *   POST /v1/agent                  body: {question, pattern}
+    25	 *   POST /v1/ocr                    body: {path, output_format, language}
+    26	 *   POST /v1/summarize              body: {text}
+    27	 *   POST /v1/graph/extract          body: {text, max_nodes, max_edges}
+    28	 *   POST /v1/classify               body: {text, options}
+    29	 *   POST /v1/prompt                 body: {instruction, max_tokens, deterministic}
+    30	 *   POST /v1/vision/classify        body: {path, top_n}
+    31	 *   POST /v1/vision/landmarks       body: {path}
+    32	 *   POST /v1/vision/saliency        body: {path, mode}             (NEW v0.7 — VNGenerateAttentionBasedSaliencyImageRequest)
+    33	 *   POST /v1/vision/feature-print   body: {path}                   (NEW v0.7 — VNGenerateImageFeaturePrintRequest 768-dim)
+    34	 *   POST /v1/vision/aesthetics      body: {path}                   (NEW v0.7 — VNCalculateImageAestheticsScoresRequest)
+    35	 *   POST /v1/vision/barcode         body: {path}                   (NEW v0.7 — VNDetectBarcodesRequest)
+    36	 *   POST /v1/vision/document        body: {path}                   (NEW v0.7 — VNRecognizeDocumentsRequest layout-aware)
+    37	 *   POST /v1/translate              body: {text, source_lang, target_lang} (NEW v0.7 — Apple Translation framework)
+    38	 *   POST /v1/nl/tag                 body: {text, scheme}           (NEW v0.7 — NLTagger lemma/nameType)
+    39	 *   POST /v1/nl/sentiment           body: {text}                   (NEW v0.7 — NLTagger sentimentScore)
+    40	 *   POST /v1/nl/language-detect     body: {text, top_n}            (NEW v0.7 — NLLanguageRecognizer)
+    41	 *   POST /v1/data-detect            body: {text}                   (NEW v0.7 — NSDataDetector URLs/phones/dates)
+    42	 *   POST /v1/spotlight/search       body: {query, scope, limit}    (NEW v0.7 — CSSearchQuery bridge)
+    43	 *   GET  /v1/health
+    44	 *   GET  /v1/tools
+    45	 *
+    46	 * Referência: 20_Arquitetura/ADR/ADR-018-Zeus-Architecture-Aegis-Pattern.md
+    47	 */
+    48	
+    49	'use strict';
+    50	
+    51	const universal = require('./universal-fs');
+    52	
+    53	// v1.15 — ON-DEVICE puro: o transporte só fala loopback. Qualquer URL não-loopback
+    54	// (config legado, discovery, qualquer caller) é coagida para o default loopback —
+    55	// o client é estruturalmente incapaz de falar com host remoto (sem relay).
+    56	const ZEUS_LOOPBACK_DEFAULT = 'http://127.0.0.1:2223';
+    57	function _zeusCoerceLoopback(url) {
+    58	  const u = (url || '').replace(/\/$/, '');
+    59	  if (!u) return ZEUS_LOOPBACK_DEFAULT;
+    60	  if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]|::1)(:\d+)?(\/|$)/i.test(u)) return u;
+    61	  try { console.warn('[zeus] URL não-loopback recusada (on-device puro), usando loopback:', u); } catch (_) {}
+    62	  return ZEUS_LOOPBACK_DEFAULT;
+    63	}
+    64	
+    65	class ZeusHttpClient {
+    66	  constructor(baseUrl) {
+    67	    this.baseUrl = _zeusCoerceLoopback(baseUrl);
+    68	    this.healthCache = null;
+    69	    this.healthCheckedAt = 0;
+    70	    this.HEALTH_TTL_MS = 30000;   // re-probe daemon health every 30s
+    71	
+    72	    // v0.9 — Token economics instrumentation
+    73	    this.metrics = {
+    74	      requests: 0,
+    75	      bytesIn: 0,        // bytes received from daemon (response payload)
+    76	      bytesOut: 0,       // bytes sent to daemon (request payload)
+    77	      byEndpoint: new Map(),   // endpoint → { count, bytesIn, bytesOut }
+    78	      startedAt: Date.now(),
+    79	    };
+    80	
+    81	    // v2.0 — Apple Cloud Private (PCC) routing. v1.15: o routing real é decidido
+    82	    // pela Apple (sem API pública de controle/inspeção). Estes modos só controlam
+    83	    // a PERMISSÃO enviada no header; o daemon sinaliza POSSIBILIDADE de cloud.
+    84	    // pccMode: 'off' | 'opt-in' | 'auto'
+    85	    //   'off'    → no PCC permission header sent; on-device only
+    86	    //   'opt-in' → header X-Zeus-Allow-Pcc:1; Apple decides per request
+    87	    //   'auto'   → header X-Zeus-Allow-Pcc:auto; daemon flags possibility when load exceeds on-device
+    88	    // v1.15 — codex #5: "used" virou "possible". O daemon NÃO consegue medir uso
+    89	    // real de PCC (Apple não expõe API de inspeção); só estima possibilidade. Os
+    90	    // campos refletem honestamente "cloud era possível", não "cloud foi usado".
+    91	    this.pccMode = 'off';
+    92	    this.lastPccPossible = false;      // updated from response header X-Zeus-Pcc-Possible
+    93	    this.pccPossibleCount = 0;         // total requests onde cloud era possível (heurística)
+    94	  }
+    95	
+    96	  setPccMode(mode) {
+    97	    const valid = ['off', 'opt-in', 'auto'];
+    98	    this.pccMode = valid.includes(mode) ? mode : 'off';
+    99	  }
+   100	
+   101	  getPccStatus() {
+   102	    return {
+   103	      mode: this.pccMode,
+   104	      lastPossible: this.lastPccPossible,
+   105	      possibleCount: this.pccPossibleCount,
+   106	    };
+   107	  }
+   108	
+   109	  /**
+   110	   * Snapshot of current metrics + estimated token cost.
+   111	   * Heuristic: 1 token ~= 4 bytes for English/Portuguese text (very rough).
+   112	   */
+   113	  getMetrics() {
+   114	    const byEndpoint = {};
+   115	    for (const [k, v] of this.metrics.byEndpoint) {
+   116	      byEndpoint[k] = {
+   117	        count: v.count,
+   118	        bytesIn: v.bytesIn,
+   119	        bytesOut: v.bytesOut,
+   120	        estimatedTokens: Math.round((v.bytesIn + v.bytesOut) / 4),
+   121	      };
+   122	    }
+   123	    return {
+   124	      requests: this.metrics.requests,
+   125	      bytesIn: this.metrics.bytesIn,
+   126	      bytesOut: this.metrics.bytesOut,
+   127	      estimatedTokens: Math.round((this.metrics.bytesIn + this.metrics.bytesOut) / 4),
+   128	      byEndpoint,
+   129	      sinceMs: Date.now() - this.metrics.startedAt,
+   130	    };
+   131	  }
+   132	
+   133	  resetMetrics() {
+   134	    this.metrics = {
+   135	      requests: 0,
+   136	      bytesIn: 0,
+   137	      bytesOut: 0,
+   138	      byEndpoint: new Map(),
+   139	      startedAt: Date.now(),
+   140	    };
+   141	  }
+   142	
+   143	  _recordMetric(endpoint, bytesOut, bytesIn) {
+   144	    this.metrics.requests++;
+   145	    this.metrics.bytesOut += bytesOut;
+   146	    this.metrics.bytesIn += bytesIn;
+   147	    let row = this.metrics.byEndpoint.get(endpoint);
+   148	    if (!row) { row = { count: 0, bytesIn: 0, bytesOut: 0 }; this.metrics.byEndpoint.set(endpoint, row); }
+   149	    row.count++;
+   150	    row.bytesIn += bytesIn;
+   151	    row.bytesOut += bytesOut;
+   152	  }
+   153	
+   154	  setBaseUrl(url) {
+   155	    this.baseUrl = _zeusCoerceLoopback(url);   // v1.15 — chokepoint: só loopback
+   156	    this.healthCache = null;
+   157	  }
+   158	
+   159	  _isLoopbackBaseUrl() {
+   160	    return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(this.baseUrl || '');
+   161	  }
+   162	
+   163	  _isPrivatePath(path, payload = {}) {
+   164	    if (typeof path === 'string' && path) {
+   165	      // vault-relative (Clientes/...) OU absoluto/aninhado (/Users/.../Clientes/...)
+   166	      if (/^Clientes\//i.test(path.replace(/^\/+/, ''))) return true;
+   167	      if (/(^|\/)Clientes\//i.test(path)) return true;
+   168	    }
+   169	    if (payload && payload.privacy && /sigiloso/i.test(String(payload.privacy))) return true;
+   170	    return false;
+   171	  }
+   172	
+   173	  _assertRawContentAllowed(endpoint, options = {}) {
+   174	    const privacyPath = options._privacyPath || options.privacyPath || options.path || null;
+   175	    if (!this._isLoopbackBaseUrl() && this._isPrivatePath(privacyPath, options)) {
+   176	      throw new Error(
+   177	        `privacy-gate: ${endpoint} recusou enviar conteúdo sigiloso para daemon remoto (${this.baseUrl})`,
+   178	      );
+   179	    }
+   180	  }
+   181	
+   182	  // Lazy health check — cached for HEALTH_TTL_MS
+   183	  // v1.4.1 — timeoutMs (default 1500ms): probes precisam falhar rápido em URLs mortas
+   184	  // para que discovery cross-device funcione sem travar Obsidian no startup.
+   185	  async isAvailable(timeoutMs = 1500) {
+   186	    const now = Date.now();
+   187	    if (this.healthCache !== null && (now - this.healthCheckedAt) < this.HEALTH_TTL_MS) {
+   188	      return this.healthCache;
+   189	    }
+   190	    try {
+   191	      // Race a probe HTTP contra um timer — Obsidian's requestUrl não respeita AbortController,
+   192	      // então usamos Promise.race como timeout externo.
+   193	      const probe = this._requestUrl({
+   194	        url: `${this.baseUrl}/v1/health`,
+   195	        method: 'GET',
+   196	        throw: false,
+   197	      });
+   198	      const timeout = new Promise(resolve =>
+   199	        setTimeout(() => resolve({ status: 0, _timedOut: true }), timeoutMs)
+   200	      );
+   201	      const resp = await Promise.race([probe, timeout]);
+   202	      const ok = resp && resp.status >= 200 && resp.status < 300;
+   203	      this.healthCache = ok;
+   204	    } catch {
+   205	      this.healthCache = false;
+   206	    }
+   207	    this.healthCheckedAt = Date.now();
+   208	    return this.healthCache;
+   209	  }
+   210	
+   211	  // v2.0 — Inject PCC routing header into outgoing request headers.
+   212	  _pccHeaders() {
+   213	    if (this.pccMode === 'off') return {};
+   214	    if (this.pccMode === 'auto') return { 'X-Zeus-Allow-Pcc': 'auto' };
+   215	    return { 'X-Zeus-Allow-Pcc': '1' };  // opt-in
+   216	  }
+   217	
+   218	  // v2.0 — Read PCC-routing signal from response headers.
+   219	  // v1.15 — codex #5: o daemon sinaliza `X-Zeus-Pcc-Possible: 1` quando cloud era
+   220	  // POSSÍVEL (heurística), não quando foi comprovadamente usado — Apple não expõe
+   221	  // API de inspeção de routing.
+   222	  _readPccPossible(headers) {
+   223	    if (!headers) return false;
+   224	    // Obsidian requestUrl returns headers as plain object; fetch returns Headers instance
+   225	    const val = typeof headers.get === 'function'
+   226	      ? headers.get('x-zeus-pcc-possible') || headers.get('X-Zeus-Pcc-Possible')
+   227	      : (headers['x-zeus-pcc-possible'] || headers['X-Zeus-Pcc-Possible']);
+   228	    const possible = val === '1' || val === 'true';
+   229	    if (possible) this.pccPossibleCount++;
+   230	    this.lastPccPossible = possible;
+
+exec
+/bin/zsh -lc 'rg -n "EmbedRelay|embedRelay|_zeusGetMeshPeers|iosEmbedRelayEnabled|allowRemote|meshPeers|auth|authorization|bearer|x-auth|tailscale|remote|relay|token" main.source.js lib/zeus-http-client.js lib/embed-ios.js' in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+lib/embed-ios.js:4: * v1.15 — arquitetura ON-DEVICE pura (sem relay). Two-tier:
+lib/embed-ios.js:197:// e a busca cai nas lanes JS. Sem relay/Tailscale.
+lib/zeus-http-client.js:7: * remoto — sem relay, sem Tailscale. Substitui o child_process.spawn no hot path.
+lib/zeus-http-client.js:29: *   POST /v1/prompt                 body: {instruction, max_tokens, deterministic}
+lib/zeus-http-client.js:55:// o client é estruturalmente incapaz de falar com host remoto (sem relay).
+lib/zeus-http-client.js:110:   * Snapshot of current metrics + estimated token cost.
+lib/zeus-http-client.js:111:   * Heuristic: 1 token ~= 4 bytes for English/Portuguese text (very rough).
+lib/zeus-http-client.js:416:    // options: { max_tokens, deterministic, prewarm, _privacyPath, privacy }
+lib/zeus-http-client.js:419:      max_tokens: options.max_tokens || 300,
+lib/zeus-http-client.js:559:   * token-efficient first probe for agents.
+main.source.js:32: * Camadas de reasoning (opcionais, default OFF — janela 4096 tokens com
+main.source.js:235:  // FoundationModels reasoning layer (janela 4096 tokens; chunking hierárquico NexusSum
+main.source.js:271:  // v1.1 — Status bar: token-saved metrics
+main.source.js:273:  statusBarRefreshIntervalMs: 30000,        // 30s refresh para tokens metrics
+main.source.js:274:  rawTokenBaseline: 1250,                   // tokens médios sem PIA por request (~5KB/4)
+main.source.js:370:// ferramentas do próprio OS"). Sem relay/mesh. Cada device usa o daemon Apple-nativo
+main.source.js:1139:// Fits FoundationModels 4096-token window easily (short generation, no tools).
+main.source.js:1157:        [instruction, { max_tokens: 300, deterministic: true, prewarm: true, timeoutMs: 90000 }],
+main.source.js:1158:        ['prompt', instruction, '--deterministic', '--max-tokens', '300', '--prewarm'],
+main.source.js:1546:  // Size limit: FoundationModels janela é 4096 tokens (~10K chars com safety margin).
+main.source.js:1624:          ? 'FoundationModels janela 4096 tokens insuficiente para esta nota + vault context. Tente sub-folder menor ou nota mais curta.'
+main.source.js:1737:      text: 'Retorna passports (concepts + summary + domain + difficulty) sem conteúdo bruto — token-eficiente.',
+main.source.js:2343:    desc.appendText(' para PDFs/imagens. Sem BM25 próprio, sem tokenizer próprio, sem bge-micro-v2.');
+main.source.js:2375:      .setDesc('URL do daemon LOCAL (loopback). Mantenha em http://127.0.0.1:2223 — o plugin é on-device puro: macOS auto-spawna o ZeusDaemonMac local; iOS lê os índices sincronizados. Apenas URLs loopback (127.0.0.1/localhost/::1) são aceitas; URL remota é rejeitada (sem relay).')
+main.source.js:2379:          new Notice('Zeus: só URLs loopback (127.0.0.1/localhost) são aceitas — arquitetura on-device, sem relay.', 8000);
+main.source.js:2465:      .setDesc('Roda `metafm enrich` na nota ativa: FoundationModels lê notas relacionadas via tool-calling e sugere links + conexões. LIMITAÇÃO: FoundationModels tem janela 4096 tokens — system prompt + tool descrições consomem ~1500, sobrando ~2500 para o conteúdo da nota + tool responses. Notas >~2KB ou vault com muitos folders pode estourar (skip silencioso). Default off; ligue se trabalhar com notas curtas. Cache por SHA.')
+main.source.js:2584:    metricsDesc.appendText('Status bar exibe contagem de docs indexados e, opcionalmente, tokens economizados via ');
+main.source.js:2589:      .setName('Mostrar tokens economizados no status bar')
+main.source.js:2599:      .setDesc('Atualiza tokens economizados periodicamente. Default 30000 (30s). Aumente para reduzir overhead, diminua para feedback mais responsivo.')
+main.source.js:2623:      .setDesc('Zera contadores de tokens, bytes e requests do HTTP client. Útil após mudar baseline ou debugar.')
+main.source.js:3356:          const tags = (r && (r.tags || r.tokens)) || [];
+main.source.js:3357:          const preview = Array.isArray(tags) ? tags.slice(0, 20).map(t => (t.lemma || t.tag || t.token)).join(' ') : JSON.stringify(r).slice(0, 200);
+main.source.js:3359:          new Notice(`Lemma: ${tags.length || '?'} tokens (preview no console; JSON no clipboard)`);
+main.source.js:3733:    // v1.1 — refresh periódico do status bar com token-saved + PCC indicator.
+main.source.js:3804:          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+main.source.js:3805:          if (remote && IoQueue.isPrivatePath(rel)) {
+main.source.js:3867:          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+main.source.js:3868:          if (remote && IoQueue.isPrivatePath(rel)) {
+main.source.js:4501:          new Notice(`Zeus lexical-ios: ${r.N} notas, ${r.vocab} tokens (${r.elapsedMs}ms)`);
+main.source.js:4525:            `${h.path} (score ${h.score.toFixed(2)}, ${h.matched_tokens.length} match)`,
+main.source.js:4579:            '(BM25/Leiden/multiplex/cosine) — 100% on-device, offline, sem relay.',
+main.source.js:4738:      // v1.1 — token-saved metrics
+main.source.js:4756:  // conteúdo bruto (~5KB médio). Estimativa: tokens_saved = (raw_baseline -
+main.source.js:4757:  // actual_tokens) por request, somado ao longo da sessão.
+
+codex
+Há dois usos de `remote` que parecem sobras defensivas de privacy-gate, não uma rota executável por si só; vou abrir esses blocos para confirmar se ainda conseguem enviar algo para fora ou se ficaram mortos pela coerção loopback do client.
+exec
+/bin/zsh -lc "nl -ba lib/zeus-http-client.js | sed -n '230,639p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+   230	    this.lastPccPossible = possible;
+   231	    return possible;
+   232	  }
+   233	
+   234	  // Try to load Obsidian's requestUrl from the obsidian module; fallback to fetch on Node
+   235	  async _requestUrl({ url, method = 'GET', body, contentType = 'application/json', throw: throwOnError = true, signal = null }) {
+   236	    let obsidian;
+   237	    try { obsidian = require('obsidian'); } catch { obsidian = null; }
+   238	
+   239	    const pccHeaders = this._pccHeaders();
+   240	
+   241	    if (obsidian && obsidian.requestUrl) {
+   242	      // Obsidian environment — preferred
+   243	      const resp = await obsidian.requestUrl({
+   244	        url, method, contentType,
+   245	        headers: { 'Content-Type': contentType, ...pccHeaders },
+   246	        body: typeof body === 'string' ? body : (body ? JSON.stringify(body) : undefined),
+   247	        throw: throwOnError,
+   248	      });
+   249	      this._readPccPossible(resp.headers);
+   250	      return resp;
+   251	    }
+   252	
+   253	    // Node fallback (testing, scripts)
+   254	    if (typeof fetch === 'function') {
+   255	      const resp = await fetch(url, {
+   256	        method,
+   257	        headers: { 'Content-Type': contentType, ...pccHeaders },
+   258	        body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
+   259	        signal,
+   260	      });
+   261	      this._readPccPossible(resp.headers);
+   262	      const text = await resp.text();
+   263	      let json = null;
+   264	      try { json = JSON.parse(text); } catch {}
+   265	      return { status: resp.status, text, json, headers: resp.headers };
+   266	    }
+   267	
+   268	    throw new Error('Nenhum transporte HTTP disponível (sem obsidian.requestUrl, sem fetch)');
+   269	  }
+   270	
+   271	  async _post(endpoint, body, timeoutMs = 60000, privacyCtx = null) {
+   272	    // v1.14 — privacy gate CENTRALIZADO (codex HIGH #4). Cobre TODOS os endpoints,
+   273	    // não só /v1/embed. Deriva o path sensível do body (path/note_path/image_path)
+   274	    // ou de privacyCtx explícito (caso /v1/embed, cujo body é texto já extraído).
+   275	    const privacyPath = (privacyCtx && (privacyCtx._privacyPath || privacyCtx.privacyPath))
+   276	      || (body && typeof body === 'object'
+   277	        ? (body.path || body.note_path || body.notePath || body.image_path || null)
+   278	        : null);
+   279	    const privacyTag = (privacyCtx && privacyCtx.privacy)
+   280	      || (body && typeof body === 'object' ? body.privacy : null);
+   281	    this._assertRawContentAllowed(endpoint, { _privacyPath: privacyPath, privacy: privacyTag });
+   282	
+   283	    const ctrl = new (typeof AbortController !== 'undefined' ? AbortController : class { constructor(){this.signal=null;} abort(){} })();
+   284	    let timer = null;
+   285	    // v0.9 — instrument bytes-out (request payload)
+   286	    const bodyStr = typeof body === 'string' ? body : (body ? JSON.stringify(body) : '');
+   287	    const bytesOut = bodyStr ? universal.byteLength(bodyStr) : 0;
+   288	    try {
+   289	      const request = this._requestUrl({
+   290	        url: `${this.baseUrl}${endpoint}`,
+   291	        method: 'POST',
+   292	        body: bodyStr,
+   293	        signal: ctrl.signal,
+   294	      });
+   295	      const timeout = new Promise((_, reject) => {
+   296	        timer = setTimeout(() => {
+   297	          try { if (ctrl.abort) ctrl.abort(); } catch {}
+   298	          reject(new Error(`Daemon ${endpoint}: timeout após ${timeoutMs}ms`));
+   299	        }, timeoutMs);
+   300	      });
+   301	      const resp = await Promise.race([request, timeout]);
+   302	      // v0.9 — instrument bytes-in (response payload)
+   303	      const respText = resp.text || (resp.json ? JSON.stringify(resp.json) : '');
+   304	      const bytesIn = respText ? universal.byteLength(respText) : 0;
+   305	      this._recordMetric(endpoint, bytesOut, bytesIn);
+   306	
+   307	      if (resp.status >= 400) {
+   308	        const err = (resp.json && resp.json.error) || resp.text || `HTTP ${resp.status}`;
+   309	        throw new Error(`Daemon ${endpoint}: ${err}`);
+   310	      }
+   311	      return resp.json || JSON.parse(resp.text);
+   312	    } finally {
+   313	      clearTimeout(timer);
+   314	    }
+   315	  }
+   316	
+   317	  // High-level API mirroring afm CLI subcommands
+   318	  async embed(text, options = {}) {
+   319	    const { _privacyPath, privacyPath, privacy, ...wireOptions } = options || {};
+   320	    // privacy gate aplicado centralmente em _post via privacyCtx (body é texto, sem path)
+   321	    // Returns { vectors: [[...]], dim, model, count }
+   322	    return await this._post('/v1/embed', { text, ...wireOptions }, 60000,
+   323	      { _privacyPath: _privacyPath || privacyPath, privacy });
+   324	  }
+   325	
+   326	  // v1.3.0 — afm refine (Writing Tools nativo)
+   327	  // mode: "proofread|rewrite|simplify"; tone para rewrite: "academic|professional|casual"
+   328	  // v1.15 — codex round 5: aceita _privacyPath/privacy no options para o gate ver a
+   329	  // proveniência do `text` (conteúdo já extraído, sem path no body).
+   330	  async refine(text, mode = 'proofread', options = {}) {
+   331	    const { _privacyPath, privacyPath, privacy, ...wireOptions } = options || {};
+   332	    return await this._post('/v1/afm/refine', { text, mode, ...wireOptions }, 90000,
+   333	      { _privacyPath: _privacyPath || privacyPath, privacy });
+   334	  }
+   335	
+   336	  // v1.3.0 — asp transcribe (SpeechAnalyzer macOS 26+ ou SFSpeechRecognizer fallback)
+   337	  // engine: "sa|sf|auto" (default auto); locale: BCP47 (e.g. "pt-BR", "en-US")
+   338	  async aspTranscribe(absPath, locale = 'pt-BR', engine = 'auto') {
+   339	    return await this._post('/v1/asp/transcribe',
+   340	      { path: absPath, locale, engine },
+   341	      600000  // 10min para áudios longos + asset download primeira vez
+   342	    );
+   343	  }
+   344	
+   345	  // v1.3.0 — asp vad (Voice Activity Detection rápido, pré-filtro)
+   346	  async aspVad(absPath) {
+   347	    return await this._post('/v1/asp/vad', { path: absPath }, 15000);
+   348	  }
+   349	
+   350	  async embedBatch(texts, options = {}) {
+   351	    // v1.5 — daemon /v1/embed só aceita single `text`. Antes da v1.5 isso caía
+   352	    // no fallback `afm embed` CLI que recebia stdin batch; removido o CLI,
+   353	    // implementamos batch via N chamadas sequenciais. Para vault grande, manter
+   354	    // throughput aceitável (~20ms/embed no M2 Pro local) — caller costuma usar
+   355	    // BATCH=20 já. Eventualmente daemon ganha `{texts:[...]}` nativo.
+   356	    if (!Array.isArray(texts)) {
+   357	      throw new Error('embedBatch: requer array de strings');
+   358	    }
+   359	    const { _privacyPath, privacyPath, privacy, ...wireOptions } = options || {};
+   360	    const privacyCtx = { _privacyPath: _privacyPath || privacyPath, privacy };
+   361	    const vectors = [];
+   362	    let dim = 0, model = '';
+   363	    for (const t of texts) {
+   364	      const r = await this._post('/v1/embed', { text: t, ...wireOptions }, 30000, privacyCtx);
+   365	      const v = (r.vectors && r.vectors[0]) || r.vector;
+   366	      if (!Array.isArray(v)) throw new Error('embedBatch: daemon não retornou vetor para "' + (t || '').slice(0, 40) + '..."');
+   367	      vectors.push(v);
+   368	      if (!dim) { dim = r.dim || v.length; model = r.model || ''; }
+   369	    }
+   370	    return { vectors, dim, model, count: vectors.length };
+   371	  }
+   372	
+   373	  async enrich(noteContent, notePath, vaultSummary = '') {
+   374	    return await this._post('/v1/enrich', {
+   375	      note_content: noteContent,
+   376	      note_path: notePath,
+   377	      vault_summary: vaultSummary,
+   378	    }, 90000);
+   379	  }
+   380	
+   381	  async agent(question, pattern = 'auto') {
+   382	    return await this._post('/v1/agent', { question, pattern }, 180000);
+   383	  }
+   384	
+   385	  async ocr(filePath, outputFormat = 'text', language = 'pt-BR,en') {
+   386	    // v1.5 — daemon /v1/ocr handler exige `image_path` (ou `image_base64`).
+   387	    // Pré-v1.5 cliente enviava `path` que caía no CLI fallback; agora precisa
+   388	    // bater no contrato Swift exato. `output_format` e `language` ignorados
+   389	    // server-side mas mantidos por compat futura.
+   390	    const langArr = typeof language === 'string'
+   391	      ? language.split(',').map(s => s.trim()).filter(Boolean)
+   392	      : (Array.isArray(language) ? language : ['pt-BR', 'en-US']);
+   393	    return await this._post('/v1/ocr', {
+   394	      image_path: filePath,
+   395	      languages: langArr,
+   396	      output_format: outputFormat,
+   397	    }, 120000);
+   398	  }
+   399	
+   400	  // v1.15 — codex round 5: privacyCtx ({_privacyPath, privacy}) propaga a
+   401	  // proveniência do conteúdo já extraído para o gate central em _post. Sem isso,
+   402	  // texto vindo de Clientes/** escaparia por endpoints content-only (sem path no body).
+   403	  async summarize(text, privacyCtx = null) {
+   404	    return await this._post('/v1/summarize', { text }, 60000, privacyCtx);
+   405	  }
+   406	
+   407	  async graphExtract(text, maxNodes = 20, maxEdges = 30, privacyCtx = null) {
+   408	    return await this._post('/v1/graph/extract', { text, max_nodes: maxNodes, max_edges: maxEdges }, 60000, privacyCtx);
+   409	  }
+   410	
+   411	  async classify(text, options, privacyCtx = null) {
+   412	    return await this._post('/v1/classify', { text, options }, 60000, privacyCtx);
+   413	  }
+   414	
+   415	  async prompt(instruction, options = {}) {
+   416	    // options: { max_tokens, deterministic, prewarm, _privacyPath, privacy }
+   417	    const body = {
+   418	      instruction,
+   419	      max_tokens: options.max_tokens || 300,
+   420	      deterministic: options.deterministic !== false,
+   421	    };
+   422	    if (options.prewarm !== undefined) body.prewarm = options.prewarm;
+   423	    return await this._post('/v1/prompt', body, options.timeoutMs || 90000,
+   424	      { _privacyPath: options._privacyPath || options.privacyPath, privacy: options.privacy });
+   425	  }
+   426	
+   427	  async visionClassify(imagePath, topN = 8) {
+   428	    return await this._post('/v1/vision/classify', { path: imagePath, top_n: topN }, 30000);
+   429	  }
+   430	
+   431	  async visionLandmarks(imagePath) {
+   432	    return await this._post('/v1/vision/landmarks', { path: imagePath }, 30000);
+   433	  }
+   434	
+   435	  // ----- v0.7 new methods — full Apple ecosystem coverage -----
+   436	
+   437	  async translate(text, sourceLang, targetLang) {
+   438	    return await this._post('/v1/translate', { text, source_lang: sourceLang, target_lang: targetLang }, 30000);
+   439	  }
+   440	
+   441	  async nlTag(text, scheme = 'lemma') {
+   442	    return await this._post('/v1/nl/tag', { text, scheme }, 15000);
+   443	  }
+   444	
+   445	  async nlSentiment(text) {
+   446	    return await this._post('/v1/nl/sentiment', { text }, 15000);
+   447	  }
+   448	
+   449	  async nlLanguageDetect(text, topN = 3) {
+   450	    return await this._post('/v1/nl/language-detect', { text, top_n: topN }, 10000);
+   451	  }
+   452	
+   453	  async visionSaliency(imagePath, mode = 'attention') {
+   454	    return await this._post('/v1/vision/saliency', { path: imagePath, mode }, 30000);
+   455	  }
+   456	
+   457	  async visionFeaturePrint(imagePath) {
+   458	    return await this._post('/v1/vision/feature-print', { path: imagePath }, 30000);
+   459	  }
+   460	
+   461	  async visionAesthetics(imagePath) {
+   462	    return await this._post('/v1/vision/aesthetics', { path: imagePath }, 30000);
+   463	  }
+   464	
+   465	  async visionBarcode(imagePath) {
+   466	    return await this._post('/v1/vision/barcode', { path: imagePath }, 30000);
+   467	  }
+   468	
+   469	  async visionDocument(imagePath) {
+   470	    return await this._post('/v1/vision/document', { path: imagePath }, 60000);
+   471	  }
+   472	
+   473	  async dataDetect(text) {
+   474	    return await this._post('/v1/data-detect', { text }, 10000);
+   475	  }
+   476	
+   477	  async spotlightSearch(query, scope = null, limit = 50) {
+   478	    return await this._post('/v1/spotlight/search', { query, scope, limit }, 15000);
+   479	  }
+   480	
+   481	  // v1.7 — Spotlight via CSSearchableIndex programático (requer daemon ≥ v1.7,
+   482	  // ativa após `node scripts/build-release.mjs`). Cliente prefere este endpoint
+   483	  // mas faz fallback gracioso para `/v1/spotlight/search` (mdfind shell) quando
+   484	  // o daemon bundled ainda for v1.0.0 (HTTP 404).
+   485	  //
+   486	  // mode: 'spotlight' | 'stale' | 'unindexed' | 'mdfind-fallback' | 'error'
+   487	  // (padrão inspirado em maiocchi-ia/skills/tripla-fusao/scripts/bm25.py
+   488	  //  — fallback honesto declarado em vez de scores silenciosos vazios)
+   489	  async spotlightQueryNative(query, scope = null, limit = 50, domainHint = null) {
+   490	    let resolvedDomainHint = domainHint;
+   491	    if (!resolvedDomainHint && scope) {
+   492	      try {
+   493	        const hex = await universal.sha256Hex(scope);
+   494	        resolvedDomainHint = 'com.maiocchi.zeus.' + hex.slice(0, 16);
+   495	      } catch {}
+   496	    }
+   497	    const body = { query, scope, limit };
+   498	    if (resolvedDomainHint) body.domain_hint = resolvedDomainHint;
+   499	    try {
+   500	      const r = await this._post('/v1/spotlight/query', body, 15000);
+   501	      return { ...r, mode: 'spotlight' };
+   502	    } catch (e) {
+   503	      const nativeMessage = e.message || String(e);
+   504	      if (/domain_hint obrigat[oó]rio|unsupported_on_aegis_daemon/i.test(nativeMessage)) {
+   505	        return { mode: 'error', error: nativeMessage, results: [] };
+   506	      }
+   507	      // Daemon bundled v1.0.0 retorna 404 com payload {path,method,available}
+   508	      // (sem campo `error`), o que faz _post lançar string genérica. Em vez de
+   509	      // tentar matchar a forma exata da mensagem, fallback gracioso pra mdfind
+   510	      // sempre que o endpoint nativo falha — mdfind é o caminho legacy estável.
+   511	      try {
+   512	        const r = await this.spotlightSearch(query, scope, limit);
+   513	        return { ...r, mode: 'mdfind-fallback', native_error: nativeMessage.slice(0, 200) };
+   514	      } catch (e2) {
+   515	        return { mode: 'error', error: e2.message, native_error: nativeMessage, results: [] };
+   516	      }
+   517	    }
+   518	  }
+   519	
+   520	  async spotlightIndex(items, domainHint = null) {
+   521	    // Aceita array de {path, title, summary, keywords, mtime}. Daemon ≥ v1.7
+   522	    // converte em CSSearchableItem batch.
+   523	    return await this._post('/v1/spotlight/index', { items, domain_hint: domainHint }, 60000);
+   524	  }
+   525	
+   526	  async spotlightPurge(domainHint = null) {
+   527	    return await this._post('/v1/spotlight/purge', { domain_hint: domainHint }, 15000);
+   528	  }
+   529	
+   530	  // ----- v0.9 new methods — Passport Index Architecture (PIA) -----
+   531	  // MCP-first surface for agent consumption with progressive disclosure.
+   532	
+   533	  /**
+   534	   * Extract a single passport (concepts + summary + domain + difficulty) for a note.
+   535	   * Daemon uses Apple NLTagger (nameType+lemma) + afm summarize + afm classify.
+   536	   */
+   537	  async passportExtract(notePath, domainOptions = []) {
+   538	    return await this._post('/v1/passport/extract', {
+   539	      path: notePath,
+   540	      domain_options: domainOptions,
+   541	    }, 30000);
+   542	  }
+   543	
+   544	  /**
+   545	   * Batch extract passports for many notes in one daemon call.
+   546	   * Long timeout (10min) — vault-wide rebuild can take a while.
+   547	   */
+   548	  async passportBatchExtract(notePaths, domainOptions = []) {
+   549	    return await this._post('/v1/passport/batch-extract', {
+   550	      paths: notePaths,
+   551	      domain_options: domainOptions,
+   552	    }, 600000);
+   553	  }
+   554	
+   555	  /**
+   556	   * Find passports semantically relevant to a query.
+   557	   * Combines embeddings cosine (over embeddings.jsonl) + concept-match scoring
+   558	   * (over passports.jsonl). Returns top-N passports WITHOUT raw content —
+   559	   * token-efficient first probe for agents.
+   560	   *
+   561	   * @param {string} query
+   562	   * @param {object} options
+   563	   *   - embeddingsPath: path to embeddings.jsonl
+   564	   *   - passportsPath:  path to passports.jsonl
+   565	   *   - topN:           number of results (default 10)
+   566	   *   - minScore:       cosine threshold (default 0.3)
+   567	   *   - conceptFilter:  array of concepts to require in result
+   568	   */
+   569	  async passportFind(query, options = {}) {
+   570	    return await this._post('/v1/passport/find', {
+   571	      query,
+   572	      embeddings_jsonl_path: options.embeddingsPath,
+   573	      passports_jsonl_path: options.passportsPath,
+   574	      top_n: options.topN || 10,
+   575	      min_score: options.minScore || 0.3,
+   576	      concept_filter: options.conceptFilter || null,
+   577	    }, 30000);
+   578	  }
+   579	
+   580	  /**
+   581	   * Fetch raw markdown content for a specific note.
+   582	   * Agents call this ONLY after passport lookup indicates this note is needed
+   583	   * for deep-dive. max_chars caps payload to prevent context blow-up.
+   584	   */
+   585	  async contentGet(filePath, vaultRoot, maxChars = 50000) {
+   586	    return await this._post('/v1/content/get', {
+   587	      path: filePath,
+   588	      vault_root: vaultRoot,
+   589	      max_chars: maxChars,
+   590	    }, 15000);
+   591	  }
+   592	
+   593	  async health() {
+   594	    const resp = await this._requestUrl({
+   595	      url: `${this.baseUrl}/v1/health`,
+   596	      method: 'GET',
+   597	      throw: false,
+   598	    });
+   599	    return resp.json || { status: 'unreachable' };
+   600	  }
+   601	
+   602	  async tools() {
+   603	    const resp = await this._requestUrl({
+   604	      url: `${this.baseUrl}/v1/tools`,
+   605	      method: 'GET',
+   606	      throw: false,
+   607	    });
+   608	    return (resp.json && resp.json.tools) || [];
+   609	  }
+   610	
+   611	  // v1.9 — MobileCLIP stub opt-in (ADR-010)
+   612	  //
+   613	  // Sem modelo instalado em ~/Library/Application Support/Zeus/mobileclip-model/
+   614	  // o daemon retorna 501 com `hint` acionável apontando para o comando do plugin
+   615	  // "Zeus: instalar modelo MobileCLIP (download manual)". Runtime CoreML real
+   616	  // chega em v2.0.
+   617	  async mobileclipStatus() {
+   618	    try {
+   619	      const resp = await this._requestUrl({
+   620	        url: `${this.baseUrl}/v1/mobileclip/status`,
+   621	        method: 'GET',
+   622	        throw: false,
+   623	      });
+   624	      return resp.json || { error: 'unreachable' };
+   625	    } catch (e) {
+   626	      return { error: e.message };
+   627	    }
+   628	  }
+   629	
+   630	  async mobileclipEmbedImage(imagePath) {
+   631	    return await this._post('/v1/mobileclip/embed-image', { image_path: imagePath }, 60000);
+   632	  }
+   633	
+   634	  async mobileclipEmbedText(text) {
+   635	    return await this._post('/v1/mobileclip/embed-text', { text }, 30000);
+   636	  }
+   637	}
+   638	
+   639	module.exports = ZeusHttpClient;
+
+exec
+/bin/zsh -lc "nl -ba main.source.js | sed -n '3788,3880p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+  3788	    //   T+8s   (deep):  passport via afm enrich (FoundationModels reasoning)
+  3789	    //
+  3790	    // Eventos cobertos: modify, create, delete, rename (full coverage)
+  3791	    this._embedTimers = new Map();
+  3792	    this._passportTimers = new Map();
+  3793	    this._audioTimers = new Map();   // v1.3.3 — real-time audio transcription
+  3794	
+  3795	    const scheduleEmbed = (rel, file) => {
+  3796	      clearTimeout(this._embedTimers.get(rel));
+  3797	      this._embedTimers.set(rel, setTimeout(async () => {
+  3798	        this._embedTimers.delete(rel);
+  3799	        try {
+  3800	          // Re-embed single file: read content, call daemon /v1/embed, update searcher.embeddings
+  3801	          const content = await this.app.vault.read(file);
+  3802	          const reachable = await this.httpClient.isAvailable();
+  3803	          if (!reachable) return;
+  3804	          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+  3805	          if (remote && IoQueue.isPrivatePath(rel)) {
+  3806	            console.warn('[zeus] real-time embed blocked by privacy gate:', rel, this.httpClient.baseUrl);
+  3807	            return;
+  3808	          }
+  3809	          const resp = await this.httpClient.embed(content.slice(0, 4000), { _privacyPath: rel });
+  3810	          if (resp && resp.vectors && resp.vectors[0]) {
+  3811	            // Update in-memory + on-disk
+  3812	            const sha = await universal.sha256Hex(content);
+  3813	            const entry = { path: rel, sha, mtime: Date.now(), title: file.basename, vec: resp.vectors[0] };
+  3814	            this.searcher.embeddings.set(rel, entry);
+  3815	            this.indexer.saveEmbeddings(this.searcher.embeddings);
+  3816	            this.refreshSmartView();
+  3817	            dbg('[zeus] real-time embed:', rel, `dim=${resp.dim}`);
+  3818	          }
+  3819	        } catch (e) {
+  3820	          console.warn('[zeus] real-time embed failed for', rel, e.message);
+  3821	        }
+  3822	      }, 500));   // 500ms debounce — Apple Notes-style instant
+  3823	    };
+  3824	
+  3825	    // v1.3.3 — real-time audio: VAD pre-filter → transcribe → embed
+  3826	    // Debounce 2s (audio writes às vezes não são atômicos)
+  3827	    const scheduleAudioTranscribe = (rel, file) => {
+  3828	      if (!this.settings.indexOnSave) return;
+  3829	      if (!this.settings.fileTypes || !this.settings.fileTypes[file.extension]) return;
+  3830	      clearTimeout(this._audioTimers.get(rel));
+  3831	      this._audioTimers.set(rel, setTimeout(async () => {
+  3832	        this._audioTimers.delete(rel);
+  3833	        try {
+  3834	          const reachable = await this.httpClient.isAvailable();
+  3835	          if (!reachable) return;
+  3836	
+  3837	          // Resolver path absoluto (daemon precisa de path absoluto)
+  3838	          let nodePath = null;
+  3839	          try { nodePath = require('path'); } catch (_) { /* v1.4.2-ios: sandbox */ }
+  3840	          const adapter = this.app.vault.adapter;
+  3841	          const basePath = typeof adapter.getBasePath === 'function'
+  3842	            ? adapter.getBasePath()
+  3843	            : (adapter.basePath || '');
+  3844	          const absPath = nodePath ? nodePath.join(basePath, rel) : basePath + '/' + rel;
+  3845	
+  3846	          // VAD pre-filter (rápido — só duração)
+  3847	          if (this.settings.audioVadEnabled) {
+  3848	            const vad = await this.httpClient.aspVad(absPath);
+  3849	            if (!vad || !vad.has_speech) {
+  3850	              dbg('[zeus] audio skip (no speech):', rel,
+  3851	                vad ? `${vad.duration_seconds.toFixed(1)}s < threshold` : 'vad failed');
+  3852	              return;
+  3853	            }
+  3854	          }
+  3855	
+  3856	          // Transcribe
+  3857	          const locale = this.settings.audioLocale || 'pt-BR';
+  3858	          const engine = this.settings.audioEngine || 'auto';
+  3859	          const tr = await this.httpClient.aspTranscribe(absPath, locale, engine);
+  3860	          if (!tr || !tr.text || tr.text.trim().length === 0) {
+  3861	            dbg('[zeus] audio no transcript:', rel,
+  3862	              tr ? `engine=${tr.engine_used}` : 'transcribe failed');
+  3863	            return;
+  3864	          }
+  3865	
+  3866	          // Embed transcript
+  3867	          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+  3868	          if (remote && IoQueue.isPrivatePath(rel)) {
+  3869	            console.warn('[zeus] audio embed blocked by privacy gate:', rel, this.httpClient.baseUrl);
+  3870	            return;
+  3871	          }
+  3872	          const resp = await this.httpClient.embed(tr.text.slice(0, 4000), { _privacyPath: rel });
+  3873	          if (resp && resp.vectors && resp.vectors[0]) {
+  3874	            const sha = await universal.sha256Hex(tr.text);
+  3875	            const entry = {
+  3876	              path: rel,
+  3877	              sha,
+  3878	              mtime: Date.now(),
+  3879	              title: file.basename,
+  3880	              vec: resp.vectors[0],
+
+exec
+/bin/zsh -lc "rg -n \"requestUrl|fetch\\(|baseUrl|headers|Authorization|Bearer|token|auth|X-Zeus|url:\" lib/zeus-http-client.js main.source.js lib/embed-ios.js" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+exec
+/bin/zsh -lc "rg -n \"discoverDaemonUrl\\(|new ZeusHttpClient|setBaseUrl\\(|zeusDaemonUrl\\s*=|zeusDaemonUrl:|_zeusSetLocalDaemonUrl|_zeusGetLocalDaemonUrl\" main.source.js lib/zeus-http-client.js lib/embed-ios.js" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+lib/zeus-http-client.js:154:  setBaseUrl(url) {
+main.source.js:255:  zeusDaemonUrl: 'http://127.0.0.1:2223',   // local daemon loopback (on-device puro; sem rota remota)
+main.source.js:392:function _zeusGetLocalDaemonUrl() {
+main.source.js:403:function _zeusSetLocalDaemonUrl(url) {
+main.source.js:429:async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 1500) {
+main.source.js:448:      const client = new ZeusHttpClientLocal(url);
+main.source.js:472:  _zeusSetLocalDaemonUrl(chosen.url);   // só cacheia se for loopback (helper filtra)
+main.source.js:2383:        this.plugin.settings.zeusDaemonUrl = v || 'http://127.0.0.1:2223';
+main.source.js:2385:        this.plugin.httpClient.setBaseUrl(this.plugin.settings.zeusDaemonUrl);
+main.source.js:2387:        _zeusSetLocalDaemonUrl(null);
+main.source.js:2394:        _zeusSetLocalDaemonUrl(null);
+main.source.js:2397:          const url = await discoverDaemonUrl(this.plugin);
+main.source.js:2398:          this.plugin.httpClient.setBaseUrl(url);
+main.source.js:2880:    const _initialDaemonUrl = _zeusGetLocalDaemonUrl() || this.settings.zeusDaemonUrl;
+main.source.js:2884:    this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
+main.source.js:2911:          this.httpClient.setBaseUrl(status.url);
+main.source.js:2912:          _zeusSetLocalDaemonUrl(status.url);
+main.source.js:3101:          const discovered = await discoverDaemonUrl(this);
+main.source.js:3104:            this.httpClient.setBaseUrl(discovered);
+main.source.js:3109:          _zeusSetLocalDaemonUrl(activeUrl);
+
+ succeeded in 0ms:
+lib/zeus-http-client.js:10: * requestUrl API (bypass CORS oficial em mobile + Electron).
+lib/zeus-http-client.js:29: *   POST /v1/prompt                 body: {instruction, max_tokens, deterministic}
+lib/zeus-http-client.js:66:  constructor(baseUrl) {
+lib/zeus-http-client.js:67:    this.baseUrl = _zeusCoerceLoopback(baseUrl);
+lib/zeus-http-client.js:86:    //   'opt-in' → header X-Zeus-Allow-Pcc:1; Apple decides per request
+lib/zeus-http-client.js:87:    //   'auto'   → header X-Zeus-Allow-Pcc:auto; daemon flags possibility when load exceeds on-device
+lib/zeus-http-client.js:92:    this.lastPccPossible = false;      // updated from response header X-Zeus-Pcc-Possible
+lib/zeus-http-client.js:110:   * Snapshot of current metrics + estimated token cost.
+lib/zeus-http-client.js:111:   * Heuristic: 1 token ~= 4 bytes for English/Portuguese text (very rough).
+lib/zeus-http-client.js:155:    this.baseUrl = _zeusCoerceLoopback(url);   // v1.15 — chokepoint: só loopback
+lib/zeus-http-client.js:160:    return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(this.baseUrl || '');
+lib/zeus-http-client.js:177:        `privacy-gate: ${endpoint} recusou enviar conteúdo sigiloso para daemon remoto (${this.baseUrl})`,
+lib/zeus-http-client.js:191:      // Race a probe HTTP contra um timer — Obsidian's requestUrl não respeita AbortController,
+lib/zeus-http-client.js:193:      const probe = this._requestUrl({
+lib/zeus-http-client.js:194:        url: `${this.baseUrl}/v1/health`,
+lib/zeus-http-client.js:211:  // v2.0 — Inject PCC routing header into outgoing request headers.
+lib/zeus-http-client.js:214:    if (this.pccMode === 'auto') return { 'X-Zeus-Allow-Pcc': 'auto' };
+lib/zeus-http-client.js:215:    return { 'X-Zeus-Allow-Pcc': '1' };  // opt-in
+lib/zeus-http-client.js:218:  // v2.0 — Read PCC-routing signal from response headers.
+lib/zeus-http-client.js:219:  // v1.15 — codex #5: o daemon sinaliza `X-Zeus-Pcc-Possible: 1` quando cloud era
+lib/zeus-http-client.js:222:  _readPccPossible(headers) {
+lib/zeus-http-client.js:223:    if (!headers) return false;
+lib/zeus-http-client.js:224:    // Obsidian requestUrl returns headers as plain object; fetch returns Headers instance
+lib/zeus-http-client.js:225:    const val = typeof headers.get === 'function'
+lib/zeus-http-client.js:226:      ? headers.get('x-zeus-pcc-possible') || headers.get('X-Zeus-Pcc-Possible')
+lib/zeus-http-client.js:227:      : (headers['x-zeus-pcc-possible'] || headers['X-Zeus-Pcc-Possible']);
+lib/zeus-http-client.js:234:  // Try to load Obsidian's requestUrl from the obsidian module; fallback to fetch on Node
+lib/zeus-http-client.js:235:  async _requestUrl({ url, method = 'GET', body, contentType = 'application/json', throw: throwOnError = true, signal = null }) {
+lib/zeus-http-client.js:241:    if (obsidian && obsidian.requestUrl) {
+lib/zeus-http-client.js:243:      const resp = await obsidian.requestUrl({
+lib/zeus-http-client.js:245:        headers: { 'Content-Type': contentType, ...pccHeaders },
+lib/zeus-http-client.js:249:      this._readPccPossible(resp.headers);
+lib/zeus-http-client.js:255:      const resp = await fetch(url, {
+lib/zeus-http-client.js:257:        headers: { 'Content-Type': contentType, ...pccHeaders },
+lib/zeus-http-client.js:261:      this._readPccPossible(resp.headers);
+lib/zeus-http-client.js:265:      return { status: resp.status, text, json, headers: resp.headers };
+lib/zeus-http-client.js:268:    throw new Error('Nenhum transporte HTTP disponível (sem obsidian.requestUrl, sem fetch)');
+lib/zeus-http-client.js:289:      const request = this._requestUrl({
+lib/zeus-http-client.js:290:        url: `${this.baseUrl}${endpoint}`,
+lib/zeus-http-client.js:416:    // options: { max_tokens, deterministic, prewarm, _privacyPath, privacy }
+lib/zeus-http-client.js:419:      max_tokens: options.max_tokens || 300,
+lib/zeus-http-client.js:559:   * token-efficient first probe for agents.
+lib/zeus-http-client.js:594:    const resp = await this._requestUrl({
+lib/zeus-http-client.js:595:      url: `${this.baseUrl}/v1/health`,
+lib/zeus-http-client.js:603:    const resp = await this._requestUrl({
+lib/zeus-http-client.js:604:      url: `${this.baseUrl}/v1/tools`,
+lib/zeus-http-client.js:619:      const resp = await this._requestUrl({
+lib/zeus-http-client.js:620:        url: `${this.baseUrl}/v1/mobileclip/status`,
+main.source.js:13: *           mesmo código TS chama daemon Swift nativo via requestUrl em Mac/iPhone/iPad/MacBook.
+main.source.js:32: * Camadas de reasoning (opcionais, default OFF — janela 4096 tokens com
+main.source.js:235:  // FoundationModels reasoning layer (janela 4096 tokens; chunking hierárquico NexusSum
+main.source.js:271:  // v1.1 — Status bar: token-saved metrics
+main.source.js:273:  statusBarRefreshIntervalMs: 30000,        // 30s refresh para tokens metrics
+main.source.js:274:  rawTokenBaseline: 1250,                   // tokens médios sem PIA por request (~5KB/4)
+main.source.js:279:  // 'opt-in' = client envia X-Zeus-Allow-Pcc:1; Apple decide caso a caso
+main.source.js:363:    throw new Error(`Daemon HTTP fora do ar (${plugin.httpClient.baseUrl}) — ${daemonMethod} não pôde rodar`);
+main.source.js:1139:// Fits FoundationModels 4096-token window easily (short generation, no tools).
+main.source.js:1157:        [instruction, { max_tokens: 300, deterministic: true, prewarm: true, timeoutMs: 90000 }],
+main.source.js:1158:        ['prompt', instruction, '--deterministic', '--max-tokens', '300', '--prewarm'],
+main.source.js:1546:  // Size limit: FoundationModels janela é 4096 tokens (~10K chars com safety margin).
+main.source.js:1624:          ? 'FoundationModels janela 4096 tokens insuficiente para esta nota + vault context. Tente sub-folder menor ou nota mais curta.'
+main.source.js:1737:      text: 'Retorna passports (concepts + summary + domain + difficulty) sem conteúdo bruto — token-eficiente.',
+main.source.js:2343:    desc.appendText(' para PDFs/imagens. Sem BM25 próprio, sem tokenizer próprio, sem bge-micro-v2.');
+main.source.js:2465:      .setDesc('Roda `metafm enrich` na nota ativa: FoundationModels lê notas relacionadas via tool-calling e sugere links + conexões. LIMITAÇÃO: FoundationModels tem janela 4096 tokens — system prompt + tool descrições consomem ~1500, sobrando ~2500 para o conteúdo da nota + tool responses. Notas >~2KB ou vault com muitos folders pode estourar (skip silencioso). Default off; ligue se trabalhar com notas curtas. Cache por SHA.')
+main.source.js:2584:    metricsDesc.appendText('Status bar exibe contagem de docs indexados e, opcionalmente, tokens economizados via ');
+main.source.js:2589:      .setName('Mostrar tokens economizados no status bar')
+main.source.js:2599:      .setDesc('Atualiza tokens economizados periodicamente. Default 30000 (30s). Aumente para reduzir overhead, diminua para feedback mais responsivo.')
+main.source.js:2623:      .setDesc('Zera contadores de tokens, bytes e requests do HTTP client. Útil após mudar baseline ou debugar.')
+main.source.js:2641:      .setDesc('off = só on-device (privacy máximo, default). opt-in = client envia header X-Zeus-Allow-Pcc:1; Apple decide caso a caso. auto = client permite PCC; o daemon apenas sinaliza POSSIBILIDADE quando a carga excede on-device — o routing real é decidido pela Apple (sem API pública de controle/inspeção).')
+main.source.js:2644:        .addOption('opt-in', 'opt-in — header X-Zeus-Allow-Pcc:1')
+main.source.js:2909:        if (status && status.running && status.url && this.httpClient.baseUrl !== status.url) {
+main.source.js:2910:          dbg('[zeus] httpClient rebase:', this.httpClient.baseUrl, '→', status.url);
+main.source.js:3098:        let activeUrl = this.httpClient.baseUrl;
+main.source.js:3114:        dbg('[zeus] daemon health:', health.status, '| platform:', health.platform, '| endpoints:', (health.endpoints || []).length, '| tools:', tools.length, '| url:', activeUrl);
+main.source.js:3356:          const tags = (r && (r.tags || r.tokens)) || [];
+main.source.js:3357:          const preview = Array.isArray(tags) ? tags.slice(0, 20).map(t => (t.lemma || t.tag || t.token)).join(' ') : JSON.stringify(r).slice(0, 200);
+main.source.js:3359:          new Notice(`Lemma: ${tags.length || '?'} tokens (preview no console; JSON no clipboard)`);
+main.source.js:3733:    // v1.1 — refresh periódico do status bar com token-saved + PCC indicator.
+main.source.js:3804:          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+main.source.js:3806:            console.warn('[zeus] real-time embed blocked by privacy gate:', rel, this.httpClient.baseUrl);
+main.source.js:3867:          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+main.source.js:3869:            console.warn('[zeus] audio embed blocked by privacy gate:', rel, this.httpClient.baseUrl);
+main.source.js:4501:          new Notice(`Zeus lexical-ios: ${r.N} notas, ${r.vocab} tokens (${r.elapsedMs}ms)`);
+main.source.js:4525:            `${h.path} (score ${h.score.toFixed(2)}, ${h.matched_tokens.length} match)`,
+main.source.js:4738:      // v1.1 — token-saved metrics
+main.source.js:4756:  // conteúdo bruto (~5KB médio). Estimativa: tokens_saved = (raw_baseline -
+main.source.js:4757:  // actual_tokens) por request, somado ao longo da sessão.
+
+codex
+Além do relay, apareceu uma superfície **PCC/cloud opt-in** ainda configurável. Ela não é EmbedRelay nem Tailscale, mas se o critério é “on-device puro” no sentido estrito, preciso tratar isso como sobra executável/remota.
+exec
+/bin/zsh -lc "nl -ba main.source.js | sed -n '2640,2648p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+exec
+/bin/zsh -lc "nl -ba main.source.js | sed -n '276,286p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+   276	  // Apple (sem API pública de controle/inspeção); estes modos só controlam a
+   277	  // PERMISSÃO que o client envia, e o daemon sinaliza POSSIBILIDADE de cloud.
+   278	  // 'off'    = nenhum header de permissão; só on-device (default, privacy máximo)
+   279	  // 'opt-in' = client envia X-Zeus-Allow-Pcc:1; Apple decide caso a caso
+   280	  // 'auto'   = client permite PCC; daemon sinaliza possibilidade quando a carga excede on-device
+   281	  pccMode: 'off',
+   282	  pccVisualIndicator: true,                 // exibe ☁️PCC? no status bar quando cloud era possível (heurístico)
+   283	  // v1.15 — logging gate (Obsidian guideline): default OFF mostra só warn/error.
+   284	  debug: false,                             // ON → dbg() imprime logs informativos no console
+   285	  // v1.8 — hybrid search MMR diversify + multiplex graph
+   286	  hybridDiversityLambda: 0.5,               // λ ∈ [0,1] da MMR — 1=só relevância, 0=só diversidade
+
+ succeeded in 0ms:
+  2640	      .setName('Modo PCC')
+  2641	      .setDesc('off = só on-device (privacy máximo, default). opt-in = client envia header X-Zeus-Allow-Pcc:1; Apple decide caso a caso. auto = client permite PCC; o daemon apenas sinaliza POSSIBILIDADE quando a carga excede on-device — o routing real é decidido pela Apple (sem API pública de controle/inspeção).')
+  2642	      .addDropdown(d => d
+  2643	        .addOption('off', 'off — só on-device (default)')
+  2644	        .addOption('opt-in', 'opt-in — header X-Zeus-Allow-Pcc:1')
+  2645	        .addOption('auto', 'auto — daemon decide')
+  2646	        .setValue(this.plugin.settings.pccMode)
+  2647	        .onChange(async v => {
+  2648	          this.plugin.settings.pccMode = v;
+
+exec
+/bin/zsh -lc 'rg -n "AegisDaemon|sem daemon|lanes JS|iOS: abra|iOS: sem daemon" main.source.js lib/embed-ios.js' in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+exec
+/bin/zsh -lc 'rg -n "pccMode|Allow-Pcc|PCC|Private Cloud|cloud" main.source.js lib/zeus-http-client.js lib/embed-ios.js' in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+lib/embed-ios.js:10: *     as lanes JS. Sem Tailscale, sem rota remota.
+lib/embed-ios.js:197:// e a busca cai nas lanes JS. Sem relay/Tailscale.
+main.source.js:201:const LexicalIosIndex = require('./lib/lexical-ios');                    // v1.11: BM25 persistido com stems pt-BR para iOS sem daemon (Feature I)
+main.source.js:304:  //   (loopback, 512-dim NLContextualEmbedding). iOS: sem daemon → lê o
+main.source.js:306:  //   lanes JS. CAMADA 2 (labs, default OFF): transformers.js local 384-dim.
+main.source.js:354:// DaemonLifecycle, AegisDaemon embebido no host app no iOS). Retorna shape
+main.source.js:371:// LOCAL (loopback): macOS auto-spawna bin/ZeusDaemonMac; iOS, sem daemon on-device
+main.source.js:372:// (sandbox do plugin não roda código nativo), degrada para as lanes JS puras sobre os
+main.source.js:2352:      .setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 não responde. iOS lê os índices sincronizados via iCloud (read-only) e busca nas lanes JS. Estado: ${_lcLabel}`);
+main.source.js:2406:            const iosHint = 'iOS: abra o app Aegis para iniciar o AegisDaemon (porta 2223 embedada).';
+main.source.js:2926:    // geradas em iOS sem daemon. Precisa estar disponível ANTES do AutoIndexer
+main.source.js:3121:          const iosHint = 'iOS: sem daemon on-device (esperado) — busca roda nas lanes JS sobre os índices computados no Mac e sincronizados via iCloud.';
+main.source.js:4578:            'embeddings.jsonl sincronizado e roda a busca nas lanes JS puras',
+
+ succeeded in 0ms:
+lib/zeus-http-client.js:81:    // v2.0 — Apple Cloud Private (PCC) routing. v1.15: o routing real é decidido
+lib/zeus-http-client.js:83:    // a PERMISSÃO enviada no header; o daemon sinaliza POSSIBILIDADE de cloud.
+lib/zeus-http-client.js:84:    // pccMode: 'off' | 'opt-in' | 'auto'
+lib/zeus-http-client.js:85:    //   'off'    → no PCC permission header sent; on-device only
+lib/zeus-http-client.js:86:    //   'opt-in' → header X-Zeus-Allow-Pcc:1; Apple decides per request
+lib/zeus-http-client.js:87:    //   'auto'   → header X-Zeus-Allow-Pcc:auto; daemon flags possibility when load exceeds on-device
+lib/zeus-http-client.js:89:    // real de PCC (Apple não expõe API de inspeção); só estima possibilidade. Os
+lib/zeus-http-client.js:90:    // campos refletem honestamente "cloud era possível", não "cloud foi usado".
+lib/zeus-http-client.js:91:    this.pccMode = 'off';
+lib/zeus-http-client.js:93:    this.pccPossibleCount = 0;         // total requests onde cloud era possível (heurística)
+lib/zeus-http-client.js:98:    this.pccMode = valid.includes(mode) ? mode : 'off';
+lib/zeus-http-client.js:103:      mode: this.pccMode,
+lib/zeus-http-client.js:211:  // v2.0 — Inject PCC routing header into outgoing request headers.
+lib/zeus-http-client.js:213:    if (this.pccMode === 'off') return {};
+lib/zeus-http-client.js:214:    if (this.pccMode === 'auto') return { 'X-Zeus-Allow-Pcc': 'auto' };
+lib/zeus-http-client.js:215:    return { 'X-Zeus-Allow-Pcc': '1' };  // opt-in
+lib/zeus-http-client.js:218:  // v2.0 — Read PCC-routing signal from response headers.
+lib/zeus-http-client.js:219:  // v1.15 — codex #5: o daemon sinaliza `X-Zeus-Pcc-Possible: 1` quando cloud era
+main.source.js:23: *   acp   = Apple Cloud Private (Private Cloud Compute — reservado para v0.5+)
+main.source.js:275:  // v2.0 — Apple Cloud Private (ACP / PCC). v1.15: routing real é decidido pela
+main.source.js:277:  // PERMISSÃO que o client envia, e o daemon sinaliza POSSIBILIDADE de cloud.
+main.source.js:279:  // 'opt-in' = client envia X-Zeus-Allow-Pcc:1; Apple decide caso a caso
+main.source.js:280:  // 'auto'   = client permite PCC; daemon sinaliza possibilidade quando a carga excede on-device
+main.source.js:281:  pccMode: 'off',
+main.source.js:282:  pccVisualIndicator: true,                 // exibe ☁️PCC? no status bar quando cloud era possível (heurístico)
+main.source.js:2631:    // v2.0 — Apple Cloud Private (ACP / PCC)
+main.source.js:2633:    new Setting(containerEl).setName('v2.0 — Apple Cloud Private (PCC)').setHeading();
+main.source.js:2635:    pccDesc.appendText('Private Cloud Compute (PCC) é a camada de cloud do Apple Intelligence — modelos servidor-side rodam em hardware Apple verificável criptograficamente, sem reter dados. Usa sua assinatura Apple Intelligence já ativa. ');
+main.source.js:2640:      .setName('Modo PCC')
+main.source.js:2641:      .setDesc('off = só on-device (privacy máximo, default). opt-in = client envia header X-Zeus-Allow-Pcc:1; Apple decide caso a caso. auto = client permite PCC; o daemon apenas sinaliza POSSIBILIDADE quando a carga excede on-device — o routing real é decidido pela Apple (sem API pública de controle/inspeção).')
+main.source.js:2644:        .addOption('opt-in', 'opt-in — header X-Zeus-Allow-Pcc:1')
+main.source.js:2646:        .setValue(this.plugin.settings.pccMode)
+main.source.js:2648:          this.plugin.settings.pccMode = v;
+main.source.js:2655:      .setName('Indicador visual PCC no status bar')
+main.source.js:2656:      .setDesc('Quando cloud (PCC) é possível, status bar exibe "☁️PCC?×N" (N = requests nesta sessão onde routing cloud era possível — heurístico, não medição real). Default ON quando pccMode ≠ off.')
+main.source.js:2664:      .setName('Status PCC')
+main.source.js:2665:      .setDesc('Inspeciona o modo atual e a contagem de requests onde cloud (PCC) era POSSÍVEL. O daemon não consegue medir uso real de cloud — Apple não expõe API de inspeção; este número é heurístico.')
+main.source.js:2670:          `Zeus PCC\nmodo: ${s.mode}\núltima req com cloud possível: ${s.lastPossible ? 'sim' : 'não'}\ntotal cloud-possível nesta sessão: ${s.possibleCount}`,
+main.source.js:3728:    // v2.0 — propaga pccMode para o HTTP client
+main.source.js:3730:      this.httpClient.setPccMode(this.settings.pccMode || 'off');
+main.source.js:3733:    // v1.1 — refresh periódico do status bar com token-saved + PCC indicator.
+main.source.js:4724:  // v1.1 — Token-saved metrics + PCC indicator (auto-injetados no estado 'idle')
+main.source.js:4743:      // v2.0 — PCC visual indicator (v1.15: "possível", não "usado" — heurístico)
+main.source.js:4747:          text += ` · ☁️PCC?×${pcc.possibleCount}`;
+
+exec
+/bin/zsh -lc "nl -ba main.source.js | sed -n '348,366p'" in /Users/rogermaiocchi/Code/zeus-obsidian-plugin/.claude/worktrees/gifted-poitras-209e91
+ succeeded in 0ms:
+   348	
+   349	// =========================================================================
+   350	// HTTP-only dispatcher (ADR-018 Aegis pattern, v1.5 — autonomous daemon)
+   351	// -------------------------------------------------------------------------
+   352	// Plugin v1.5 abandona o caminho child_process.spawn — toda operação Apple
+   353	// passa pelo daemon HTTP local (bin/ZeusDaemonMac auto-spawned no Mac via
+   354	// DaemonLifecycle, AegisDaemon embebido no host app no iOS). Retorna shape
+   355	// { source, result } por compatibilidade com callsites legados.
+   356	// -------------------------------------------------------------------------
+   357	async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs /* spawnArgs, stdinText, timeoutMs ignorados */) {
+   358	  if (!plugin.httpClient || typeof plugin.httpClient[daemonMethod] !== 'function') {
+   359	    throw new Error(`Daemon method indisponível: ${daemonMethod}`);
+   360	  }
+   361	  const reachable = await plugin.httpClient.isAvailable();
+   362	  if (!reachable) {
+   363	    throw new Error(`Daemon HTTP fora do ar (${plugin.httpClient.baseUrl}) — ${daemonMethod} não pôde rodar`);
+   364	  }
+   365	  const result = await plugin.httpClient[daemonMethod](...daemonArgs);
+   366	  return { source: 'daemon', result };
+
+codex
+Não digo **FECHADO** estrito.
+
+**OK nos itens de relay:** não encontrei referência executável a `EmbedRelay`, `embedRelay`, `_zeusGetMeshPeers`, `iosEmbedRelayEnabled`, `allowRemote`, auth token de relay ou mesh peers nos 3 arquivos. `ZeusHttpClient` coage `baseUrl` para loopback em constructor/setBaseUrl.
+
+**Sobrou:**
+
+- `main.source.js:429`-`448` — `discoverDaemonUrl(plugin, candidates)` ainda aceita `candidates` arbitrários. Nos callsites atuais ele é chamado sem candidates, então usa loopback; mas a função em si não garante “só loopback” na fronteira.
+- `main.source.js:354` — comentário ainda fala em `AegisDaemon embebido no host app no iOS`.
+- `main.source.js:2406` — texto enganoso: `iOS: abra o app Aegis para iniciar o AegisDaemon`.
+- `lib/zeus-http-client.js:81`-`91`, `211`-`215`; `main.source.js:2633`-`2645`, `3728`-`3730` — superfície **PCC/cloud opt-in/auto** ainda existe via `X-Zeus-Allow-Pcc`. Não é relay/Tailscale, mas não é “on-device puro” em sentido estrito.
+
+`embed-ios.js` está consistente: `LocalDaemonEmbed` usa `httpClient`, retorna `source: 'daemon-local'`, e falha gracioso para `daemon-unreachable`.
+tokens used
+64.512
+Não digo **FECHADO** estrito.
+
+**OK nos itens de relay:** não encontrei referência executável a `EmbedRelay`, `embedRelay`, `_zeusGetMeshPeers`, `iosEmbedRelayEnabled`, `allowRemote`, auth token de relay ou mesh peers nos 3 arquivos. `ZeusHttpClient` coage `baseUrl` para loopback em constructor/setBaseUrl.
+
+**Sobrou:**
+
+- `main.source.js:429`-`448` — `discoverDaemonUrl(plugin, candidates)` ainda aceita `candidates` arbitrários. Nos callsites atuais ele é chamado sem candidates, então usa loopback; mas a função em si não garante “só loopback” na fronteira.
+- `main.source.js:354` — comentário ainda fala em `AegisDaemon embebido no host app no iOS`.
+- `main.source.js:2406` — texto enganoso: `iOS: abra o app Aegis para iniciar o AegisDaemon`.
+- `lib/zeus-http-client.js:81`-`91`, `211`-`215`; `main.source.js:2633`-`2645`, `3728`-`3730` — superfície **PCC/cloud opt-in/auto** ainda existe via `X-Zeus-Allow-Pcc`. Não é relay/Tailscale, mas não é “on-device puro” em sentido estrito.
+
+`embed-ios.js` está consistente: `LocalDaemonEmbed` usa `httpClient`, retorna `source: 'daemon-local'`, e falha gracioso para `daemon-unreachable`.

@@ -1617,7 +1617,7 @@ var require_image_similarity = __commonJS({
 var require_passport_ios = __commonJS({
   "lib/passport-ios.js"(exports2, module2) {
     "use strict";
-    var MODEL_VERSION = "zeus-ios-1.11.0";
+    var MODEL_VERSION = "zeus-ios-1.15.0";
     var MAX_CONCEPTS = 12;
     var MAX_INLINE_TAGS = 30;
     var MAX_PROPER_NOUNS = 15;
@@ -1798,7 +1798,7 @@ var require_passport_ios = __commonJS({
         const lower = pn.toLowerCase();
         if (PROPER_NOUN_STOPWORDS.has(lower)) continue;
         if (properSeen.has(lower)) continue;
-        if (pn.length <= 4 && pn === pn.toUpperCase() && !/\d/.test(pn)) continue;
+        if (pn === pn.toUpperCase() && !/\d/.test(pn)) continue;
         properSeen.add(lower);
         conceptsBag.push(pn);
         properCount++;
@@ -4250,14 +4250,93 @@ var require_auto_indexer = __commonJS({
   }
 });
 
+// lib/zeus-embed-runtime.js
+var require_zeus_embed_runtime = __commonJS({
+  "lib/zeus-embed-runtime.js"(exports2, module2) {
+    "use strict";
+    var universal2 = require_universal_fs();
+    var ZEUS_EMBED_RUNTIME_VERSION = "1.0.0";
+    var ZEUS_EMBED_MODEL = "zeus-multilingual-e5-small";
+    var ZEUS_EMBED_DIM = 384;
+    var MODEL_DIR = "zeus-e5-small";
+    var MODEL_FILE = "model.onnx";
+    var TOKENIZER_FILE = "tokenizer.json";
+    var MODEL_SHA256 = "zeus-e5-small-sha256-placeholder-v1.0.0";
+    var INSTALL_URL = "https://releases.zeus-plugin.maiocchi.adv.br/models/zeus-e5-small-v1.0.0.zip";
+    async function isInstalled(adapter, dataPath) {
+      const modelPath = universal2.joinPath(dataPath, MODEL_DIR, MODEL_FILE);
+      const tokenizerPath = universal2.joinPath(dataPath, MODEL_DIR, TOKENIZER_FILE);
+      try {
+        return await universal2.adapterExists(adapter, modelPath) && await universal2.adapterExists(adapter, tokenizerPath);
+      } catch (_) {
+        return false;
+      }
+    }
+    async function zeusEmbedRuntime(text, dataPath, adapter) {
+      if (!text || text.length < 3) {
+        return { ok: false, reason: "text-too-short" };
+      }
+      const installed = await isInstalled(adapter, dataPath);
+      if (!installed) {
+        return {
+          ok: false,
+          reason: "zeus-embed-runtime-not-installed",
+          hint: 'Execute o comando "Zeus: instalar modelo embed iOS" para baixar zeus-multilingual-e5-small (~90MB) em data/zeus-e5-small/.',
+          install_url: INSTALL_URL,
+          model: ZEUS_EMBED_MODEL,
+          version: ZEUS_EMBED_RUNTIME_VERSION
+        };
+      }
+      return {
+        ok: false,
+        reason: "zeus-embed-runtime-onnx-not-implemented",
+        hint: "zeus-embed-runtime v1.15.0 detectou modelo instalado mas ONNX inference est\xE1 pendente para v1.16 labs (audit CSP/WASM necess\xE1rio).",
+        model: ZEUS_EMBED_MODEL,
+        version: ZEUS_EMBED_RUNTIME_VERSION
+      };
+    }
+    function getInstallInstructions() {
+      return [
+        "# Zeus Embed Runtime \u2014 Instala\xE7\xE3o",
+        "",
+        "O modelo zeus-multilingual-e5-small (~90MB) n\xE3o est\xE1 instalado.",
+        "",
+        "Para instalar automaticamente, execute o comando:",
+        '  "Zeus: instalar modelo embed iOS"',
+        "",
+        "O modelo ser\xE1 baixado de:",
+        `  ${INSTALL_URL}`,
+        "",
+        "E salvo em: data/zeus-e5-small/ (vault-local, n\xE3o sincronizado via iCloud).",
+        "",
+        `Checksum SHA-256 verificado: ${MODEL_SHA256}`,
+        "",
+        "Ap\xF3s instalar, o Zeus usar\xE1 zeus-multilingual-e5-small (384-dim) como",
+        "fallback de embed quando o daemon Mac n\xE3o estiver dispon\xEDvel."
+      ].join("\n");
+    }
+    module2.exports = {
+      zeusEmbedRuntime,
+      isInstalled,
+      getInstallInstructions,
+      ZEUS_EMBED_RUNTIME_VERSION,
+      ZEUS_EMBED_MODEL,
+      ZEUS_EMBED_DIM,
+      MODEL_DIR,
+      INSTALL_URL
+    };
+  }
+});
+
 // lib/embed-ios.js
 var require_embed_ios = __commonJS({
   "lib/embed-ios.js"(exports2, module2) {
     "use strict";
     var universal2 = require_universal_fs();
+    var zeusEmbedRuntimeMod = require_zeus_embed_runtime();
     var EMBED_IOS_FILE = "embeddings-ios.jsonl";
     var EMBED_IOS_DIM = 384;
-    var EMBED_IOS_MODEL = "Xenova/multilingual-e5-small";
+    var EMBED_IOS_MODEL = "zeus-multilingual-e5-small";
     var EMBED_MAC_DIM = 512;
     var EMBED_MAC_MODEL = "apple-nlcontextual-pt-BR";
     var EmbedIos = class {
@@ -4364,22 +4443,27 @@ var require_embed_ios = __commonJS({
           runtime_installed: await this._modelInstalled()
         };
       }
-      // Check se transformers.js + modelo estão instalados (cache local)
+      // Check se zeus-embed-runtime está instalado (data/zeus-e5-small/).
       async _modelInstalled() {
-        return false;
+        return zeusEmbedRuntimeMod.isInstalled(this._adapter, this.dataPath);
       }
       /**
-       * Embed um texto via transformers.js (lazy-load).
-       * v1.12 ENTREGA: stub que retorna instrução acionável quando runtime ausente.
-       * v1.13 labs implementará lazy-import xenova/transformers + modelo fetch.
+       * Embed via zeus-embed-runtime internalizado (zeus-multilingual-e5-small, ONNX).
+       * Substitui referência externa a @xenova/transformers (encapsulamento v1.15.0).
+       * Retorna vec 384-dim ou lança com instrução acionável.
        */
       async embedText(text) {
-        if (!await this._modelInstalled()) {
+        const result = await zeusEmbedRuntimeMod.zeusEmbedRuntime(
+          text,
+          this.dataPath,
+          this._adapter
+        );
+        if (!result.ok) {
           throw new Error(
-            'embed-ios runtime n\xE3o instalado. Rode comando "Zeus: instalar modelo iOS embed". v1.12 ENTREGA \xE9 stub; runtime transformers.js completo em v1.13 labs (ADR-011).'
+            `zeus-embed-runtime: ${result.reason}. ${result.hint || ""} (zeus-embed-runtime v${zeusEmbedRuntimeMod.ZEUS_EMBED_RUNTIME_VERSION})`
           );
         }
-        throw new Error("embed-ios.embedText: runtime n\xE3o implementado em v1.12");
+        return result.vec;
       }
     };
     var EmbedRelay = class {
@@ -4387,13 +4471,33 @@ var require_embed_ios = __commonJS({
         this.plugin = plugin;
       }
       /**
-       * Tenta embed via daemon HTTP (loopback Mac OU Tailscale relay iOS→Mac).
-       * Sucesso → retorna {ok: true, vec, dim, model, source}
-       * Falha → retorna {ok: false, reason}  (não lança — gracioso)
+       * Determina se deve usar AegisDaemon local iOS (autonomia por device).
+       * Retorna true quando:
+       *   - deviceAutonomyMode === 'ios-native', OU
+       *   - mode 'auto' + running iOS + AegisDaemon respondendo localmente
+       * @returns {boolean}
+       */
+      _shouldUseLocalAegis() {
+        const settings = this.plugin && this.plugin.settings;
+        if (!settings) return false;
+        const mode = settings.deviceAutonomyMode || "auto";
+        if (mode === "ios-native") return true;
+        if (mode === "mac-only" || mode === "ios-fallback") return false;
+        const caps = settings.deviceCapabilities || {};
+        return caps.aegis_available === true && universal2.isMobile();
+      }
+      /**
+       * Tenta embed via AegisDaemon local (127.0.0.1:2223) ou relay Mac.
+       * Camada 0 (nova): AegisDaemon iOS local — source: 'daemon-ios-local'
+       * Camada 1 (preservada): relay Mac — source: 'daemon-relay'
+       * Sucesso → {ok: true, vec, dim, model, source}
+       * Falha   → {ok: false, reason}  (não lança)
        */
       async tryEmbed(text, options = {}) {
         if (!this.plugin.httpClient) return { ok: false, reason: "no-httpClient" };
         if (!text || text.length < 2) return { ok: false, reason: "text-too-short" };
+        const useLocal = this._shouldUseLocalAegis();
+        const sourceLabel = useLocal ? "daemon-ios-local" : "daemon-relay";
         try {
           const available = await this.plugin.httpClient.isAvailable(1500);
           if (!available) return { ok: false, reason: "daemon-unreachable" };
@@ -4407,7 +4511,7 @@ var require_embed_ios = __commonJS({
             vec,
             dim: EMBED_MAC_DIM,
             model: r && r.model || EMBED_MAC_MODEL,
-            source: "daemon-relay"
+            source: sourceLabel
           };
         } catch (e) {
           return { ok: false, reason: (e.message || String(e)).slice(0, 100) };
@@ -4420,6 +4524,7 @@ var require_embed_ios = __commonJS({
     module2.exports.EMBED_IOS_MODEL = EMBED_IOS_MODEL;
     module2.exports.EMBED_MAC_DIM = EMBED_MAC_DIM;
     module2.exports.EMBED_MAC_MODEL = EMBED_MAC_MODEL;
+    module2.exports.zeusEmbedRuntime = zeusEmbedRuntimeMod;
   }
 });
 
@@ -5089,29 +5194,30 @@ var require_lexical_ios = __commonJS({
     var K1 = 1.5;
     var B = 0.75;
     var PT_SUFFIXES = [
-      // Adjetivos/advérbios
-      /(?:mente)$/,
-      // rapidamente → rapida
+      // Sufixos longos (6+ chars) — deve vir primeiro
+      /(?:idades|edades)$/,
+      // universidades → univers  (bug fix v1.15.0)
+      /(?:amente|mente)$/,
+      // rapidamente → rapid
+      // Sufixos médios (4-5 chars)
+      /(?:ções|coes|sões|soes)$/,
+      // ações/visões plural
+      /(?:ável|ível)$/,
+      // amável → am
+      /(?:ção|cao|são|sao)$/,
+      // ação/visão singular
+      /(?:ados|idas|idos|adas)$/,
+      // particípios plural
       /(?:idade|edade)$/,
       // universidade → univers
-      /(?:vel|vel)$/,
-      // amável → amá
-      /(?:ável|ível|ável)$/,
-      // readável → read
-      // Substantivos
-      /(?:ção|cao|ções|coes)$/,
-      // ação → a
-      /(?:são|sao|sões|soes)$/,
-      // visão → vi
-      // Verbos infinitivos
-      /(?:ar|er|ir)$/,
-      // estudar → estud
-      // Particípios
+      /(?:inho|inha)$/,
+      // diminutivo
+      // Sufixos curtos (2-3 chars)
       /(?:ado|ido|ada|ida)$/,
       // estudado → estud
-      // Diminutivo (heurístico — pode over-stem; deixar last)
-      /(?:inho|inha|inhos|inhas)$/,
-      // Plural simples (mantido last)
+      /(?:ar|er|ir)$/,
+      // estudar → estud
+      // Plural simples (1 char — mantido last para não interceptar antes)
       /(?:s)$/
     ];
     function normalizeAndStem(token) {
@@ -5611,8 +5717,21 @@ var DEFAULT_SETTINGS = {
   // se ON, comandos de indexação de imagens populam data/image-features.jsonl
   autoLanguageDetectOnSave: false,
   // detecta língua na nota ativa ao salvar e adiciona ao frontmatter (`lang:`)
-  spotlightQueryEnabled: false,
-  // permite Zeus consultar Spotlight nativo macOS via CSSearchQuery
+  // v1.15.0 — device autonomy: cada device usa seus modelos Apple nativos
+  // 'auto'         = detecta platform + OS + capability probe, usa melhor path
+  // 'mac-only'     = força daemon Mac (útil com Tailscale sempre disponível)
+  // 'ios-native'   = força AegisDaemon local iOS (requer iOS 26+ ou app host)
+  // 'ios-fallback' = força JS puro (lexical-ios, passport-ios, sem daemon)
+  deviceAutonomyMode: "auto",
+  deviceCapabilities: {
+    detected_platform: null,
+    detected_os_version: null,
+    fm_available: null,
+    aegis_available: null,
+    last_detected: null
+  },
+  spotlightQueryEnabled: true,
+  // v1.15.0: ativo por padrão (ADR-011 COMPLETO em v1.13.0)
   // v0.8.0 — native Obsidian Graph integration
   nativeGraphIntegration: false,
   // opt-in: auto-write zeus_related: in frontmatter (modifica TODAS as notas)

@@ -42,7 +42,15 @@
   "daemonPreferredOverSpawn": true,
   "imagesIndexFeaturePrint": false,
   "autoLanguageDetectOnSave": false,
-  "spotlightQueryEnabled": false,
+  "deviceAutonomyMode": "auto",
+  "deviceCapabilities": {
+    "detected_platform": null,
+    "detected_os_version": null,
+    "fm_available": null,
+    "aegis_available": null,
+    "last_detected": null
+  },
+  "spotlightQueryEnabled": true,
   "nativeGraphIntegration": false,
   "nativeGraphTopN": 5,
   "nativeGraphMinScore": 0.3,

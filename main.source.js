@@ -252,7 +252,20 @@ const DEFAULT_SETTINGS = {
   // v0.7.0 — full Apple ecosystem coverage
   imagesIndexFeaturePrint: false,           // se ON, comandos de indexação de imagens populam data/image-features.jsonl
   autoLanguageDetectOnSave: false,          // detecta língua na nota ativa ao salvar e adiciona ao frontmatter (`lang:`)
-  spotlightQueryEnabled: false,             // permite Zeus consultar Spotlight nativo macOS via CSSearchQuery
+  // v1.15.0 — device autonomy: cada device usa seus modelos Apple nativos
+  // 'auto'         = detecta platform + OS + capability probe, usa melhor path
+  // 'mac-only'     = força daemon Mac (útil com Tailscale sempre disponível)
+  // 'ios-native'   = força AegisDaemon local iOS (requer iOS 26+ ou app host)
+  // 'ios-fallback' = força JS puro (lexical-ios, passport-ios, sem daemon)
+  deviceAutonomyMode: 'auto',
+  deviceCapabilities: {
+    detected_platform: null,
+    detected_os_version: null,
+    fm_available: null,
+    aegis_available: null,
+    last_detected: null,
+  },
+  spotlightQueryEnabled: true,              // v1.15.0: ativo por padrão (ADR-011 COMPLETO em v1.13.0)
   // v0.8.0 — native Obsidian Graph integration
   nativeGraphIntegration: false,            // opt-in: auto-write zeus_related: in frontmatter (modifica TODAS as notas)
   nativeGraphTopN: 5,                       // top N neighbors per note

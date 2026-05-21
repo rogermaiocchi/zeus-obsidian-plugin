@@ -4,6 +4,30 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.14.0] — 2026-05-21 — Security hardening (auditoria round 4 + mesa de debate Codex)
+
+Sprint de hardening a partir da auditoria de 4 fases (5 subagentes Claude + Codex CLI). Foco: fechar a superfície de rede do daemon e completar o privacy gate. Correções verificadas end-to-end com tooling nativo (`swift build`, `lsof`, `curl`, testes node).
+
+### Segurança — daemon (CRIT)
+
+- **CRIT #1 — bind loopback por padrão.** `ZeusArgs.host` default passa de `0.0.0.0` para `127.0.0.1` (`daemon/Sources/ZeusDaemonMac/main.swift`). Cross-device via Tailscale agora exige `--host 0.0.0.0` explícito + token. Verificado: `lsof` mostra `127.0.0.1` only no default.
+- **CRIT #2/#3 — auth gate `X-Zeus-Token`.** Novo middleware em `ZeusMacHTTPHandler` e `AegisHTTPHandler`: loopback é confiável (on-device-first); peers não-loopback exigem `X-Zeus-Token` == env `ZEUS_DAEMON_TOKEN` (compare constant-time). `/v1/health` fica aberto para discovery. Fail-closed: sem token configurado, todo peer remoto é recusado mesmo bound em `0.0.0.0`. Fecha o vetor de RCE não-autenticado em `/v1/cmd` na LAN/tailnet. Verificado: LAN sem token → 401, token correto → 200, loopback → 200.
+
+### Privacidade (HIGH)
+
+- **HIGH #4 — privacy gate centralizado.** `_assertRawContentAllowed()` movido para `_post()` em `lib/zeus-http-client.js`, cobrindo TODOS os endpoints (antes só `/v1/embed`). `enrich`, `ocr`, `summarize`, `aspTranscribe`, `contentGet`, `passport*` agora bloqueiam envio de conteúdo `Clientes/`/`sigiloso` para daemon remoto. `_isPrivatePath` reforçado para pegar paths absolutos/aninhados. Verificado: 13/13 testes.
+
+### Cross-device (HIGH/MED)
+
+- **#6 / S8 Check 3 — flush de `deviceId` legado** do `data.json` sincronizado no `onload` (guarded, só quando há valor stale).
+- **MED #9 — `claudeBin` sem path pessoal hardcoded.** Resolve via `ZEUS_CLAUDE_BIN` → `~/.local/bin` → `/opt/homebrew/bin` → `/usr/local/bin`.
+
+### Pendências documentadas (não nesta release)
+
+Relativização de paths em `passports.jsonl`/`lexical-ios.jsonl`, remoção da topologia Tailscale hardcoded (`TAILSCALE_MESH`), wiring do Twin MLX no iOS, e cleanup de conformidade Obsidian (descrição/`detachLeavesOfType`) — requerem teste de integração cross-device. Ver `audit-final-consolidado.md`.
+
+---
+
 ## [1.13.2] — 2026-05-20 — Codex deferred #5 RESOLVED: Swift 6 strict concurrency
 
 User pediu "resolva com codex cli: 1 deferred com tracking". Codex deep audit anterior deferred Swift 6 strict concurrency em 6 sites de Spotlight handlers. Debate profundo aprovou **opção A+** (Sendable Box com NSLock).

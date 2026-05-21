@@ -179,6 +179,27 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         }
     }
 
+    // MARK: - Auth (v1.14 — codex CRIT #2/#3)
+    // Loopback confiável (on-device); peers não-loopback exigem X-Zeus-Token ==
+    // env ZEUS_DAEMON_TOKEN. Fail-closed sem token configurado.
+    static func isLoopback(_ addr: SocketAddress?) -> Bool {
+        guard let ip = addr?.ipAddress else { return false }
+        return ip == "127.0.0.1" || ip == "::1" || ip == "::ffff:127.0.0.1"
+    }
+
+    static func isAuthorized(remote: SocketAddress?, head: HTTPRequestHead) -> Bool {
+        if isLoopback(remote) { return true }
+        guard let token = ProcessInfo.processInfo.environment["ZEUS_DAEMON_TOKEN"],
+              !token.isEmpty else { return false }
+        guard let provided = head.headers.first(name: "X-Zeus-Token")
+                ?? head.headers.first(name: "x-zeus-token") else { return false }
+        let ab = Array(provided.utf8), bb = Array(token.utf8)
+        if ab.count != bb.count { return false }
+        var diff: UInt8 = 0
+        for i in 0..<ab.count { diff |= ab[i] ^ bb[i] }
+        return diff == 0
+    }
+
     private func handleRequest(context: ChannelHandlerContext) {
         guard let head = self.requestHead else {
             self.writeJSON(context: context, status: .badRequest, dict: ["error": "missing request head"])
@@ -206,6 +227,14 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             headers.add(name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS")
             headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type")
             self.writeRaw(context: context, status: .noContent, headers: headers, body: nil)
+            return
+        }
+
+        // v1.14 — Auth gate (codex CRIT #2/#3). /v1/health aberto p/ discovery;
+        // resto exige loopback OU X-Zeus-Token válido.
+        if path != "/v1/health" && !Self.isAuthorized(remote: context.remoteAddress, head: head) {
+            self.writeJSON(context: context, status: .unauthorized,
+                           dict: ["error": "unauthorized: non-loopback request requires valid X-Zeus-Token"])
             return
         }
 

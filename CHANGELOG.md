@@ -4,6 +4,47 @@ Todas as mudanças notáveis deste projeto. Formato derivado de [Keep a Changelo
 
 ---
 
+## [1.15.0] — 2026-05-21 — Fecha 100% das pendências (round 4 deferred + mesa de debate Codex round 5)
+
+Sprint autônoma fechando TODAS as pendências "deferred" da v1.14.0 + os achados de uma segunda mesa de debate com o Codex CLI (round 5). Tudo verificado: `swift build` (ambos daemons), `node scripts/check-project.mjs`, e testes node (18/18 asserts). Sem `0.0.0.0`, sem RCE, sem dado pessoal no fonte.
+
+### Conformidade Obsidian (HIGH — blockers de submissão)
+
+- **manifest `description`**: reescrita em inglês, 220 chars (limite 250), só ASCII. Antes: 891 chars em português com `·`/`⊕`/acentos.
+- **`onunload` não chama mais `detachLeavesOfType`** (proibido pelo guideline; o Obsidian gerencia o ciclo das views via `registerView`).
+- **Settings headings**: 13 `createEl('h2'/'h3')` → `new Setting().setHeading()`.
+- **Inline styles estáticos → `styles.css`** (`.zeus-passport-card-title`, `.zeus-smart-graph-node`, `.zeus-result-why-line`, `.zeus-prompt-*`); só o `width` dinâmico do progress bar fica inline.
+- **`registerDomEvent`** no Modal de passport-find; `addEventListener` mantido (com justificativa) só em elementos transitórios/recriados onde `registerDomEvent` acumularia entradas.
+- **`console.log` gated**: 52 ocorrências → `dbg()` atrás de `settings.debug` (default OFF; só warn/error por padrão). Novo toggle "Debug logging" nas settings.
+- **Guard `isMac()`** no comando `zeus-spotlight-search`.
+
+### Privacidade / topologia (HIGH)
+
+- **Topologia Tailscale hardcoded REMOVIDA** (`TAILSCALE_MESH` com IPs `100.108.x`/hostname `rogers-mac-mini`). Mesh peers agora vêm de `localStorage` per-device (não sincronizado), default vazio, configuráveis em Settings. `allowRemoteDaemonFallback` default `false` (strict on-device).
+- **`deviceId` removido do `data.json`** versionado/sincronizado (o flush legado já existia no onload).
+- **Fallbacks `/Users/rogermaiocchi` e `/Users/maiocchi` removidos** — resolvidos via `$HOME`/`$USER`.
+- **Privacy gate cobre conteúdo content-only** (codex round 5): `graphExtract`/`summarize`/`refine`/`classify`/`prompt` aceitam `privacyCtx` e o caller passa a proveniência (`_privacyPath`) — texto vindo de `Clientes/**` não escapa mais por endpoints sem `path` no body.
+
+### Cross-device — paths vault-relativos (HIGH)
+
+- **`passports.jsonl` 100% vault-relativo**: coerção no chokepoint de escrita (`saveAll`), na leitura (`loadAll`, auto-migra absolutos legados), em `buildOne` e em `buildAll` (codex round 5). Nenhum `/Users/...` entra no JSONL sincronizado via iCloud.
+- **`lexical-ios.jsonl`**: coerção defensiva em `incremental` (índice já era relativo por construção).
+
+### iOS — Twin MLX (MED)
+
+- **`runFoundationModel` (AegisDaemon) agora liga o Twin**: nos ramos de indisponibilidade do Apple Intelligence (iOS<26, device sem AI, `.unavailable`) delega para `MLXAppleTwinProvider.shared` via `twinFallbackOr503` (antes retornava 503 sem nunca chamar o Twin). `/v1/prompt` também roteado (codex round 5). No macOS `shared` é `nil` → mantém 503 (Apple Intelligence cobre).
+
+### Honestidade — PCC (HIGH)
+
+- **`pcc_used` → `pcc_possible`** em todo lugar (Swift Mac handler, client JS, UI, header `X-Zeus-Pcc-Used` → `X-Zeus-Pcc-Possible`). O daemon não consegue medir uso real de cloud (Apple não expõe API de inspeção); o campo agora declara honestamente "cloud era possível", não "cloud foi usado". `pcc=off` → `false` (recusa estrutural).
+
+### Notas
+
+- Auditoria desta sprint: `audit-codex-round5-raw.txt` (log Codex) + seção 8 de `audit-final-consolidado.md` (adjudicação da mesa de debate).
+- Itens que exigem device físico (deploy iOS via Xcode, runtime do Twin em iPhone/iPad) seguem validados por **compilação**; sem device USB nesta sessão.
+
+---
+
 ## [1.14.0] — 2026-05-21 — Security hardening (auditoria round 4 + mesa de debate Codex)
 
 Sprint de hardening a partir da auditoria de 4 fases (5 subagentes Claude + Codex CLI). Foco: fechar a superfície de rede do daemon e completar o privacy gate. Correções verificadas end-to-end com tooling nativo (`swift build`, `lsof`, `curl`, testes node).

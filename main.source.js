@@ -42,6 +42,14 @@
 
 'use strict';
 
+// === v1.15 — debug-gated logging (Obsidian guideline: por padrão, só erros) ===
+// console.log poluía o console do usuário a cada boot/index. Agora todo log
+// informativo passa por dbg(), que só imprime quando ZEUS_DEBUG está ligado
+// (settings.debug, propagado em onload). console.warn/console.error continuam
+// sempre visíveis. ZEUS_DEBUG começa false — nenhum spam antes de loadSettings.
+let ZEUS_DEBUG = false;
+function dbg(...args) { if (ZEUS_DEBUG) { try { console.log(...args); } catch (_) {} } }
+
 // === v0.12 PluginRequire helper ===
 // Obsidian plugin loader sets __dirname to Electron renderer init, not plugin dir.
 // Relative pluginRequire('lib/X') fails. Use absolute path via discovery.
@@ -106,9 +114,9 @@ function _zeusFindPluginDir() {
   // 4) macOS: glob iCloud Drive do usuário
   try {
     if (fs0 && path0) {
-      const home = process.env.HOME || ('/Users/' + (process.env.USER || 'rogermaiocchi'));
+      const home = process.env.HOME || (process.env.USER ? '/Users/' + process.env.USER : '');
       const iCloudBase = home + '/Library/Mobile Documents/iCloud~md~obsidian/Documents';
-      if (fs0.existsSync(iCloudBase)) {
+      if (home && fs0.existsSync(iCloudBase)) {
         const entries = fs0.readdirSync(iCloudBase, { withFileTypes: true });
         for (const e of entries) {
           if (!e.isDirectory()) continue;
@@ -121,18 +129,20 @@ function _zeusFindPluginDir() {
     }
   } catch (_) {}
 
-  // 5) Fallbacks fixos macOS + iOS
+  // 5) Fallbacks fixos macOS + iOS — derivados de $HOME (sem usernames hardcoded).
+  // v1.15 — codex #8: removidos paths pessoais /Users/<user>; reconstruímos a
+  // partir de process.env.HOME, que cobre qualquer usuário macOS. iOS usa o
+  // sandbox determinístico /private/var/mobile.
   const home = (typeof process !== 'undefined' && process.env && process.env.HOME) || '';
+  const iCloudDocs = '/Library/Mobile Documents/iCloud~md~obsidian/Documents';
   const fallback = [
-    '/private/var/mobile/Library/Mobile Documents/iCloud~md~obsidian/Documents/Memoria/.obsidian/plugins/zeus',
-    '/var/mobile/Library/Mobile Documents/iCloud~md~obsidian/Documents/Memoria/.obsidian/plugins/zeus',
-    home + '/Library/Mobile Documents/iCloud~md~obsidian/Documents/Memoria/.obsidian/plugins/zeus',
-    '/Users/rogermaiocchi/Library/Mobile Documents/iCloud~md~obsidian/Documents/Memoria/.obsidian/plugins/zeus',
-    '/Users/maiocchi/Library/Mobile Documents/iCloud~md~obsidian/Documents/Memoria/.obsidian/plugins/zeus',
-    '/Users/rogermaiocchi/Library/Mobile Documents/iCloud~md~obsidian/Documents/.obsidian/plugins/zeus',
+    '/private/var/mobile' + iCloudDocs + '/Memoria/.obsidian/plugins/zeus',
+    '/var/mobile' + iCloudDocs + '/Memoria/.obsidian/plugins/zeus',
+    home + iCloudDocs + '/Memoria/.obsidian/plugins/zeus',
+    home + iCloudDocs + '/.obsidian/plugins/zeus',
   ];
   for (const c of fallback) {
-    if (isValid(c)) return c;
+    if (c && isValid(c)) return c;
   }
 
   // v1.4.3: sem fs (Capacitor) nao da pra VALIDAR caminhos — todas as 5
@@ -153,7 +163,7 @@ function pluginRequire(rel) {
     : (_ZEUS_PLUGIN_DIR + '/' + rel).replace(/\/+/g, '/');
   return require(full);
 }
-console.log('[zeus] pluginRequire base:', _ZEUS_PLUGIN_DIR);
+dbg('[zeus] pluginRequire base:', _ZEUS_PLUGIN_DIR);
 
 
 const obsidian = require('obsidian');
@@ -242,7 +252,7 @@ const DEFAULT_SETTINGS = {
   multiVectorEnabled: false,      // off until reindex; flip after primeiro reindex c/ multi-vector
   multiVectorIndexOnReindex: false, // se true, runFullIndex produz multi-vectors.jsonl além de embeddings.jsonl
   // v0.6.0 — Aegis-pattern HTTP daemon (ADR-018)
-  zeusDaemonUrl: 'http://127.0.0.1:2223',   // local daemon loopback; cross-device via Tailscale: http://100.65.240.43:2223
+  zeusDaemonUrl: 'http://127.0.0.1:2223',   // local daemon loopback (neutro; mesh peers ficam em localStorage per-device)
   daemonPreferredOverSpawn: true,            // ADR-018 fase E++: HTTP-first em todos hot paths; spawn é fallback no Mac
   // v1.4.1 — On-device-first: cada device Apple roda seu próprio daemon nativo
   // (ZeusDaemonMac no macOS, AegisDaemon no iOS). Quando ON, discovery cai para
@@ -259,7 +269,7 @@ const DEFAULT_SETTINGS = {
   nativeGraphMinScore: 0.3,                 // skip edges below this cosine score
   nativeGraphSyncOnSave: true,              // resync neighbor after file modify
   // v0.10.0 — cross-device coordination + scheduler
-  deviceId: '',                             // persisted; generated on first run by DistributedCoordinator
+  deviceId: '',                             // v1.15: NÃO persistido em data.json (filtrado em saveSettings); vive em localStorage per-device
   schedulerEnabled: true,                   // default ON — background coordinator sweeps stale passports
   schedulerIntervalMs: 15 * 60 * 1000,      // 15 min default
   coordTtlMs: 60 * 1000,                    // 60s default; iCloud sync delay (5-30s) << TTL
@@ -267,12 +277,16 @@ const DEFAULT_SETTINGS = {
   showTokenSavedInStatusBar: true,          // exibe "k tok saved" via PIA no status bar
   statusBarRefreshIntervalMs: 30000,        // 30s refresh para tokens metrics
   rawTokenBaseline: 1250,                   // tokens médios sem PIA por request (~5KB/4)
-  // v2.0 — Apple Cloud Private (ACP / PCC)
-  // 'off'    = só on-device (privacy máximo, requer macOS 26+ Apple Intelligence)
-  // 'opt-in' = client envia header X-Zeus-Allow-Pcc:1; daemon decide caso a caso
-  // 'auto'   = sempre permite roteamento para PCC quando on-device excede capacidade
+  // v2.0 — Apple Cloud Private (ACP / PCC). v1.15: routing real é decidido pela
+  // Apple (sem API pública de controle/inspeção); estes modos só controlam a
+  // PERMISSÃO que o client envia, e o daemon sinaliza POSSIBILIDADE de cloud.
+  // 'off'    = nenhum header de permissão; só on-device (default, privacy máximo)
+  // 'opt-in' = client envia X-Zeus-Allow-Pcc:1; Apple decide caso a caso
+  // 'auto'   = client permite PCC; daemon sinaliza possibilidade quando a carga excede on-device
   pccMode: 'off',
-  pccVisualIndicator: true,                 // exibe ☁️PCC no status bar quando daemon roteou via PCC
+  pccVisualIndicator: true,                 // exibe ☁️PCC? no status bar quando cloud era possível (heurístico)
+  // v1.15 — logging gate (Obsidian guideline): default OFF mostra só warn/error.
+  debug: false,                             // ON → dbg() imprime logs informativos no console
   // v1.8 — hybrid search MMR diversify + multiplex graph
   hybridDiversityLambda: 0.5,               // λ ∈ [0,1] da MMR — 1=só relevância, 0=só diversidade
   hybridDiversifyDefault: false,            // se ON, query() aplica MMR por padrão (lambda configurável acima)
@@ -360,18 +374,37 @@ async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs /* spawnArgs, s
   return { source: 'daemon', result };
 }
 
-// v0.6.1 — Adaptive daemon discovery: tries local loopback, then Tailscale mesh
-// Per device, prefers: 127.0.0.1 (same device daemon) > device-specific Tailscale (mesh peer)
-// v1.4.1 — Inclui hostnames mDNS/.local como fallback para LAN local (sem Tailscale).
-const TAILSCALE_MESH = [
-  // Order matters — closest/fastest first
-  'http://127.0.0.1:2223',                  // local daemon (any device)
-  'http://100.108.238.49:2223',             // rogers-mac-mini (Tailscale, macOS)
-  'http://100.86.123.88:2223',              // macbook-air-de-roger (Tailscale, macOS)
-  'http://100.91.107.120:2223',             // ipad-air-gen-4 (Tailscale, iOS)
-  'http://100.65.240.43:2223',              // iphone-15 (Tailscale, iOS)
-  'http://rogers-mac-mini.local:2223',      // mDNS/Bonjour fallback (LAN local sem Tailscale)
-];
+// v0.6.1 — Adaptive daemon discovery: tries local loopback, then optional mesh peers.
+// Per device, prefers: 127.0.0.1 (same device daemon) > user-configured mesh peers.
+//
+// v1.15 — codex #7 / S8 Check 2: a topologia de rede (IPs Tailscale, hostnames mDNS)
+// NÃO é mais hardcoded no fonte. Vazava os devices/IPs pessoais do maintainer e
+// quebrava em qualquer outra rede. Os peers de mesh agora vêm de localStorage
+// (per-device, NÃO sincronizado via iCloud), default vazio — sem mesh out-of-the-box.
+// Configurável em Settings → Zeus → "Daemon mesh peers (local)". Cada device escolhe
+// seus próprios peers; nada de topologia em data.json (que sincroniza).
+const ZEUS_MESH_PEERS_KEY = 'zeus.mesh.peers';   // JSON array de URLs http://host:port, per-device
+
+function _zeusGetMeshPeers() {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return [];
+    const raw = window.localStorage.getItem(ZEUS_MESH_PEERS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter(u => typeof u === 'string' && /^https?:\/\//.test(u)) : [];
+  } catch { return []; }
+}
+
+function _zeusSetMeshPeers(urls) {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    const clean = (Array.isArray(urls) ? urls : [])
+      .map(u => String(u).trim())
+      .filter(u => /^https?:\/\//.test(u));
+    if (clean.length === 0) window.localStorage.removeItem(ZEUS_MESH_PEERS_KEY);
+    else window.localStorage.setItem(ZEUS_MESH_PEERS_KEY, JSON.stringify(clean));
+  } catch {}
+}
 
 // v1.4.1 — Per-device cache: localStorage não é sincronizado via iCloud, então cada device
 // memoriza sua própria URL funcional. Evita re-discovery em todo startup.
@@ -414,7 +447,7 @@ function _zeusSetLocalDaemonUrl(url) {
     }
     // Só cacheia loopback — URL remota não é "estado estável" do device.
     if (!_zeusIsLoopback(url)) {
-      console.log('[zeus] cache skip — URL não é loopback (sempre re-probe local primeiro):', url);
+      dbg('[zeus] cache skip — URL não é loopback (sempre re-probe local primeiro):', url);
       return;
     }
     window.localStorage.setItem(ZEUS_LOCAL_DAEMON_KEY, url);
@@ -428,13 +461,13 @@ function _zeusSetLocalDaemonUrl(url) {
 //   1. 127.0.0.1:2223  — daemon LOCAL Apple-nativo (ZeusDaemonMac no Mac, AegisDaemon no iOS)
 //   2. localhost:2223  — alternativa de hostname para o mesmo loopback
 //   3. settings.zeusDaemonUrl — override sincronizado via iCloud (geralmente também 127.0.0.1)
-//   4. TAILSCALE_MESH — fallback degradado SE allowRemoteDaemonFallback estiver ON
+//   4. mesh peers (localStorage, per-device) — fallback degradado SE allowRemoteDaemonFallback estiver ON
 //
 // Probes em paralelo com timeout curto (1500ms). MAS o resultado é PRIORIZADO por
 // ordem de preferência: se loopback responde, vence sobre Tailscale mesmo que Tailscale
 // tenha respondido primeiro. Isso garante "local sempre que possível".
 async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 1500) {
-  const allowRemote = plugin.settings.allowRemoteDaemonFallback !== false;  // default true
+  const allowRemote = plugin.settings.allowRemoteDaemonFallback === true;  // default false (strict on-device)
 
   const ordered = [];
   const seen = new Set();
@@ -448,9 +481,9 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
     push('http://localhost:2223');
     // 3: settings (sincronizado via iCloud — geralmente loopback, mas pode ser custom)
     push(plugin.settings.zeusDaemonUrl);
-    // 4: mesh remoto (só se fallback permitido)
+    // 4: mesh peers remotos (per-device localStorage, só se fallback permitido)
     if (allowRemote) {
-      for (const u of TAILSCALE_MESH) push(u);
+      for (const u of _zeusGetMeshPeers()) push(u);
     }
   }
 
@@ -478,7 +511,7 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
   const loopback = winners.find(w => w.loopback);
   const chosen = loopback || winners.sort((a, b) => a.idx - b.idx)[0];
 
-  console.log('[zeus] adaptive daemon discovery → using', chosen.url,
+  dbg('[zeus] adaptive daemon discovery → using', chosen.url,
     chosen.loopback ? '(LOCAL on-device daemon ✓)' : '(REMOTE Tailscale fallback ⚠)');
 
   _zeusSetLocalDaemonUrl(chosen.url);   // só cacheia se for loopback (helper filtra)
@@ -1051,7 +1084,7 @@ class ZeusSearcher {
     if (this.plugin.settings.hydeEnabled) {
       try {
         textToEmbed = await this.plugin.hyde.expand(query);
-        console.log('[zeus] HyDE expansion (first 100):', textToEmbed.slice(0, 100));
+        dbg('[zeus] HyDE expansion (first 100):', textToEmbed.slice(0, 100));
       } catch (e) {
         console.warn('[zeus] HyDE failed, using raw query', e.message);
       }
@@ -1203,10 +1236,12 @@ class ZeusGraphExtractor {
     try {
       const content = await this.plugin.app.vault.adapter.read(filePath);
       const stripped = content.replace(/^---\n[\s\S]*?\n---\n/, '').slice(0, 6000);
+      // v1.15 — codex round 5: passa filePath como privacyCtx para o gate central
+      // ver a proveniência do conteúdo (graphExtract envia texto, não path).
       const r = await tryDaemonOrSpawn(
         this.plugin,
         'graphExtract',
-        [stripped, 20, 30],
+        [stripped, 20, 30, { _privacyPath: filePath }],
         ['graph-extract', '--max-nodes', '20', '--max-edges', '30'],
         stripped,
         60000
@@ -1574,7 +1609,7 @@ class ZeusEnricher {
       if (stat && typeof stat.size === 'number') fileSize = stat.size;
     } catch {}
     if (fileSize > this.plugin.settings.hierarchicalThreshold) {
-      console.log(`[zeus] doc ${filePath} is ${fileSize}B > ${this.plugin.settings.hierarchicalThreshold} — delegating to HierarchicalProcessor`);
+      dbg(`[zeus] doc ${filePath} is ${fileSize}B > ${this.plugin.settings.hierarchicalThreshold} — delegating to HierarchicalProcessor`);
       try {
         // Hierarchical processor needs absolute fs paths (afm CLI) — Mac only.
         if (!isMac() || !fs) {
@@ -1767,8 +1802,6 @@ class ZeusPassportFindModal extends obsidian.Modal {
         for (const p of hits) {
           const card = results.createDiv({ cls: 'zeus-passport-card' });
           const title = card.createEl('div', { cls: 'zeus-passport-card-title', text: p.path });
-          title.style.fontWeight = 'bold';
-          title.style.cursor = 'pointer';
           title.onclick = () => {
             this.app.workspace.openLinkText(p.path, '', false);
             this.close();
@@ -1796,7 +1829,8 @@ class ZeusPassportFindModal extends obsidian.Modal {
         submit.disabled = false;
       }
     };
-    input.addEventListener('keydown', e => { if (e.key === 'Enter') submit.click(); });
+    // v1.15 — registerDomEvent (este Modal é Component; listener limpo no close)
+    this.registerDomEvent(input, 'keydown', e => { if (e.key === 'Enter') submit.click(); });
     input.focus();
   }
 
@@ -1976,9 +2010,7 @@ class ZeusMultiplexNeighborsModal extends SuggestModal {
       const whyWrap = el.createDiv({ cls: 'zeus-result-path' });
       for (const edge of hit._edges) {
         const whyText = (edge.why && edge.why.length) ? edge.why.slice(0, 2).join(' · ') : '';
-        const line = whyWrap.createDiv();
-        line.style.fontSize = '0.85em';
-        line.style.opacity = '0.8';
+        const line = whyWrap.createDiv({ cls: 'zeus-result-why-line' });
         line.setText(`  ${edge.type} (w=${(edge.weight || 0).toFixed(2)}): ${whyText}`);
       }
     }
@@ -2072,7 +2104,10 @@ class ZeusSmartView extends ItemView {
       const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
       title.textContent = `${p.score.toFixed(2)} · ${p.path}`;
       circle.appendChild(title);
-      circle.style.cursor = 'pointer';
+      // v1.15 — cursor movido p/ CSS (.zeus-smart-graph-node). addEventListener
+      // (não registerDomEvent) é intencional: os círculos são recriados a cada
+      // render do grafo; o GC limpa o listener junto com o <circle> removido.
+      // registerDomEvent acumularia uma entrada por re-render até o close da view.
       circle.addEventListener('click', async () => {
         const tf = this.app.vault.getAbstractFileByPath(p.path);
         if (tf instanceof TFile) await this.app.workspace.getLeaf().openFile(tf);
@@ -2287,6 +2322,8 @@ class ZeusStatusView extends ItemView {
     const pct = fileCount > 0 ? Math.round((embCount / fileCount) * 100) : 0;
     const barWrap = calib.createDiv({ cls: 'zeus-progress-wrap' });
     const bar = barWrap.createDiv({ cls: 'zeus-progress-bar' });
+    // v1.15 — width é DINÂMICO (% calculado em runtime). Obsidian permite style
+    // inline para valores computados; só os estáticos foram movidos p/ styles.css.
     bar.style.width = pct + '%';
     bar.setText(pct + '%');
 
@@ -2333,7 +2370,16 @@ class ZeusSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl('h2', { text: 'Zeus — Apple-native Search' });
+    new Setting(containerEl).setName('Zeus — Apple-native Search').setHeading();
+
+    new Setting(containerEl)
+      .setName('Debug logging')
+      .setDesc('Default OFF: o console mostra só avisos e erros. ON: imprime logs informativos do Zeus (boot, indexação, discovery) para diagnóstico.')
+      .addToggle(t => t.setValue(this.plugin.settings.debug === true).onChange(async v => {
+        this.plugin.settings.debug = v;
+        ZEUS_DEBUG = v;
+        await this.plugin.saveSettings();
+      }));
     const desc = containerEl.createEl('p');
     desc.appendText('Substitui Omnisearch + Smart Connections com 100% Apple-native: ');
     desc.createEl('strong', { text: 'NLContextualEmbedding' });
@@ -2350,7 +2396,7 @@ class ZeusSettingTab extends PluginSettingTab {
       .setName('Daemon HTTP (bin/ZeusDaemonMac)')
       .setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 não responde. iOS consome via Tailscale/iCloud read-only. Estado: ${_lcLabel}`);
 
-    containerEl.createEl('h3', { text: 'Apple Vision multi-modal (av)' });
+    new Setting(containerEl).setName('Apple Vision multi-modal (av)').setHeading();
 
     new Setting(containerEl)
       .setName('Image features extraction')
@@ -2367,11 +2413,11 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Usa RecognizeDocumentsRequest layout-aware para PDFs. EXPERIMENTAL. Fallback automático para aocr regular.')
       .addToggle(t => t.setValue(this.plugin.settings.aocrPdfStructured).onChange(async v => { this.plugin.settings.aocrPdfStructured = v; await this.plugin.saveSettings(); }));
 
-    containerEl.createEl('h3', { text: 'Aegis-pattern HTTP daemon (v0.6, ADR-018)' });
+    new Setting(containerEl).setName('Aegis-pattern HTTP daemon (v0.6, ADR-018)').setHeading();
 
     new Setting(containerEl)
       .setName('Zeus daemon URL (sincronizado via iCloud)')
-      .setDesc('Setting compartilhada. Mantenha em http://127.0.0.1:2223 — cada device Apple roda seu PRÓPRIO daemon nativo (ZeusDaemonMac no macOS, AegisDaemon no iOS) e o discovery sempre tenta o loopback primeiro. Tailscale fica só como fallback quando o daemon local não está rodando.')
+      .setDesc('Setting compartilhada. Mantenha em http://127.0.0.1:2223 — cada device Apple roda seu PRÓPRIO daemon nativo (ZeusDaemonMac no macOS, AegisDaemon no iOS) e o discovery sempre tenta o loopback primeiro. Mesh peers (configuráveis abaixo, por device) ficam só como fallback quando o daemon local não está rodando.')
       .addText(t => t.setValue(this.plugin.settings.zeusDaemonUrl).setPlaceholder('http://127.0.0.1:2223').onChange(async v => {
         this.plugin.settings.zeusDaemonUrl = v;
         await this.plugin.saveSettings();
@@ -2381,9 +2427,9 @@ class ZeusSettingTab extends PluginSettingTab {
       }));
 
     new Setting(containerEl)
-      .setName('Permitir fallback remoto via Tailscale')
-      .setDesc('Default ON: se o daemon local 127.0.0.1:2223 não responde (ainda não instalado neste device), tenta peers Tailscale (Mac mini, MacBook, iPad, iPhone). OFF = modo strict on-device: nunca conecta a outro device — exige daemon Apple-nativo local funcionando. Recomendado OFF depois que todos os devices tiverem seu daemon próprio.')
-      .addToggle(t => t.setValue(this.plugin.settings.allowRemoteDaemonFallback !== false).onChange(async v => {
+      .setName('Permitir fallback remoto para mesh peers')
+      .setDesc('Default OFF (strict on-device): nunca conecta a outro device — exige daemon Apple-nativo local funcionando. ON: se o daemon local 127.0.0.1:2223 não responde, tenta os mesh peers configurados abaixo. Os peers ficam só neste device (localStorage, não sincroniza via iCloud).')
+      .addToggle(t => t.setValue(this.plugin.settings.allowRemoteDaemonFallback === true).onChange(async v => {
         this.plugin.settings.allowRemoteDaemonFallback = v;
         await this.plugin.saveSettings();
         // Invalida cache para forçar reavaliação na próxima discovery
@@ -2391,8 +2437,21 @@ class ZeusSettingTab extends PluginSettingTab {
       }));
 
     new Setting(containerEl)
+      .setName('Daemon mesh peers (local, não sincronizado)')
+      .setDesc('URLs de daemons remotos para fallback, uma por linha (ex: http://host-ou-ip:2223). Guardado só neste device (localStorage) — nunca vai para data.json sincronizado. Cada device escolhe seus próprios peers; sem topologia hardcoded. Requer o toggle acima ligado e um token de auth válido no daemon remoto.')
+      .addTextArea(t => {
+        t.setValue(_zeusGetMeshPeers().join('\n'))
+          .setPlaceholder('http://192.168.1.50:2223\nhttp://meu-host.local:2223')
+          .onChange(v => {
+            _zeusSetMeshPeers(String(v).split('\n').map(s => s.trim()).filter(Boolean));
+            _zeusSetLocalDaemonUrl(null);  // invalida cache para reavaliar com os novos peers
+          });
+        t.inputEl.rows = 3;
+      });
+
+    new Setting(containerEl)
       .setName('Forçar redescoberta de daemon agora')
-      .setDesc('Limpa cache localStorage e probe 127.0.0.1 + settings + TAILSCALE_MESH em paralelo. Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use após instalar o daemon local ou mover entre redes.')
+      .setDesc('Limpa cache localStorage e probe 127.0.0.1 + settings + mesh peers (local) em paralelo. Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use após instalar o daemon local ou mover entre redes.')
       .addButton(b => b.setButtonText('Redescobrir').setCta().onClick(async () => {
         _zeusSetLocalDaemonUrl(null);
         const n = new Notice('Zeus: redescobrindo daemon…', 0);
@@ -2424,7 +2483,7 @@ class ZeusSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
       }));
 
-    containerEl.createEl('h3', { text: 'HyDE — Hypothetical Document Embedding (DISRUPTIVE)' });
+    new Setting(containerEl).setName('HyDE — Hypothetical Document Embedding (DISRUPTIVE)').setHeading();
 
     new Setting(containerEl)
       .setName('HyDE query expansion')
@@ -2461,7 +2520,7 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Reindex completo 3s após abrir Obsidian (Mac only).')
       .addToggle(t => t.setValue(this.plugin.settings.indexOnStartup).onChange(async v => { this.plugin.settings.indexOnStartup = v; await this.plugin.saveSettings(); }));
 
-    containerEl.createEl('h3', { text: 'FoundationModels reasoning layer' });
+    new Setting(containerEl).setName('FoundationModels reasoning layer').setHeading();
 
     new Setting(containerEl)
       .setName('Enrich on note open (EXPERIMENTAL)')
@@ -2484,7 +2543,7 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Limite de loops de auto-crítica para padrão reflexion.')
       .addSlider(s => s.setLimits(1, 10, 1).setValue(this.plugin.settings.agentMaxIterations).setDynamicTooltip().onChange(async v => { this.plugin.settings.agentMaxIterations = v; await this.plugin.saveSettings(); }));
 
-    containerEl.createEl('h3', { text: 'v0.7 — full Apple ecosystem coverage' });
+    new Setting(containerEl).setName('v0.7 — full Apple ecosystem coverage').setHeading();
 
     new Setting(containerEl)
       .setName('Index image feature-prints (VNGenerateImageFeaturePrint)')
@@ -2501,7 +2560,7 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Permite o comando "Zeus: buscar via Spotlight nativo" consultar o índice macOS via CSSearchQuery exposto pelo daemon. Funciona apenas no Mac.')
       .addToggle(t => t.setValue(this.plugin.settings.spotlightQueryEnabled).onChange(async v => { this.plugin.settings.spotlightQueryEnabled = v; await this.plugin.saveSettings(); }));
 
-    containerEl.createEl('h3', { text: 'v0.8 — Native Obsidian Graph integration' });
+    new Setting(containerEl).setName('v0.8 — Native Obsidian Graph integration').setHeading();
 
     new Setting(containerEl)
       .setName('Native graph integration (DESTRUTIVO — opt-in)')
@@ -2523,7 +2582,7 @@ class ZeusSettingTab extends PluginSettingTab {
       .setDesc('Re-sincroniza `zeus_related:` 6s após cada modificação da nota (independente de Mac/indexOnSave).')
       .addToggle(t => t.setValue(this.plugin.settings.nativeGraphSyncOnSave).onChange(async v => { this.plugin.settings.nativeGraphSyncOnSave = v; await this.plugin.saveSettings(); }));
 
-    containerEl.createEl('h3', { text: 'Cross-device coordination (v0.10)' });
+    new Setting(containerEl).setName('Cross-device coordination (v0.10)').setHeading();
 
     new Setting(containerEl)
       .setName('Device ID')
@@ -2576,13 +2635,13 @@ class ZeusSettingTab extends PluginSettingTab {
           `Scheduler: enabled=${s.enabled}, running=${s.running}`,
           8000,
         );
-        console.log('[zeus] coordination stats', s);
+        dbg('[zeus] coordination stats', s);
       }));
 
     // ────────────────────────────────────────────────────────────────────
     // v1.1 — Métricas no Status Bar
     // ────────────────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'v1.1 — Status Bar & Token Metrics' });
+    new Setting(containerEl).setName('v1.1 — Status Bar & Token Metrics').setHeading();
     const metricsDesc = containerEl.createEl('p', { cls: 'setting-item-description' });
     metricsDesc.appendText('Status bar exibe contagem de docs indexados e, opcionalmente, tokens economizados via ');
     metricsDesc.createEl('strong', { text: 'Passport Index Architecture (PIA)' });
@@ -2633,7 +2692,7 @@ class ZeusSettingTab extends PluginSettingTab {
     // ────────────────────────────────────────────────────────────────────
     // v2.0 — Apple Cloud Private (ACP / PCC)
     // ────────────────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'v2.0 — Apple Cloud Private (PCC)' });
+    new Setting(containerEl).setName('v2.0 — Apple Cloud Private (PCC)').setHeading();
     const pccDesc = containerEl.createEl('p', { cls: 'setting-item-description' });
     pccDesc.appendText('Private Cloud Compute (PCC) é a camada de cloud do Apple Intelligence — modelos servidor-side rodam em hardware Apple verificável criptograficamente, sem reter dados. Usa sua assinatura Apple Intelligence já ativa. ');
     pccDesc.createEl('strong', { text: 'Apenas para queries que excedem capacidade on-device' });
@@ -2641,7 +2700,7 @@ class ZeusSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Modo PCC')
-      .setDesc('off = só on-device (privacy máximo, default). opt-in = client envia header X-Zeus-Allow-Pcc:1; daemon decide caso a caso. auto = daemon roteia para PCC quando on-device excede capacidade.')
+      .setDesc('off = só on-device (privacy máximo, default). opt-in = client envia header X-Zeus-Allow-Pcc:1; Apple decide caso a caso. auto = client permite PCC; o daemon apenas sinaliza POSSIBILIDADE quando a carga excede on-device — o routing real é decidido pela Apple (sem API pública de controle/inspeção).')
       .addDropdown(d => d
         .addOption('off', 'off — só on-device (default)')
         .addOption('opt-in', 'opt-in — header X-Zeus-Allow-Pcc:1')
@@ -2656,7 +2715,7 @@ class ZeusSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Indicador visual PCC no status bar')
-      .setDesc('Quando PCC é usado, status bar exibe "☁️PCC×N" (N = contagem de requests roteadas via PCC nesta sessão). Default ON quando pccMode ≠ off.')
+      .setDesc('Quando cloud (PCC) é possível, status bar exibe "☁️PCC?×N" (N = requests nesta sessão onde routing cloud era possível — heurístico, não medição real). Default ON quando pccMode ≠ off.')
       .addToggle(t => t.setValue(this.plugin.settings.pccVisualIndicator).onChange(async v => {
         this.plugin.settings.pccVisualIndicator = v;
         await this.plugin.saveSettings();
@@ -2665,12 +2724,12 @@ class ZeusSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Status PCC')
-      .setDesc('Inspeciona modo atual e contadores de uso PCC desde a última sessão.')
+      .setDesc('Inspeciona o modo atual e a contagem de requests onde cloud (PCC) era POSSÍVEL. O daemon não consegue medir uso real de cloud — Apple não expõe API de inspeção; este número é heurístico.')
       .addButton(b => b.setButtonText('Mostrar').onClick(() => {
         if (!this.plugin.httpClient) { new Notice('Zeus: HTTP client indisponível'); return; }
         const s = this.plugin.httpClient.getPccStatus();
         new Notice(
-          `Zeus PCC\nmodo: ${s.mode}\núltima req via PCC: ${s.lastUsed ? 'sim' : 'não'}\ntotal PCC nesta sessão: ${s.totalUsageCount}`,
+          `Zeus PCC\nmodo: ${s.mode}\núltima req com cloud possível: ${s.lastPossible ? 'sim' : 'não'}\ntotal cloud-possível nesta sessão: ${s.possibleCount}`,
           8000,
         );
       }));
@@ -2678,7 +2737,7 @@ class ZeusSettingTab extends PluginSettingTab {
     // ────────────────────────────────────────────────────────────────────
     // v1.8 — Hybrid diversify (MMR) + Multiplex graph
     // ────────────────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'v1.8 — Hybrid diversify (MMR) + Multiplex graph (8 edge types)' });
+    new Setting(containerEl).setName('v1.8 — Hybrid diversify (MMR) + Multiplex graph (8 edge types)').setHeading();
     const v18Desc = containerEl.createEl('p', { cls: 'setting-item-description' });
     v18Desc.appendText('5º retriever BM25 (Okapi puro JS) já está ativo no hybrid-search — acha termo exato (sigla, processo, id) que a perna semântica perde. ');
     v18Desc.appendText('MMR rerank opcional usa jaccard de sources como proxy de diversidade. Multiplex graph captura 8 evidências (wikilink·backlink·entity·date·folder·cosine·spotlight·co-citation) com `why` auditável.');
@@ -2732,7 +2791,7 @@ class ZeusSettingTab extends PluginSettingTab {
     // Escopo enxuto: local move + connectivity split + agregação. NÃO é o
     // Leiden canônico (sem refinement phase). Suficiente para vault típico.
     // ────────────────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Leiden communities (v1.9)' });
+    new Setting(containerEl).setName('Leiden communities (v1.9)').setHeading();
 
     new Setting(containerEl)
       .setName('Leiden resolution (γ)')
@@ -2779,7 +2838,7 @@ class ZeusSettingTab extends PluginSettingTab {
     // ────────────────────────────────────────────────────────────────────
     // Ações finais
     // ────────────────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Ações' });
+    new Setting(containerEl).setName('Ações').setHeading();
     new Setting(containerEl)
       .setName('Reindex completo')
       .setDesc('Re-lê o vault e recalcula embeddings. Mac only — outros devices apenas lêem.')
@@ -2813,7 +2872,7 @@ class ZeusPlugin extends Plugin {
     const trace = (step, info) => {
       const line = `[${new Date().toISOString()}] ${step}${info ? ': ' + JSON.stringify(info).slice(0, 200) : ''}`;
       traceLog.push(line);
-      console.log('[zeus.trace]', line);
+      dbg('[zeus.trace]', line);
     };
     const writeTrace = (err) => {
       try {
@@ -2829,13 +2888,16 @@ class ZeusPlugin extends Plugin {
       trace('loadData.begin');
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     trace('loadData.done');
+    // v1.15 — propaga o flag de debug para o logger gated (dbg). A partir daqui,
+    // dbg() respeita settings.debug; antes disso ficou silencioso (default false).
+    ZEUS_DEBUG = !!this.settings.debug;
     // vaultRoot is absolute path on Mac (Electron). On iOS Capacitor the adapter
     // exposes only relative paths — vaultRoot is undefined, callers must use
     // vault.adapter.* with vault-relative paths.
     this.vaultRoot = this.app.vault.adapter && this.app.vault.adapter.basePath ? this.app.vault.adapter.basePath : null;
     this._manifestCache = null;
     this._embeddingsCache = null;
-    console.log('[zeus] platform:', universal.detectPlatform(), '| vaultRoot:', this.vaultRoot || '(adapter-only)');
+    dbg('[zeus] platform:', universal.detectPlatform(), '| vaultRoot:', this.vaultRoot || '(adapter-only)');
     this.indexer = new ZeusIndexer(this);
     this.searcher = new ZeusSearcher(this);
     this.enricher = new ZeusEnricher(this);
@@ -2879,7 +2941,7 @@ class ZeusPlugin extends Plugin {
     // funciona para ELE, mesmo que settings.zeusDaemonUrl (sincronizado) aponte para outro device.
     const _initialDaemonUrl = _zeusGetLocalDaemonUrl() || this.settings.zeusDaemonUrl;
     if (_initialDaemonUrl !== this.settings.zeusDaemonUrl) {
-      console.log('[zeus] using per-device cached daemon URL:', _initialDaemonUrl, '(settings:', this.settings.zeusDaemonUrl, ')');
+      dbg('[zeus] using per-device cached daemon URL:', _initialDaemonUrl, '(settings:', this.settings.zeusDaemonUrl, ')');
     }
     this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
 
@@ -2894,20 +2956,20 @@ class ZeusPlugin extends Plugin {
       // do adapter Obsidian vs FSEvents pra detectar quando o adapter perdeu sync.
       try {
         const ws = this.nativeWatcher.start();
-        console.log('[zeus] native-watcher:', ws);
+        dbg('[zeus] native-watcher:', ws);
       } catch (e) {
         console.warn('[zeus] native-watcher start failed:', e.message);
       }
       try {
         const status = await this.daemonLifecycle.ensureRunning();
-        console.log('[zeus] daemon lifecycle:', status);
+        dbg('[zeus] daemon lifecycle:', status);
         // v1.5.1 — fix P2 codex review: quando o lifecycle sobe (ou reaproveita)
         // um daemon local em 127.0.0.1:2223, redireciona httpClient pra ele,
         // sobrescrevendo qualquer cache de URL remota (Tailscale peer). Sem
         // esse rebase, plugin spawna localmente mas continua falando com peer
         // remoto — "drop-in/on-device" não cumprido.
         if (status && status.running && status.url && this.httpClient.baseUrl !== status.url) {
-          console.log('[zeus] httpClient rebase:', this.httpClient.baseUrl, '→', status.url);
+          dbg('[zeus] httpClient rebase:', this.httpClient.baseUrl, '→', status.url);
           this.httpClient.setBaseUrl(status.url);
           _zeusSetLocalDaemonUrl(status.url);
         }
@@ -2937,11 +2999,11 @@ class ZeusPlugin extends Plugin {
     if (this.settings.lexicalIosAutoBuild) {
       setTimeout(async () => {
         try {
-          console.log('[zeus.lexical-ios] auto-build starting…');
+          dbg('[zeus.lexical-ios] auto-build starting…');
           const r = await this.lexicalIos.build((msg, pct) => {
-            if (pct % 25 === 0) console.log(`[zeus.lexical-ios] ${pct}%`, msg);
+            if (pct % 25 === 0) dbg(`[zeus.lexical-ios] ${pct}%`, msg);
           });
-          console.log('[zeus.lexical-ios] auto-build done:', r);
+          dbg('[zeus.lexical-ios] auto-build done:', r);
         } catch (e) {
           console.warn('[zeus.lexical-ios] auto-build failed:', e.message);
         }
@@ -2975,7 +3037,7 @@ class ZeusPlugin extends Plugin {
           window.localStorage.setItem(ZEUS_LOCAL_DEVICE_ID_KEY, _localDeviceId);
         }
       } catch (_) {}
-      console.log('[zeus] generated per-device deviceId (localStorage):', _localDeviceId);
+      dbg('[zeus] generated per-device deviceId (localStorage):', _localDeviceId);
     }
     // settings.deviceId fica em memória apenas — overrides do coordinator com o per-device.
     const _persistedDeviceId = this.settings.deviceId;  // v1.14 — valor vindo do data.json (pode ser legado)
@@ -2987,7 +3049,7 @@ class ZeusPlugin extends Plugin {
     if (this.settings.autoIndexEnabled !== false) {
       try {
         const ai = this.autoIndexer.start();
-        console.log('[zeus] auto-indexer:', ai);
+        dbg('[zeus] auto-indexer:', ai);
       } catch (e) {
         console.warn('[zeus] auto-indexer start failed:', e.message);
       }
@@ -2997,7 +3059,7 @@ class ZeusPlugin extends Plugin {
     // (saveSettings já filtra deviceId via destructuring). Guard evita write
     // em todo boot: só flusha quando havia valor stale no disco.
     if (_persistedDeviceId) {
-      console.log('[zeus] flush deviceId legado do data.json sincronizado');
+      dbg('[zeus] flush deviceId legado do data.json sincronizado');
       try { await this.saveSettings(); } catch (e) { console.warn('[zeus] flush deviceId falhou:', e.message); }
     }
     // v0.10.0 — Background scheduler for stale-passport detection + claim-coordinated re-extract
@@ -3016,7 +3078,7 @@ class ZeusPlugin extends Plugin {
         try {
           const tasks = await this.ioQueue.list();
           if (tasks.length === 0) return;
-          console.log('[zeus.io-queue] consumindo', tasks.length, 'tasks pendentes');
+          dbg('[zeus.io-queue] consumindo', tasks.length, 'tasks pendentes');
           for (const task of tasks) {
             await this.ioQueue.consume(task, async (t) => {
               if (t.type === 'passport') {
@@ -3059,24 +3121,24 @@ class ZeusPlugin extends Plugin {
     if (this.settings.multiplexAutoBuild) {
       setTimeout(async () => {
         try {
-          console.log('[zeus.multiplex] auto-build starting…');
+          dbg('[zeus.multiplex] auto-build starting…');
           await this.multiplex.buildFromVault((msg, pct) => {
-            if (pct % 25 === 0) console.log(`[zeus.multiplex] ${pct}%`, msg);
+            if (pct % 25 === 0) dbg(`[zeus.multiplex] ${pct}%`, msg);
           });
           await this.multiplex.persist();
           this._multiplexLoaded = true;
           const s = this.multiplex.stats();
-          console.log('[zeus.multiplex] auto-build done:', s.total, 'edges');
+          dbg('[zeus.multiplex] auto-build done:', s.total, 'edges');
           // v1.9 — Leiden auto-run após multiplex pronto. Roda em sequência (não
           // em paralelo) — Leiden depende do grafo congelado em memória.
           if (this.settings.leidenAutoRun) {
             try {
-              console.log('[zeus.leiden] auto-detect starting…');
+              dbg('[zeus.leiden] auto-detect starting…');
               const r = await this.leiden.detectCommunities({
                 resolution: this.settings.leidenResolution || 1.0,
               });
               await this.leiden.persist(r);
-              console.log('[zeus.leiden] auto-detect done:', r.stats.communityCount, 'comunidades, Q=', r.modularity.toFixed(3));
+              dbg('[zeus.leiden] auto-detect done:', r.stats.communityCount, 'comunidades, Q=', r.modularity.toFixed(3));
             } catch (e2) {
               console.warn('[zeus.leiden] auto-detect failed:', e2.message);
             }
@@ -3097,10 +3159,10 @@ class ZeusPlugin extends Plugin {
         const currentOk = await this.httpClient.isAvailable(1500);
         let activeUrl = this.httpClient.baseUrl;
         if (!currentOk) {
-          // URL atual morta — varre TAILSCALE_MESH + settings em paralelo.
+          // URL atual morta — varre loopback + settings + mesh peers (local) em paralelo.
           const discovered = await discoverDaemonUrl(this);
           if (discovered && discovered !== activeUrl) {
-            console.log('[zeus] adapting daemon URL from', activeUrl, 'to', discovered);
+            dbg('[zeus] adapting daemon URL from', activeUrl, 'to', discovered);
             this.httpClient.setBaseUrl(discovered);
             activeUrl = discovered;
           }
@@ -3111,7 +3173,7 @@ class ZeusPlugin extends Plugin {
         // Probe daemon capabilities to log what's available
         const health = await this.httpClient.health();
         const tools = await this.httpClient.tools();
-        console.log('[zeus] daemon health:', health.status, '| platform:', health.platform, '| endpoints:', (health.endpoints || []).length, '| tools:', tools.length, '| url:', activeUrl);
+        dbg('[zeus] daemon health:', health.status, '| platform:', health.platform, '| endpoints:', (health.endpoints || []).length, '| tools:', tools.length, '| url:', activeUrl);
         if (health.status === 'ok') {
           const isLocal = _zeusIsLoopback(activeUrl);
           new Notice(`Zeus: daemon ${health.platform || '?'} ${isLocal ? 'LOCAL ✓' : 'REMOTE (Tailscale) ⚠'} · ${(health.endpoints || []).length} endpoints`);
@@ -3262,7 +3324,7 @@ class ZeusPlugin extends Plugin {
           const tools = await this.httpClient.tools();
           n.hide();
           new Notice(`Daemon: ${health.status || 'unknown'} · platform: ${health.platform || '?'} · ${tools.length} tools`);
-          console.log('[zeus] HTTP daemon health:', health, 'tools:', tools);
+          dbg('[zeus] HTTP daemon health:', health, 'tools:', tools);
         } catch (e) {
           n.hide();
           new Notice(`Daemon unreachable: ${e.message.slice(0, 200)}`);
@@ -3287,7 +3349,7 @@ class ZeusPlugin extends Plugin {
           const out = (r && (r.translated || r.output || r.translation)) || JSON.stringify(r);
           try { await navigator.clipboard.writeText(out); } catch {}
           new Notice('Tradução copiada para clipboard');
-          console.log('[zeus] translate:', out);
+          dbg('[zeus] translate:', out);
         } catch (e) {
           n.hide();
           new Notice('Translate falhou: ' + e.message.slice(0, 150));
@@ -3307,7 +3369,7 @@ class ZeusPlugin extends Plugin {
           n.hide();
           const score = (r && (r.sentiment ?? r.score)) ?? 'n/a';
           new Notice(`Sentimento: ${typeof score === 'number' ? score.toFixed(3) : score}`);
-          console.log('[zeus] sentiment:', r);
+          dbg('[zeus] sentiment:', r);
         } catch (e) {
           n.hide();
           new Notice('Sentiment falhou: ' + e.message.slice(0, 150));
@@ -3333,7 +3395,7 @@ class ZeusPlugin extends Plugin {
             ? hyps.map(h => `${h.language || h.code}=${typeof h.confidence === 'number' ? h.confidence.toFixed(2) : h.confidence}`).join(', ')
             : '';
           new Notice(`Língua: ${dominant}${detail ? ' (' + detail + ')' : ''}`);
-          console.log('[zeus] language-detect:', r);
+          dbg('[zeus] language-detect:', r);
         } catch (e) {
           n.hide();
           new Notice('Language-detect falhou: ' + e.message.slice(0, 150));
@@ -3357,7 +3419,7 @@ class ZeusPlugin extends Plugin {
           const preview = Array.isArray(tags) ? tags.slice(0, 20).map(t => (t.lemma || t.tag || t.token)).join(' ') : JSON.stringify(r).slice(0, 200);
           try { await navigator.clipboard.writeText(JSON.stringify(r, null, 2)); } catch {}
           new Notice(`Lemma: ${tags.length || '?'} tokens (preview no console; JSON no clipboard)`);
-          console.log('[zeus] lemma preview:', preview, 'full:', r);
+          dbg('[zeus] lemma preview:', preview, 'full:', r);
         } catch (e) {
           n.hide();
           new Notice('Lemma falhou: ' + e.message.slice(0, 150));
@@ -3381,7 +3443,7 @@ class ZeusPlugin extends Plugin {
           const summary = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' · ');
           try { await navigator.clipboard.writeText(JSON.stringify(matches, null, 2)); } catch {}
           new Notice(`Detectados: ${matches.length} (${summary || 'nenhum'}) — JSON no clipboard`);
-          console.log('[zeus] data-detect:', r);
+          dbg('[zeus] data-detect:', r);
         } catch (e) {
           n.hide();
           new Notice('Data-detect falhou: ' + e.message.slice(0, 150));
@@ -3410,7 +3472,7 @@ class ZeusPlugin extends Plugin {
           const blocks = (r && (r.blocks || r.regions)) || [];
           try { await navigator.clipboard.writeText(text || JSON.stringify(r, null, 2)); } catch {}
           new Notice(`Document scan: ${blocks.length || 0} blocos · ${text.length} chars no clipboard`);
-          console.log('[zeus] vision-document:', r);
+          dbg('[zeus] vision-document:', r);
         } catch (e) {
           n.hide();
           new Notice('Document scan falhou: ' + e.message.slice(0, 150));
@@ -3438,7 +3500,7 @@ class ZeusPlugin extends Plugin {
           const overall = (r && (r.overall_score ?? r.score ?? r.aesthetics)) ?? '?';
           const utility = (r && (r.is_utility ?? r.utility)) ?? '?';
           new Notice(`Aesthetics: ${typeof overall === 'number' ? overall.toFixed(3) : overall} · utility: ${utility}`);
-          console.log('[zeus] aesthetics:', r);
+          dbg('[zeus] aesthetics:', r);
         } catch (e) {
           n.hide();
           new Notice('Aesthetics falhou: ' + e.message.slice(0, 150));
@@ -3450,6 +3512,10 @@ class ZeusPlugin extends Plugin {
       id: 'zeus-spotlight-search',
       name: 'Zeus: buscar via Spotlight nativo (CSSearchQuery)',
       callback: async () => {
+        if (!isMac()) {
+          new Notice('Zeus: Spotlight (CSSearchQuery) só roda no Mac.');
+          return;
+        }
         if (!this.settings.spotlightQueryEnabled) {
           new Notice('Spotlight query desabilitado — habilite em Settings → Zeus');
           return;
@@ -3471,7 +3537,7 @@ class ZeusPlugin extends Plugin {
           }
           try { await navigator.clipboard.writeText(JSON.stringify(results, null, 2)); } catch {}
           new Notice(`Spotlight: ${results.length} hits (JSON no clipboard)`);
-          console.log('[zeus] spotlight:', r);
+          dbg('[zeus] spotlight:', r);
         } catch (e) {
           n.hide();
           new Notice('Spotlight falhou: ' + e.message.slice(0, 150));
@@ -3492,7 +3558,7 @@ class ZeusPlugin extends Plugin {
           });
           n.hide();
           new Notice(`Zeus img-sim: ${stats.indexed} novas · ${stats.skipped} cache · ${stats.failed} falhas / ${stats.total} imagens`);
-          console.log('[zeus] image-similarity index stats:', stats);
+          dbg('[zeus] image-similarity index stats:', stats);
         } catch (e) {
           n.hide();
           new Notice('Image-index falhou: ' + e.message.slice(0, 200));
@@ -3543,7 +3609,7 @@ class ZeusPlugin extends Plugin {
           const lines = matches.map(m => `${(m.similarity * 100).toFixed(1)}% — ${m.rel}`);
           try { await navigator.clipboard.writeText(lines.join('\n')); } catch {}
           new Notice(`Top ${matches.length}:\n${lines.slice(0, 5).join('\n')}\n(lista completa no clipboard)`);
-          console.log('[zeus] image-similarity matches:', matches);
+          dbg('[zeus] image-similarity matches:', matches);
         } catch (e) {
           n.hide();
           new Notice('Image-similarity falhou: ' + e.message.slice(0, 200));
@@ -3691,7 +3757,7 @@ class ZeusPlugin extends Plugin {
           last,
           10000,
         );
-        console.log('[zeus] scheduler stats', s);
+        dbg('[zeus] scheduler stats', s);
       },
     });
     this.addCommand({
@@ -3810,7 +3876,7 @@ class ZeusPlugin extends Plugin {
             this.searcher.embeddings.set(rel, entry);
             this.indexer.saveEmbeddings(this.searcher.embeddings);
             this.refreshSmartView();
-            console.log('[zeus] real-time embed:', rel, `dim=${resp.dim}`);
+            dbg('[zeus] real-time embed:', rel, `dim=${resp.dim}`);
           }
         } catch (e) {
           console.warn('[zeus] real-time embed failed for', rel, e.message);
@@ -3843,7 +3909,7 @@ class ZeusPlugin extends Plugin {
           if (this.settings.audioVadEnabled) {
             const vad = await this.httpClient.aspVad(absPath);
             if (!vad || !vad.has_speech) {
-              console.log('[zeus] audio skip (no speech):', rel,
+              dbg('[zeus] audio skip (no speech):', rel,
                 vad ? `${vad.duration_seconds.toFixed(1)}s < threshold` : 'vad failed');
               return;
             }
@@ -3854,7 +3920,7 @@ class ZeusPlugin extends Plugin {
           const engine = this.settings.audioEngine || 'auto';
           const tr = await this.httpClient.aspTranscribe(absPath, locale, engine);
           if (!tr || !tr.text || tr.text.trim().length === 0) {
-            console.log('[zeus] audio no transcript:', rel,
+            dbg('[zeus] audio no transcript:', rel,
               tr ? `engine=${tr.engine_used}` : 'transcribe failed');
             return;
           }
@@ -3884,7 +3950,7 @@ class ZeusPlugin extends Plugin {
             this.searcher.embeddings.set(rel, entry);
             this.indexer.saveEmbeddings(this.searcher.embeddings);
             this.refreshSmartView();
-            console.log('[zeus] real-time audio:', rel,
+            dbg('[zeus] real-time audio:', rel,
               `${tr.duration_seconds.toFixed(1)}s · ${tr.text.length}ch · ${tr.engine_used}`);
           }
         } catch (e) {
@@ -3940,7 +4006,7 @@ class ZeusPlugin extends Plugin {
       this.searcher.embeddings.delete(file.path);
       this.indexer.saveEmbeddings(this.searcher.embeddings);
       this.refreshSmartView();
-      console.log('[zeus] real-time delete:', file.path);
+      dbg('[zeus] real-time delete:', file.path);
     }));
 
     // Event: rename (update path)
@@ -3952,7 +4018,7 @@ class ZeusPlugin extends Plugin {
         entry.path = file.path;
         this.searcher.embeddings.set(file.path, entry);
         this.indexer.saveEmbeddings(this.searcher.embeddings);
-        console.log('[zeus] real-time rename:', oldPath, '→', file.path);
+        dbg('[zeus] real-time rename:', oldPath, '→', file.path);
       }
     }));
 
@@ -4016,7 +4082,7 @@ class ZeusPlugin extends Plugin {
       try {
         const r = await this.multiplex.load();
         this._multiplexLoaded = true;
-        console.log('[zeus.multiplex] loaded', r);
+        dbg('[zeus.multiplex] loaded', r);
       } catch (e) {
         console.warn('[zeus.multiplex] load failed:', e.message);
       }
@@ -4342,7 +4408,7 @@ class ZeusPlugin extends Plugin {
             '',
             'Em v2.0, este comando fará o download automatico via fetch HTTPS + checksum.',
           ].join('\n');
-          console.log('[zeus.mobileclip]', msg);
+          dbg('[zeus.mobileclip]', msg);
           // Copia pro clipboard se disponível (Electron desktop + browser).
           try { await navigator.clipboard.writeText(msg); } catch {}
           new Notice('MobileCLIP install instructions copiadas pro clipboard. Cole em terminal/notas.', 12000);
@@ -4477,7 +4543,7 @@ class ZeusPlugin extends Plugin {
           const breakdown = Object.entries(s.byType).map(([t, n]) => `${t}=${n}`).join(' ');
           const oldest = s.oldest ? ` · oldest ${s.oldest}` : '';
           new Notice(`Zeus fila: ${s.total} tasks (${breakdown || 'nenhum'})${oldest}`, 8000);
-          console.log('[zeus] io-queue status:', s);
+          dbg('[zeus] io-queue status:', s);
         } catch (e) {
           new Notice('Zeus fila-status falhou: ' + e.message.slice(0, 150));
         }
@@ -4521,7 +4587,7 @@ class ZeusPlugin extends Plugin {
             `${h.path} (score ${h.score.toFixed(2)}, ${h.matched_tokens.length} match)`,
           ).join('\n');
           new Notice(`Zeus lexical-ios: ${hits.length} hits\n${top3}`, 12000);
-          console.log('[zeus] lexical-ios hits:', hits);
+          dbg('[zeus] lexical-ios hits:', hits);
         } catch (e) {
           n.hide();
           new Notice('Zeus lexical-ios search falhou: ' + e.message.slice(0, 200));
@@ -4549,7 +4615,7 @@ class ZeusPlugin extends Plugin {
             lines.push(`    model=${s.model_id} · dim=${s.dim} · entries=${s.count}`);
           }
           new Notice(lines.join('\n'), 12000);
-          console.log('[zeus] iOS embed status:', lines.join(' | '));
+          dbg('[zeus] iOS embed status:', lines.join(' | '));
         } catch (e) {
           new Notice('Zeus iOS embed status falhou: ' + e.message.slice(0, 150));
         }
@@ -4581,7 +4647,7 @@ class ZeusPlugin extends Plugin {
             '  Quando indisponível Tailscale Mac, fallback local 384-dim.',
             '  Schema versionado: embeddings-ios.jsonl separado.',
           ].join('\n');
-          console.log('[zeus.embed-ios]', msg);
+          dbg('[zeus.embed-ios]', msg);
           try { await navigator.clipboard.writeText(msg); } catch {}
           new Notice('Embed iOS install: instruções copiadas pro clipboard. v1.12 entrega relay Mac.', 12000);
         } catch (e) {
@@ -4602,14 +4668,14 @@ class ZeusPlugin extends Plugin {
             `last_built: ${s.last_built || 'never'}`,
             10000,
           );
-          console.log('[zeus] lexical-ios stats:', s);
+          dbg('[zeus] lexical-ios stats:', s);
         } catch (e) {
           new Notice('Zeus lexical-ios stats falhou: ' + e.message.slice(0, 150));
         }
       },
     });
 
-    console.log(`[zeus] loaded v${this.manifest.version} — Apple-native search & connections`);
+    dbg(`[zeus] loaded v${this.manifest.version} — Apple-native search & connections`);
     trace('onload.complete');
     writeTrace(null);
     } catch (err) {
@@ -4621,8 +4687,10 @@ class ZeusPlugin extends Plugin {
   }
 
   async onunload() {
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE_SMART);
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE_STATUS);
+    // v1.15 — Obsidian guideline: NÃO chamar detachLeavesOfType no onunload.
+    // O Obsidian já gerencia o ciclo de vida das views registradas via
+    // registerView(); detachar manualmente quebra "Reload plugins" e a
+    // restauração de layout. Removido (era detachLeavesOfType SMART/STATUS).
     if (this.scheduler) {
       try { this.scheduler.stop(); } catch (e) { console.warn('[zeus] scheduler stop:', e.message); }
     }
@@ -4738,11 +4806,11 @@ class ZeusPlugin extends Plugin {
         const saved = this._estimateTokensSaved();
         if (saved >= 100) text += ` · ${this._fmtTokens(saved)} saved`;
       }
-      // v2.0 — PCC visual indicator
+      // v2.0 — PCC visual indicator (v1.15: "possível", não "usado" — heurístico)
       if (this.settings.pccVisualIndicator && this.httpClient) {
         const pcc = this.httpClient.getPccStatus();
-        if (pcc.mode !== 'off' && pcc.totalUsageCount > 0) {
-          text += ` · ☁️PCC×${pcc.totalUsageCount}`;
+        if (pcc.mode !== 'off' && pcc.possibleCount > 0) {
+          text += ` · ☁️PCC?×${pcc.possibleCount}`;
         }
       }
     }
@@ -4779,17 +4847,9 @@ class ZeusPlugin extends Plugin {
       const { Modal } = obsidian;
       const modal = new Modal(this.app);
       modal.titleEl.setText('Zeus');
-      const p = modal.contentEl.createEl('p', { text: promptText });
-      p.style.marginBottom = '8px';
-      const input = modal.contentEl.createEl('input', { type: 'text' });
-      input.style.width = '100%';
-      input.style.padding = '6px 8px';
-      input.style.boxSizing = 'border-box';
-      const btnRow = modal.contentEl.createDiv();
-      btnRow.style.marginTop = '12px';
-      btnRow.style.display = 'flex';
-      btnRow.style.gap = '8px';
-      btnRow.style.justifyContent = 'flex-end';
+      const p = modal.contentEl.createEl('p', { text: promptText, cls: 'zeus-prompt-text' });
+      const input = modal.contentEl.createEl('input', { type: 'text', cls: 'zeus-prompt-input' });
+      const btnRow = modal.contentEl.createDiv({ cls: 'zeus-prompt-btn-row' });
       const okBtn = btnRow.createEl('button', { text: 'OK' });
       okBtn.classList.add('mod-cta');
       const cancelBtn = btnRow.createEl('button', { text: 'Cancel' });
@@ -4797,6 +4857,8 @@ class ZeusPlugin extends Plugin {
       const finish = (v) => { if (done) return; done = true; resolve(v); modal.close(); };
       okBtn.onclick = () => finish(input.value);
       cancelBtn.onclick = () => finish(null);
+      // v1.15 — elemento transitório: o modal é destruído no close e o <input>
+      // (+ listener) é coletado junto. addEventListener é seguro e correto aqui.
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') finish(input.value);
         else if (e.key === 'Escape') finish(null);

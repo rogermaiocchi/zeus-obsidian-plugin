@@ -47,7 +47,6 @@
   "nativeGraphTopN": 5,
   "nativeGraphMinScore": 0.3,
   "nativeGraphSyncOnSave": true,
-  "deviceId": "darwin-1000138-uuu3-1b36gq",
   "schedulerEnabled": true,
   "schedulerIntervalMs": 900000,
   "coordTtlMs": 60000

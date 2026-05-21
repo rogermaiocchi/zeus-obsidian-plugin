@@ -259,7 +259,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             let result = capturedSelf.route(method: method, path: path, body: bodyString, pcc: pccPermission)
             capturedContext.context.eventLoop.execute {
                 guard capturedContext.context.channel.isActive else { return }
-                capturedSelf.writeJSON(context: capturedContext.context, status: result.status, dict: result.payload, pccUsed: result.pccUsed)
+                capturedSelf.writeJSON(context: capturedContext.context, status: result.status, dict: result.payload, pccPossible: result.pccPossible)
             }
         }
     }
@@ -270,16 +270,16 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         let status: HTTPResponseStatus
         let payload: [String: Any]
         // v1.2 — Apple Cloud Private (PCC) telemetry
-        // Quando true, response inclui header X-Zeus-Pcc-Used:1.
+        // Quando true, response inclui header X-Zeus-Pcc-Possible:1.
         // Atualmente é heurística (FoundationModels SDK ainda não expõe API
         // explícita de cloud-routing; macOS roteia internamente). Quando a
         // Apple expuser API pública, esta flag passa a refletir routing real.
-        let pccUsed: Bool
+        let pccPossible: Bool
 
-        init(status: HTTPResponseStatus, payload: [String: Any], pccUsed: Bool = false) {
+        init(status: HTTPResponseStatus, payload: [String: Any], pccPossible: Bool = false) {
             self.status = status
             self.payload = payload
-            self.pccUsed = pccUsed
+            self.pccPossible = pccPossible
         }
     }
 
@@ -850,8 +850,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 var merged = parsed
                 merged["note_path"] = notePath
                 merged["model"] = res.payload["model"] ?? "FoundationModels"
-                merged["pcc_used"] = res.pccUsed
-                return Response(status: .ok, payload: merged, pccUsed: res.pccUsed)
+                merged["pcc_possible"] = res.pccPossible
+                return Response(status: .ok, payload: merged, pccPossible: res.pccPossible)
             }
             return Response(status: .ok, payload: [
                 "suggested_links": [],
@@ -860,8 +860,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 "raw": raw,
                 "note_path": notePath,
                 "model": res.payload["model"] ?? "FoundationModels",
-                "pcc_used": res.pccUsed
-            ], pccUsed: res.pccUsed)
+                "pcc_possible": res.pccPossible
+            ], pccPossible: res.pccPossible)
         }
         return res
     }
@@ -919,7 +919,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         let _ = (json["prewarm"] as? Bool) ?? false // accepted but no-op (session prewarm is internal)
 
         // v1.2 — PCC heurística (mesma lógica do runFoundationModel)
-        let pccUsed = self.shouldFlagPccUsed(pcc: pcc, promptChars: instruction.count, instructionsChars: 0, maxTokens: maxTokens)
+        let pccPossible = self.pccRoutingPossible(pcc: pcc, promptChars: instruction.count, instructionsChars: 0, maxTokens: maxTokens)
 
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
@@ -957,8 +957,8 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     "deterministic": deterministic,
                     "max_tokens": maxTokens,
                     "pcc_permission": "\(pcc)",
-                    "pcc_used": pccUsed
-                ], pccUsed: pccUsed)
+                    "pcc_possible": pccPossible
+                ], pccPossible: pccPossible)
             case .unavailable(let reason):
                 return Response(status: .serviceUnavailable, payload: [
                     "error": "FoundationModels indisponível: \(reason)"
@@ -2422,21 +2422,31 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
 
     // MARK: - FoundationModels runner (gated)
 
-    // v1.2 — Heurística PCC routing.
-    // FoundationModels SDK (macOS 26 atual) NÃO expõe API pública para forçar
-    // ou inspecionar cloud routing — Apple decide internamente via privacy
-    // gates + capacity. Nossa heurística marca pccUsed=true quando:
+    // v1.2 — Heurística de POSSIBILIDADE de PCC routing.
+    // v1.15 — codex #5: renomeado de `shouldFlagPccUsed`/`pcc_used` para
+    // `pccRoutingPossible`/`pcc_possible`. O nome antigo AFIRMAVA que a request
+    // foi roteada via Private Cloud Compute — uma mentira: o FoundationModels SDK
+    // (macOS 26) NÃO expõe API pública para forçar nem para INSPECIONAR cloud
+    // routing. Apple decide internamente via privacy gates + capacity. Logo o
+    // daemon não pode medir uso real — só estimar POSSIBILIDADE. O campo agora
+    // declara honestamente "cloud era possível", não "cloud foi usado".
+    //
+    // Enforcement de `off`: quando pcc == .off (default, e o que o client manda
+    // quando pccMode='off') esta função retorna false e o daemon NUNCA sinaliza
+    // possibilidade de cloud. O único modelo invocado é `SystemLanguageModel.default`,
+    // que é o modelo base on-device — não há endpoint cloud-only neste daemon para
+    // recusar; a recusa é estrutural (sem permissão, sem afirmação de cloud).
+    //
+    // Heurística retorna true (cloud POSSÍVEL) quando:
     //   1. Client enviou permissão (pcc != .off), E
-    //   2. Carga é grande o suficiente para plausivelmente exceder on-device:
-    //      • prompt + instructions > 6000 chars (~1500 tokens), OU
-    //      • maxTokens > 1000, OU
-    //      • modo .auto (daemon decide sempre sinalizar quando há permissão)
-    // Quando Apple expuser API explícita (esperado em SDK futuro), esta heurística
-    // é substituída pela API real (ex.: GenerationOptions.allowsCloudCompute).
-    private func shouldFlagPccUsed(pcc: PccPermission, promptChars: Int, instructionsChars: Int, maxTokens: Int) -> Bool {
-        guard pcc != .off else { return false }
+    //   2. Carga plausivelmente excede on-device: prompt+instructions > 6000 chars
+    //      (~1500 tokens) OU maxTokens > 1000, OU modo .auto.
+    // Quando Apple expuser API explícita (ex.: GenerationOptions.allowsCloudCompute),
+    // esta heurística é substituída por medição real.
+    private func pccRoutingPossible(pcc: PccPermission, promptChars: Int, instructionsChars: Int, maxTokens: Int) -> Bool {
+        guard pcc != .off else { return false }   // off → recusa estrutural: nunca afirma cloud
         if pcc == .auto { return true }
-        // opt-in: somente sinaliza quando heurística sugere routing cloud
+        // opt-in: só sinaliza POSSIBILIDADE quando a heurística sugere routing cloud
         let totalChars = promptChars + instructionsChars
         return totalChars > 6000 || maxTokens > 1000
     }
@@ -2566,7 +2576,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             var p = res.payload
             p["answer"] = txt
             p["iterations"] = 1
-            return Response(status: .ok, payload: p, pccUsed: res.pccUsed)
+            return Response(status: .ok, payload: p, pccPossible: res.pccPossible)
         }
         return res
     }
@@ -2578,7 +2588,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         extraPayload: [String: Any],
         pcc: PccPermission = .off
     ) -> Response {
-        let pccUsed = self.shouldFlagPccUsed(
+        let pccPossible = self.pccRoutingPossible(
             pcc: pcc,
             promptChars: prompt.count,
             instructionsChars: instructions.count,
@@ -2615,7 +2625,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     "model": "apple-foundationmodels-systemlanguagemodel",
                     "provider": "apple-intelligence",
                     "pcc_permission": "\(pcc)",
-                    "pcc_used": pccUsed
+                    "pcc_possible": pccPossible
                 ]
                 for (k, v) in extraPayload { payload[k] = v }
                 // v1.4 Fase B — captura para dataset contínuo (opt-in via flag-file)
@@ -2626,7 +2636,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     output: resultText.get() ?? "",
                     model: "apple-foundationmodels-systemlanguagemodel"
                 )
-                return Response(status: .ok, payload: payload, pccUsed: pccUsed)
+                return Response(status: .ok, payload: payload, pccPossible: pccPossible)
             case .unavailable(let reason):
                 return Response(status: .serviceUnavailable, payload: [
                     "error": "FoundationModels indisponível: \(reason)"
@@ -3375,17 +3385,18 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         return seconds.get()
     }
 
-    private func writeJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, dict: [String: Any], pccUsed: Bool = false) {
+    private func writeJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, dict: [String: Any], pccPossible: Bool = false) {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "application/json; charset=utf-8")
         headers.add(name: "Access-Control-Allow-Origin", value: "*")
         headers.add(name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS")
         headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type, X-Zeus-Allow-Pcc")
-        headers.add(name: "Access-Control-Expose-Headers", value: "X-Zeus-Pcc-Used")
-        // v1.2 — PCC telemetry: sinaliza ao client que esta response foi
-        // (heurística) roteada via Private Cloud Compute.
-        if pccUsed {
-            headers.add(name: "X-Zeus-Pcc-Used", value: "1")
+        headers.add(name: "Access-Control-Expose-Headers", value: "X-Zeus-Pcc-Possible")
+        // v1.2 — PCC telemetry. v1.15 (codex #5): sinaliza que cloud routing era
+        // POSSÍVEL para esta response (heurística por carga), não que foi usado —
+        // Apple não expõe API para medir o routing real.
+        if pccPossible {
+            headers.add(name: "X-Zeus-Pcc-Possible", value: "1")
         }
         let body: ByteBuffer?
         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.fragmentsAllowed]) {

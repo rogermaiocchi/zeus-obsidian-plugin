@@ -951,23 +951,28 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     "max_tokens": maxTokens
                 ])
             case .unavailable(let reason):
-                return Response(status: .serviceUnavailable, payload: [
-                    "error": "FoundationModels indisponível: \(reason)"
-                ])
+                // v1.15 — codex round 5 #8: /v1/prompt também cai pro Twin (era 503).
+                return self.twinFallbackOr503(
+                    instructions: "", prompt: instruction, maxTokens: maxTokens,
+                    extraPayload: ["task": "prompt", "deterministic": deterministic],
+                    unavailableReason: "FoundationModels indisponível: \(reason)")
             @unknown default:
-                return Response(status: .serviceUnavailable, payload: [
-                    "error": "FoundationModels com estado desconhecido"
-                ])
+                return self.twinFallbackOr503(
+                    instructions: "", prompt: instruction, maxTokens: maxTokens,
+                    extraPayload: ["task": "prompt", "deterministic": deterministic],
+                    unavailableReason: "FoundationModels com estado desconhecido")
             }
         } else {
-            return Response(status: .serviceUnavailable, payload: [
-                "error": "FoundationModels requer iOS 26.0+ (este device é mais antigo)"
-            ])
+            return self.twinFallbackOr503(
+                instructions: "", prompt: instruction, maxTokens: maxTokens,
+                extraPayload: ["task": "prompt", "deterministic": deterministic],
+                unavailableReason: "FoundationModels requer iOS 26.0+ (este device é mais antigo)")
         }
         #else
-        return Response(status: .serviceUnavailable, payload: [
-            "error": "FoundationModels framework não disponível neste build"
-        ])
+        return self.twinFallbackOr503(
+            instructions: "", prompt: instruction, maxTokens: maxTokens,
+            extraPayload: ["task": "prompt", "deterministic": deterministic],
+            unavailableReason: "FoundationModels framework não disponível neste build")
         #endif
     }
 
@@ -2307,24 +2312,78 @@ final class AegisHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 )
                 return Response(status: .ok, payload: payload)
             case .unavailable(let reason):
-                return Response(status: .serviceUnavailable, payload: [
-                    "error": "FoundationModels indisponível: \(reason)"
-                ])
+                // v1.15 — S7: Apple Intelligence indisponível → tenta o MLX Twin.
+                return self.twinFallbackOr503(
+                    instructions: instructions, prompt: prompt, maxTokens: maxTokens,
+                    extraPayload: extraPayload,
+                    unavailableReason: "FoundationModels indisponível: \(reason)")
             @unknown default:
-                return Response(status: .serviceUnavailable, payload: [
-                    "error": "FoundationModels com estado desconhecido"
-                ])
+                return self.twinFallbackOr503(
+                    instructions: instructions, prompt: prompt, maxTokens: maxTokens,
+                    extraPayload: extraPayload,
+                    unavailableReason: "FoundationModels com estado desconhecido")
             }
         } else {
-            return Response(status: .serviceUnavailable, payload: [
-                "error": "FoundationModels requer iOS 26.0+ (este device é mais antigo)"
-            ])
+            // iOS < 26: sem Apple Intelligence → MLX Twin é o caminho generativo.
+            return self.twinFallbackOr503(
+                instructions: instructions, prompt: prompt, maxTokens: maxTokens,
+                extraPayload: extraPayload,
+                unavailableReason: "FoundationModels requer iOS 26.0+ (este device é mais antigo)")
         }
         #else
-        return Response(status: .serviceUnavailable, payload: [
-            "error": "FoundationModels framework não disponível neste build (compilar em iOS 26+ SDK)"
-        ])
+        // Build sem o framework FoundationModels → MLX Twin se carregado.
+        return self.twinFallbackOr503(
+            instructions: instructions, prompt: prompt, maxTokens: maxTokens,
+            extraPayload: extraPayload,
+            unavailableReason: "FoundationModels framework não disponível neste build (compilar em iOS 26+ SDK)")
         #endif
+    }
+
+    // v1.15 — S7 / risco arquitetural #1: WIRE do MLX Apple-Twin.
+    //
+    // Antes, todo ramo de indisponibilidade do FoundationModels retornava 503 e o
+    // Twin (carregado via ODR por MLXAppleTwinBootstrap) NUNCA era chamado — a
+    // maquinaria de fallback existia mas o call-site faltava. Agora, quando Apple
+    // Intelligence não está elegível/disponível (iOS<26, device sem AI, estado
+    // .unavailable), delega para `MLXAppleTwinProvider.shared` se ele estiver
+    // carregado. No macOS `shared` é sempre nil (Apple Intelligence cobre) → mantém
+    // o 503 honesto. O Twin já injeta seu próprio system prompt institucional, então
+    // combinamos `instructions` + `prompt` num único turno do usuário.
+    private func twinFallbackOr503(
+        instructions: String,
+        prompt: String,
+        maxTokens: Int,
+        extraPayload: [String: Any],
+        unavailableReason: String
+    ) -> Response {
+        guard let twin = MLXAppleTwinProvider.shared else {
+            return Response(status: .serviceUnavailable, payload: [
+                "error": unavailableReason,
+                "twin_loaded": false
+            ])
+        }
+        let combined = instructions.isEmpty ? prompt : "\(instructions)\n\n\(prompt)"
+        switch twin.prompt(instruction: combined, maxTokens: maxTokens, deterministic: true) {
+        case .success(let text):
+            // "text" e "output" são duplicados de propósito: endpoints que passam
+            // por runFoundationModel leem "text"; /v1/prompt lê "output". Manter os
+            // dois deixa o caller agnóstico ao provedor (Apple Intelligence vs Twin).
+            var payload: [String: Any] = [
+                "text": text,
+                "output": text,
+                "model": "mlx-gemma-apple-twin",
+                "provider": "mlx-apple-twin",
+                "twin_fallback": true
+            ]
+            for (k, v) in extraPayload { payload[k] = v }
+            return Response(status: .ok, payload: payload)
+        case .failure(let err):
+            return Response(status: .serviceUnavailable, payload: [
+                "error": "MLX Twin fallback falhou: \(err.localizedDescription)",
+                "twin_loaded": true,
+                "twin_attempted": true
+            ])
+        }
     }
 
     // MARK: - Helpers

@@ -3050,6 +3050,106 @@ var require_daemon_lifecycle = __commonJS({
   }
 });
 
+// lib/zeus-simhash.js
+var require_zeus_simhash = __commonJS({
+  "lib/zeus-simhash.js"(exports2, module2) {
+    "use strict";
+    var DIM = 512;
+    var BITS = 128;
+    var WORDS = 4;
+    function _buildProj() {
+      const P = new Int8Array(BITS * DIM);
+      for (let b = 0; b < BITS; b++) {
+        for (let d = 0; d < DIM; d++) {
+          const seed = (b << 16 ^ d & 65535) >>> 0;
+          let h = 2166136261;
+          h = Math.imul(h ^ seed & 255, 16777619) >>> 0;
+          h = Math.imul(h ^ seed >> 8 & 255, 16777619) >>> 0;
+          h = Math.imul(h ^ seed >> 16 & 255, 16777619) >>> 0;
+          h = Math.imul(h ^ seed >> 24 & 255, 16777619) >>> 0;
+          P[b * DIM + d] = h & 1 ? 1 : -1;
+        }
+      }
+      return P;
+    }
+    var PROJ = _buildProj();
+    function computeSimHash(vec) {
+      const result = new Uint32Array(WORDS);
+      const len = Math.min(vec.length, DIM);
+      for (let b = 0; b < BITS; b++) {
+        let dot = 0;
+        const base = b * DIM;
+        for (let d = 0; d < len; d++) {
+          dot += vec[d] * PROJ[base + d];
+        }
+        if (dot > 0) {
+          result[b >> 5] |= 1 << (b & 31) >>> 0;
+        }
+      }
+      return result;
+    }
+    function hammingDistance(a, b) {
+      let dist = 0;
+      for (let i = 0; i < WORDS; i++) {
+        let x = (a[i] ^ b[i]) >>> 0;
+        x -= x >> 1 & 1431655765;
+        x = (x & 858993459) + (x >> 2 & 858993459);
+        x = x + (x >> 4) & 252645135;
+        dist += Math.imul(x, 16843009) >>> 24;
+      }
+      return dist;
+    }
+    function serializeHash(hash) {
+      let s = "";
+      for (let i = 0; i < WORDS; i++) {
+        s += (hash[i] >>> 0).toString(16).padStart(8, "0");
+      }
+      return s;
+    }
+    function deserializeHash(hex) {
+      const result = new Uint32Array(WORDS);
+      for (let i = 0; i < WORDS; i++) {
+        result[i] = parseInt(hex.slice(i * 8, i * 8 + 8), 16) >>> 0;
+      }
+      return result;
+    }
+    function filterBySimHash(candidates, queryHash, maxDist = 20) {
+      const out = [];
+      for (const c of candidates) {
+        if (!c.sh) {
+          out.push(c);
+          continue;
+        }
+        try {
+          const h = deserializeHash(c.sh);
+          if (hammingDistance(queryHash, h) <= maxDist) out.push(c);
+        } catch (e) {
+          out.push(c);
+        }
+      }
+      return out;
+    }
+    function annotateWithSimHash(embObj) {
+      if (!embObj || !Array.isArray(embObj.vec)) return embObj;
+      embObj.sh = serializeHash(computeSimHash(embObj.vec));
+      return embObj;
+    }
+    module2.exports = {
+      computeSimHash,
+      hammingDistance,
+      serializeHash,
+      deserializeHash,
+      filterBySimHash,
+      annotateWithSimHash,
+      PROJ,
+      // exposto para testes unitários (verificar determinismo)
+      DIM,
+      BITS,
+      WORDS
+    };
+  }
+});
+
 // lib/hybrid-search.js
 var require_hybrid_search = __commonJS({
   "lib/hybrid-search.js"(exports2, module2) {
@@ -3063,9 +3163,10 @@ var require_hybrid_search = __commonJS({
       spotlight: 1 << 4,
       bm25: 1 << 5,
       // v1.11 Feature I — lexical-ios é BM25 persistido (TF-IDF + stems pt-BR).
-      // Mantém bit próprio (distinto de bm25 in-memory) para auditoria do sourceMask
-      // sem confundir os dois retrievers durante MMR diversify.
-      lexicalIos: 1 << 6
+      lexicalIos: 1 << 6,
+      // v1.15.0 — SimHash 128-bit pré-filtro turbo quantico. Bit de auditoria:
+      // items que sobreviveram ao filtro Hamming distance ≤ 20 recebem este bit.
+      simhash: 1 << 7
     };
     var SOURCE_NAMES = Object.keys(SOURCE_BITS);
     function _maskToNames(mask) {
@@ -3087,6 +3188,13 @@ var require_hybrid_search = __commonJS({
     } catch (e) {
       console.warn("[zeus.hybrid] bm25 lib n\xE3o carregou \u2014 5\xBA retriever desativado:", e.message);
       _bm25 = null;
+    }
+    var _simhash;
+    try {
+      _simhash = require_zeus_simhash();
+    } catch (e) {
+      console.warn("[zeus.hybrid] zeus-simhash n\xE3o carregou \u2014 pr\xE9-filtro turbo quantico desativado:", e.message);
+      _simhash = null;
     }
     var HybridSearch2 = class {
       constructor(plugin) {
@@ -3171,6 +3279,40 @@ var require_hybrid_search = __commonJS({
           candidates.splice(bestIdx, 1);
         }
         return selected;
+      }
+      // ---------------------------------------------------------------------------
+      // _simhashRetriever — pré-filtro turbo quantico: hamming distance O(N×4)
+      // sobre campo `sh` (SimHash 128-bit) dos embeddings, antes do cosine exato.
+      //
+      // Retorna apenas itens dentro de maxDist Hamming bits do query SimHash.
+      // Source bit `simhash` marca itens sobreviventes para auditoria via MMR.
+      //
+      // Requisitos:
+      //   - embeddings.jsonl deve ter campo `sh` (gerado por annotateWithSimHash)
+      //   - queryVec deve ser um vetor 512-dim válido
+      // ---------------------------------------------------------------------------
+      _simhashRetriever(queryVec, topN, maxDist = 20) {
+        if (!_simhash || !queryVec || !Array.isArray(queryVec)) return [];
+        const searcher = this.plugin.searcher;
+        if (!searcher || !searcher.embeddings) return [];
+        try {
+          const queryHash = _simhash.computeSimHash(queryVec);
+          const hits = [];
+          for (const [path2, emb] of searcher.embeddings.entries()) {
+            if (!emb || !emb.sh) continue;
+            try {
+              const h = _simhash.deserializeHash(emb.sh);
+              const dist = _simhash.hammingDistance(queryHash, h);
+              if (dist <= maxDist) hits.push({ path: path2, dist });
+            } catch (e) {
+            }
+          }
+          hits.sort((a, b) => a.dist - b.dist);
+          return hits.slice(0, topN).map((h) => ({ path: h.path, source: "simhash" }));
+        } catch (e) {
+          console.warn("[zeus.hybrid] simhash retriever failed:", e.message);
+          return [];
+        }
       }
       // ---------------------------------------------------------------------------
       // _bm25Retriever — roda BM25 sobre as notas com embedding carregado (lazy
@@ -3305,11 +3447,23 @@ var require_hybrid_search = __commonJS({
       async query(q, topN = 30, opts = {}) {
         if (!q || !q.trim()) return [];
         const lists = [];
+        let _queryVec = null;
         try {
           const sem = await this.plugin.searcher.search(q, topN * 2);
           lists.push((sem || []).map((x) => ({ path: x.path, source: "semantic" })));
+          if (this.plugin.searcher.lastQueryVec) {
+            _queryVec = this.plugin.searcher.lastQueryVec;
+          }
         } catch (e) {
           console.warn("[zeus.hybrid] semantic search failed", e.message);
+        }
+        if (_simhash && _queryVec) {
+          try {
+            const shHits = this._simhashRetriever(_queryVec, topN * 2);
+            if (shHits.length > 0) lists.push(shHits);
+          } catch (e) {
+            console.warn("[zeus.hybrid] simhash retrieval failed", e.message);
+          }
         }
         try {
           const qn = q.toLowerCase().trim();

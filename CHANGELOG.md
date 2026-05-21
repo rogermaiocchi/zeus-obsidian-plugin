@@ -43,6 +43,20 @@ Endpoints que estavam "unsupported" sem necessidade técnica, agora implementado
 - **`lexical-ios.js`**: reordenação do `PT_SUFFIXES` (sufixos mais longos primeiro) para evitar over-stem prematuro. Ex: "universidades" → "univers" (correto) ao invés de "universidade" (bug anterior).
 - **`embed-ios.js` embedText**: garantido que o stub lança dentro de `async` corretamente.
 
+### Motor generativo iOS — migração Gemma 4 → Qwen 2.5 3B-Instruct 4-bit
+
+- **NOVO `QwenProvider.swift`** — `MLXQwenRunner: MLXAppleTwinProviding`. Motor generativo Qwen 2.5 3B-Instruct 4-bit via MLX Swift. Template ChatML (`<|im_start|>`). Único modelo para todos os devices iOS (iPhone + iPad), ~1.8 GB int4. Elimina divisão E2B (iPhone) / E4B (iPad) do Gemma 4.
+- **`MLXAppleTwinBootstrap.swift`** — migrado de `MLXGemmaTwinRunner` para `MLXQwenRunner`. ODR tag: `qwen-twin-v1.0`. Resource: `zeus-qwen2.5-3b-instruct-4bit-v1.0` (prefixo zeus-). `currentIdiom()` removido (desnecessário com modelo único).
+- **`AppleTwinSystemPrompt.swift`** — per-command system prompts focados em PT-BR text engineering: coesão, morfologia, anáfora/catáfora, métodos Feynman/Luhmann/Cornell, HyDE, extração de grafo. `Command` enum com `forCommand(_ cmd)` static method.
+- **`FewShotLoader.renderTurnsQwen()`** — renderização de exemplos few-shot em template ChatML (Qwen) paralelo ao `renderTurns()` existente (Gemma).
+- **Domínio de fine-tuning**: PT-BR semântica, léxico, morfologia, fonologia, sintaxe, coesão/coerência, anáfora, catáfora, dêixis, concordância; métodos Feynman/Luhmann/Cornell; busca hash turbo quantico; integração grafo Obsidian; banco .base. NÃO inclui conteúdo jurídico específico.
+- **`docs/superpowers/specs/2026-05-21-camada-qwen-design.md`** — especificação atualizada da camada generativa on-device.
+
+### SimHash 128-bit — pré-filtro turbo quantico
+
+- **NOVO `lib/zeus-simhash.js`** — SimHash 128-bit sobre embeddings 512-dim (NLContextualEmbedding). Random projection matrix 128×512 Int8Array (FNV-1a seeded, determinística, 64 KB). `computeSimHash(vec)` O(65536), `hammingDistance(a,b)` O(4), `filterBySimHash(N, queryHash, maxDist=20)` O(N×4). Serialização: hex 32 chars para `embeddings.jsonl` campo `sh`. `annotateWithSimHash(embObj)` para auto-indexer.
+- **`hybrid-search.js`** — integração SimHash como 8º retriever (pré-filtro turbo quantico): `SOURCE_BITS.simhash = 1 << 7`; `_simhashRetriever(queryVec, topN, maxDist)` retorna candidatos por Hamming distance; wired em `query()` após semantic search quando `lastQueryVec` disponível e `zeus-simhash` carregado.
+
 ### Infra + metadados
 
 - `lib/passport-ios.js` — `MODEL_VERSION` atualizado: `zeus-ios-1.11.0` → `zeus-ios-1.15.0`.

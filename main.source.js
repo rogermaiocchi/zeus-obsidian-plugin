@@ -351,8 +351,9 @@ function isMac() {
 // -------------------------------------------------------------------------
 // Plugin v1.5 abandona o caminho child_process.spawn — toda operação Apple
 // passa pelo daemon HTTP local (bin/ZeusDaemonMac auto-spawned no Mac via
-// DaemonLifecycle, AegisDaemon embebido no host app no iOS). Retorna shape
-// { source, result } por compatibilidade com callsites legados.
+// DaemonLifecycle). No iOS não há daemon (sandbox) → operações Apple-native
+// indisponíveis localmente; a busca usa as lanes JS sobre índices sincronizados.
+// Retorna shape { source, result } por compatibilidade com callsites legados.
 // -------------------------------------------------------------------------
 async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs /* spawnArgs, stdinText, timeoutMs ignorados */) {
   if (!plugin.httpClient || typeof plugin.httpClient[daemonMethod] !== 'function') {
@@ -429,7 +430,8 @@ function _zeusSetLocalDaemonUrl(url) {
 async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 1500) {
   const ordered = [];
   const seen = new Set();
-  const push = (u) => { if (u && !seen.has(u)) { seen.add(u); ordered.push(u); } };
+  // on-device puro: só loopback entra na lista de probe (nunca prova host remoto).
+  const push = (u) => { if (u && _zeusIsLoopback(u) && !seen.has(u)) { seen.add(u); ordered.push(u); } };
 
   if (candidates) {
     for (const u of candidates) push(u);
@@ -2402,9 +2404,9 @@ class ZeusSettingTab extends PluginSettingTab {
             const isLocal = _zeusIsLoopback(url);
             new Notice(`Zeus: daemon ${isLocal ? 'LOCAL on-device ✓' : 'local'} em ${url}`, 6000);
           } else {
-            const macHint = 'macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent.';
-            const iosHint = 'iOS: abra o app Aegis para iniciar o AegisDaemon (porta 2223 embedada).';
-            new Notice(`Zeus: nenhum daemon respondeu.\n${isMac() ? macHint : iosHint}`, 12000);
+            const macHint = 'macOS: o plugin auto-spawna bin/ZeusDaemonMac; se falhar, rode `bash daemon/scripts/install-mac-daemon.sh` (LaunchAgent).';
+            const iosHint = 'iOS: sem daemon on-device (esperado) — a busca usa as lanes JS sobre os índices computados no Mac e sincronizados via iCloud.';
+            new Notice(`Zeus: daemon local indisponível.\n${isMac() ? macHint : iosHint}`, 12000);
           }
           this.display();
         } catch (e) {

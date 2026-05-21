@@ -5807,7 +5807,7 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
   const ordered = [];
   const seen = /* @__PURE__ */ new Set();
   const push = (u) => {
-    if (u && !seen.has(u)) {
+    if (u && _zeusIsLoopback(u) && !seen.has(u)) {
       seen.add(u);
       ordered.push(u);
     }
@@ -7509,9 +7509,9 @@ var ZeusSettingTab = class extends PluginSettingTab {
           const isLocal = _zeusIsLoopback(url);
           new Notice(`Zeus: daemon ${isLocal ? "LOCAL on-device \u2713" : "local"} em ${url}`, 6e3);
         } else {
-          const macHint = "macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent.";
-          const iosHint = "iOS: abra o app Aegis para iniciar o AegisDaemon (porta 2223 embedada).";
-          new Notice(`Zeus: nenhum daemon respondeu.
+          const macHint = "macOS: o plugin auto-spawna bin/ZeusDaemonMac; se falhar, rode `bash daemon/scripts/install-mac-daemon.sh` (LaunchAgent).";
+          const iosHint = "iOS: sem daemon on-device (esperado) \u2014 a busca usa as lanes JS sobre os \xEDndices computados no Mac e sincronizados via iCloud.";
+          new Notice(`Zeus: daemon local indispon\xEDvel.
 ${isMac() ? macHint : iosHint}`, 12e3);
         }
         this.display();

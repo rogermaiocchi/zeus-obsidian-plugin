@@ -195,7 +195,7 @@ const HybridSearch = require('./lib/hybrid-search');                     // v1.6
 const NativeWatcher = require('./lib/native-watcher');                   // v1.6: FSEvents observability (Mac iCloud)
 const MultiplexGraph = require('./lib/multiplex-graph');                 // v1.8: 8-edge-type multiplex graph (wikilink/backlink/entity/date/folder/cosine/spotlight/co-citation)
 const AutoIndexer = require('./lib/auto-indexer');                        // v1.10: orquestra rebuilds de TODAS as camadas via vault.on() automático
-const EmbedIosLib = require('./lib/embed-ios');                           // v1.12: embed iOS schema versionado + relay Mac via Tailscale
+const EmbedIosLib = require('./lib/embed-ios');                           // embed iOS schema versionado + embed via daemon LOCAL (on-device)
 const LeidenCommunities = require('./lib/leiden');                       // v1.9: community detection enxuto (local move + connectivity split + agregação) sobre multiplex
 const IoQueue = require('./lib/io-queue');                               // v1.11: fila iCloud-mediada para Mac consumir tarefas geradas em iOS (Feature H)
 const LexicalIosIndex = require('./lib/lexical-ios');                    // v1.11: BM25 persistido com stems pt-BR para iOS sem daemon (Feature I)
@@ -252,13 +252,8 @@ const DEFAULT_SETTINGS = {
   multiVectorEnabled: false,      // off until reindex; flip after primeiro reindex c/ multi-vector
   multiVectorIndexOnReindex: false, // se true, runFullIndex produz multi-vectors.jsonl além de embeddings.jsonl
   // v0.6.0 — Aegis-pattern HTTP daemon (ADR-018)
-  zeusDaemonUrl: 'http://127.0.0.1:2223',   // local daemon loopback (neutro; mesh peers ficam em localStorage per-device)
+  zeusDaemonUrl: 'http://127.0.0.1:2223',   // local daemon loopback (on-device puro; sem rota remota)
   daemonPreferredOverSpawn: true,            // ADR-018 fase E++: HTTP-first em todos hot paths; spawn é fallback no Mac
-  // v1.4.1 — On-device-first: cada device Apple roda seu próprio daemon nativo
-  // (ZeusDaemonMac no macOS, AegisDaemon no iOS). Quando ON, discovery cai para
-  // Tailscale mesh apenas se o daemon local não responder. Quando OFF, Tailscale
-  // mesh nunca é tentado — modo strict on-device (melhor privacidade + latência).
-  allowRemoteDaemonFallback: false,
   // v0.7.0 — full Apple ecosystem coverage
   imagesIndexFeaturePrint: false,           // se ON, comandos de indexação de imagens populam data/image-features.jsonl
   autoLanguageDetectOnSave: false,          // detecta língua na nota ativa ao salvar e adiciona ao frontmatter (`lang:`)
@@ -305,13 +300,10 @@ const DEFAULT_SETTINGS = {
   // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
   // multiplex/leiden) com debounce + cooldown.
   autoIndexEnabled: true,
-  // v1.12 — embed iOS two-tier (codex audit C+B aprovado)
-  // CAMADA 1 (default ON): relay HTTP daemon via Tailscale/loopback. iOS chama
-  //   daemon Mac, persiste em embeddings.jsonl 512-dim NLContextualEmbedding.
-  // CAMADA 2 (default OFF, labs): transformers.js + multilingual-e5-small ~118MB
-  //   fetch lazy primeiro use. Persiste embeddings-ios.jsonl 384-dim.
-  //   v1.12 ENTREGA stub apenas; runtime completo em v1.13 ADR-011 labs.
-  iosEmbedRelayEnabled: true,
+  // v1.15 — embed on-device puro. macOS: embed via daemon Apple-nativo LOCAL
+  //   (loopback, 512-dim NLContextualEmbedding). iOS: sem daemon → lê o
+  //   embeddings.jsonl computado no Mac e sincronizado via iCloud; busca nas
+  //   lanes JS. CAMADA 2 (labs, default OFF): transformers.js local 384-dim.
   iosEmbedTransformersEnabled: false,
   // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
   // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
@@ -374,71 +366,20 @@ async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs /* spawnArgs, s
   return { source: 'daemon', result };
 }
 
-// v0.6.1 — Adaptive daemon discovery: tries local loopback, then optional mesh peers.
-// Per device, prefers: 127.0.0.1 (same device daemon) > user-configured mesh peers.
-//
-// v1.15 — codex #7 / S8 Check 2: a topologia de rede (IPs Tailscale, hostnames mDNS)
-// NÃO é mais hardcoded no fonte. Vazava os devices/IPs pessoais do maintainer e
-// quebrava em qualquer outra rede. Os peers de mesh agora vêm de localStorage
-// (per-device, NÃO sincronizado via iCloud), default vazio — sem mesh out-of-the-box.
-// Configurável em Settings → Zeus → "Daemon mesh peers (local)". Cada device escolhe
-// seus próprios peers; nada de topologia em data.json (que sincroniza).
-const ZEUS_MESH_PEERS_KEY = 'zeus.mesh.peers';   // JSON array de URLs http://host:port, per-device
-
-function _zeusGetMeshPeers() {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return [];
-    const raw = window.localStorage.getItem(ZEUS_MESH_PEERS_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr.filter(u => typeof u === 'string' && /^https?:\/\//.test(u)) : [];
-  } catch { return []; }
-}
-
-function _zeusSetMeshPeers(urls) {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    const clean = (Array.isArray(urls) ? urls : [])
-      .map(u => String(u).trim())
-      .filter(u => /^https?:\/\//.test(u));
-    if (clean.length === 0) window.localStorage.removeItem(ZEUS_MESH_PEERS_KEY);
-    else window.localStorage.setItem(ZEUS_MESH_PEERS_KEY, JSON.stringify(clean));
-  } catch {}
-}
-
-// v1.15 — token de auth do daemon remoto (relay Tailscale). Per-device em
-// localStorage, NUNCA em data.json (que sincroniza via iCloud) — evita vazar
-// segredo entre devices. Casa com env ZEUS_DAEMON_TOKEN do daemon remoto.
-const ZEUS_DAEMON_TOKEN_KEY = 'zeus.daemon.token';
-
-function _zeusGetDaemonToken() {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return null;
-    const t = window.localStorage.getItem(ZEUS_DAEMON_TOKEN_KEY);
-    return (t && t.trim()) ? t.trim() : null;
-  } catch { return null; }
-}
-
-function _zeusSetDaemonToken(token) {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    const t = (typeof token === 'string') ? token.trim() : '';
-    if (!t) window.localStorage.removeItem(ZEUS_DAEMON_TOKEN_KEY);
-    else window.localStorage.setItem(ZEUS_DAEMON_TOKEN_KEY, t);
-  } catch {}
-}
+// v1.15 — arquitetura ON-DEVICE pura (decisão do Roger: "autonomia própria, usar as
+// ferramentas do próprio OS"). Sem relay/mesh. Cada device usa o daemon Apple-nativo
+// LOCAL (loopback): macOS auto-spawna bin/ZeusDaemonMac; iOS, sem daemon on-device
+// (sandbox do plugin não roda código nativo), degrada para as lanes JS puras sobre os
+// índices computados no Mac e sincronizados via iCloud. NENHUMA topologia de rede no
+// fonte (removido o TAILSCALE_MESH hardcoded da auditoria v1.15) e nenhum peer remoto.
 
 // v1.4.1 — Per-device cache: localStorage não é sincronizado via iCloud, então cada device
 // memoriza sua própria URL funcional. Evita re-discovery em todo startup.
 //
 // IMPORTANTE — arquitetura on-device-first (Apple-native em TODOS os devices):
-//   Cada device (Mac mini, MacBook Air, iPad, iPhone) roda seu próprio daemon nativo
-//   em 127.0.0.1:2223. macOS: ZeusDaemonMac (LaunchAgent). iOS: AegisDaemon embedado
-//   no app Aegis. Tailscale mesh é apenas FALLBACK degradado quando o daemon local
-//   não está rodando — não a rota normal.
-//
-//   Por isso o cache só persiste 127.0.0.1: se cachearmos um peer Tailscale, o device
-//   ficaria preso ali mesmo quando o daemon local subir. Toda boot reavalia o local.
+//   macOS roda seu próprio daemon nativo em 127.0.0.1:2223 (ZeusDaemonMac, auto-spawn).
+//   iOS não roda daemon (sandbox) → degrada para JS puro sobre índices sincronizados.
+//   O cache só persiste loopback — não há rota remota.
 const ZEUS_LOCAL_DAEMON_KEY = 'zeus.daemon.url';        // cached URL string (sempre 127.0.0.1:* quando cacheado)
 const ZEUS_LOCAL_DAEMON_TS_KEY = 'zeus.daemon.ts';      // cached at (ms)
 const ZEUS_LOCAL_DAEMON_TTL_MS = 12 * 60 * 60 * 1000;   // 12h — re-probe periodicamente
@@ -479,18 +420,13 @@ function _zeusSetLocalDaemonUrl(url) {
 
 // v1.4.1 — On-device-first daemon discovery.
 //
-// Ordem fixa de candidatos:
-//   1. 127.0.0.1:2223  — daemon LOCAL Apple-nativo (ZeusDaemonMac no Mac, AegisDaemon no iOS)
+// Ordem fixa de candidatos (ON-DEVICE puro — sem rota remota):
+//   1. 127.0.0.1:2223  — daemon LOCAL Apple-nativo (ZeusDaemonMac no Mac, auto-spawn)
 //   2. localhost:2223  — alternativa de hostname para o mesmo loopback
-//   3. settings.zeusDaemonUrl — override sincronizado via iCloud (geralmente também 127.0.0.1)
-//   4. mesh peers (localStorage, per-device) — fallback degradado SE allowRemoteDaemonFallback estiver ON
+//   3. settings.zeusDaemonUrl — override (default 127.0.0.1; sincronizado via iCloud)
 //
-// Probes em paralelo com timeout curto (1500ms). MAS o resultado é PRIORIZADO por
-// ordem de preferência: se loopback responde, vence sobre Tailscale mesmo que Tailscale
-// tenha respondido primeiro. Isso garante "local sempre que possível".
+// Probes em paralelo com timeout curto (1500ms); loopback sempre vence.
 async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 1500) {
-  const allowRemote = plugin.settings.allowRemoteDaemonFallback === true;  // default false (strict on-device)
-
   const ordered = [];
   const seen = new Set();
   const push = (u) => { if (u && !seen.has(u)) { seen.add(u); ordered.push(u); } };
@@ -498,15 +434,11 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
   if (candidates) {
     for (const u of candidates) push(u);
   } else {
-    // 1+2: loopback (sempre primeiro — daemon local Apple-nativo daquele device)
+    // loopback primeiro (daemon local Apple-nativo daquele device), depois o override.
     push('http://127.0.0.1:2223');
     push('http://localhost:2223');
-    // 3: settings (sincronizado via iCloud — geralmente loopback, mas pode ser custom)
-    push(plugin.settings.zeusDaemonUrl);
-    // 4: mesh peers remotos (per-device localStorage, só se fallback permitido)
-    if (allowRemote) {
-      for (const u of _zeusGetMeshPeers()) push(u);
-    }
+    // override só se for loopback (on-device puro; ignora URL remota legada em data.json)
+    if (_zeusIsLoopback(plugin.settings.zeusDaemonUrl)) push(plugin.settings.zeusDaemonUrl);
   }
 
   const ZeusHttpClientLocal = require('./lib/zeus-http-client');
@@ -525,16 +457,16 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
     .map(r => r.value);
 
   if (winners.length === 0) {
-    console.warn('[zeus] adaptive daemon discovery → NENHUM daemon respondeu (nem local nem mesh)');
+    console.warn('[zeus] adaptive daemon discovery → NENHUM daemon local respondeu');
     return plugin.settings.zeusDaemonUrl;  // mantém o default para tentar de novo depois
   }
 
-  // Prioriza loopback (on-device); se nenhum loopback, usa o de menor idx (mesh ordenado por proximidade).
+  // Prioriza loopback (on-device); loopback sempre vence (on-device puro).
   const loopback = winners.find(w => w.loopback);
   const chosen = loopback || winners.sort((a, b) => a.idx - b.idx)[0];
 
   dbg('[zeus] adaptive daemon discovery → using', chosen.url,
-    chosen.loopback ? '(LOCAL on-device daemon ✓)' : '(REMOTE Tailscale fallback ⚠)');
+    chosen.loopback ? '(LOCAL on-device daemon ✓)' : '(local)');
 
   _zeusSetLocalDaemonUrl(chosen.url);   // só cacheia se for loopback (helper filtra)
   return chosen.url;
@@ -2416,7 +2348,7 @@ class ZeusSettingTab extends PluginSettingTab {
       : 'aguardando primeira verificação';
     new Setting(containerEl)
       .setName('Daemon HTTP (bin/ZeusDaemonMac)')
-      .setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 não responde. iOS consome via Tailscale/iCloud read-only. Estado: ${_lcLabel}`);
+      .setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 não responde. iOS lê os índices sincronizados via iCloud (read-only) e busca nas lanes JS. Estado: ${_lcLabel}`);
 
     new Setting(containerEl).setName('Apple Vision multi-modal (av)').setHeading();
 
@@ -2439,54 +2371,24 @@ class ZeusSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Zeus daemon URL (sincronizado via iCloud)')
-      .setDesc('Setting compartilhada. Mantenha em http://127.0.0.1:2223 — cada device Apple roda seu PRÓPRIO daemon nativo (ZeusDaemonMac no macOS, AegisDaemon no iOS) e o discovery sempre tenta o loopback primeiro. Mesh peers (configuráveis abaixo, por device) ficam só como fallback quando o daemon local não está rodando.')
+      .setDesc('URL do daemon LOCAL (loopback). Mantenha em http://127.0.0.1:2223 — o plugin é on-device puro: macOS auto-spawna o ZeusDaemonMac local; iOS lê os índices sincronizados. Apenas URLs loopback (127.0.0.1/localhost/::1) são aceitas; URL remota é rejeitada (sem relay).')
       .addText(t => t.setValue(this.plugin.settings.zeusDaemonUrl).setPlaceholder('http://127.0.0.1:2223').onChange(async v => {
-        this.plugin.settings.zeusDaemonUrl = v;
+        // v1.15 — on-device puro: rejeita URL não-loopback (sem rota remota).
+        if (v && !_zeusIsLoopback(v)) {
+          new Notice('Zeus: só URLs loopback (127.0.0.1/localhost) são aceitas — arquitetura on-device, sem relay.', 8000);
+          t.setValue(this.plugin.settings.zeusDaemonUrl);
+          return;
+        }
+        this.plugin.settings.zeusDaemonUrl = v || 'http://127.0.0.1:2223';
         await this.plugin.saveSettings();
-        this.plugin.httpClient.setBaseUrl(v);
+        this.plugin.httpClient.setBaseUrl(this.plugin.settings.zeusDaemonUrl);
         // v1.4.1 — Limpa cache localStorage para que o novo valor seja reprobado.
         _zeusSetLocalDaemonUrl(null);
       }));
 
     new Setting(containerEl)
-      .setName('Permitir fallback remoto para mesh peers')
-      .setDesc('Default OFF (strict on-device): nunca conecta a outro device — exige daemon Apple-nativo local funcionando. ON: se o daemon local 127.0.0.1:2223 não responde, tenta os mesh peers configurados abaixo. Os peers ficam só neste device (localStorage, não sincroniza via iCloud).')
-      .addToggle(t => t.setValue(this.plugin.settings.allowRemoteDaemonFallback === true).onChange(async v => {
-        this.plugin.settings.allowRemoteDaemonFallback = v;
-        await this.plugin.saveSettings();
-        // Invalida cache para forçar reavaliação na próxima discovery
-        _zeusSetLocalDaemonUrl(null);
-      }));
-
-    new Setting(containerEl)
-      .setName('Daemon mesh peers (local, não sincronizado)')
-      .setDesc('URLs de daemons remotos para fallback, uma por linha (ex: http://host-ou-ip:2223). Guardado só neste device (localStorage) — nunca vai para data.json sincronizado. Cada device escolhe seus próprios peers; sem topologia hardcoded. Requer o toggle acima ligado e um token de auth válido no daemon remoto.')
-      .addTextArea(t => {
-        t.setValue(_zeusGetMeshPeers().join('\n'))
-          .setPlaceholder('http://192.168.1.50:2223\nhttp://meu-host.local:2223')
-          .onChange(v => {
-            _zeusSetMeshPeers(String(v).split('\n').map(s => s.trim()).filter(Boolean));
-            _zeusSetLocalDaemonUrl(null);  // invalida cache para reavaliar com os novos peers
-          });
-        t.inputEl.rows = 3;
-      });
-
-    new Setting(containerEl)
-      .setName('Token do daemon remoto (local, não sincronizado)')
-      .setDesc('Token de auth (X-Zeus-Token) enviado APENAS para peers remotos não-loopback. Deve ser igual ao env ZEUS_DAEMON_TOKEN do daemon remoto (ex: ZeusDaemonMac no Mac via Tailscale). Guardado só neste device (localStorage), nunca em data.json sincronizado. Loopback (daemon local) não usa token.')
-      .addText(t => {
-        t.setValue(_zeusGetDaemonToken() || '')
-          .setPlaceholder('cole o token do daemon remoto')
-          .onChange(v => {
-            _zeusSetDaemonToken(v);
-            if (this.plugin.httpClient) this.plugin.httpClient.setAuthToken(_zeusGetDaemonToken());
-          });
-        t.inputEl.type = 'password';
-      });
-
-    new Setting(containerEl)
       .setName('Forçar redescoberta de daemon agora')
-      .setDesc('Limpa cache localStorage e probe 127.0.0.1 + settings + mesh peers (local) em paralelo. Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use após instalar o daemon local ou mover entre redes.')
+      .setDesc('Limpa cache localStorage e re-prova 127.0.0.1 + settings (on-device). Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use após instalar/subir o daemon local.')
       .addButton(b => b.setButtonText('Redescobrir').setCta().onClick(async () => {
         _zeusSetLocalDaemonUrl(null);
         const n = new Notice('Zeus: redescobrindo daemon…', 0);
@@ -2497,7 +2399,7 @@ class ZeusSettingTab extends PluginSettingTab {
           n.hide();
           if (ok) {
             const isLocal = _zeusIsLoopback(url);
-            new Notice(`Zeus: daemon ${isLocal ? 'LOCAL on-device ✓' : 'REMOTE (fallback Tailscale) ⚠'} em ${url}`, 6000);
+            new Notice(`Zeus: daemon ${isLocal ? 'LOCAL on-device ✓' : 'local'} em ${url}`, 6000);
           } else {
             const macHint = 'macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent.';
             const iosHint = 'iOS: abra o app Aegis para iniciar o AegisDaemon (porta 2223 embedada).';
@@ -2979,9 +2881,6 @@ class ZeusPlugin extends Plugin {
       dbg('[zeus] using per-device cached daemon URL:', _initialDaemonUrl, '(settings:', this.settings.zeusDaemonUrl, ')');
     }
     this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
-    // v1.15 — token de auth para daemon remoto (relay Tailscale). Per-device
-    // (localStorage). Loopback ignora o token; só requests não-loopback o enviam.
-    this.httpClient.setAuthToken(_zeusGetDaemonToken());
 
     // v1.5 — Daemon lifecycle: se 127.0.0.1:2223 não responder, plugin sobe
     // bin/ZeusDaemonMac sozinho (autonomia "drop-in" sem launchctl manual).
@@ -3003,7 +2902,7 @@ class ZeusPlugin extends Plugin {
         dbg('[zeus] daemon lifecycle:', status);
         // v1.5.1 — fix P2 codex review: quando o lifecycle sobe (ou reaproveita)
         // um daemon local em 127.0.0.1:2223, redireciona httpClient pra ele,
-        // sobrescrevendo qualquer cache de URL remota (Tailscale peer). Sem
+        // sobrescrevendo cache antigo. Sem
         // esse rebase, plugin spawna localmente mas continua falando com peer
         // remoto — "drop-in/on-device" não cumprido.
         if (status && status.running && status.url && this.httpClient.baseUrl !== status.url) {
@@ -3031,9 +2930,9 @@ class ZeusPlugin extends Plugin {
     // Build full é opt-in via settings.lexicalIosAutoBuild OU comando manual.
     // Incrementals rodam via AutoIndexer ~30s após modify.
     this.lexicalIos = new LexicalIosIndex(this);
-    // v1.12 — embed iOS two-tier wiring (codex C+B aprovado)
+    // v1.15 — embed on-device: daemon local (loopback) + transformers.js labs
     this.embedIos = new EmbedIosLib(this);
-    this.embedRelay = new EmbedIosLib.EmbedRelay(this);
+    this.embedLocalDaemon = new EmbedIosLib.LocalDaemonEmbed(this);
     if (this.settings.lexicalIosAutoBuild) {
       setTimeout(async () => {
         try {
@@ -3197,7 +3096,7 @@ class ZeusPlugin extends Plugin {
         const currentOk = await this.httpClient.isAvailable(1500);
         let activeUrl = this.httpClient.baseUrl;
         if (!currentOk) {
-          // URL atual morta — varre loopback + settings + mesh peers (local) em paralelo.
+          // URL atual morta — re-prova loopback + settings (on-device) em paralelo.
           const discovered = await discoverDaemonUrl(this);
           if (discovered && discovered !== activeUrl) {
             dbg('[zeus] adapting daemon URL from', activeUrl, 'to', discovered);
@@ -3214,13 +3113,13 @@ class ZeusPlugin extends Plugin {
         dbg('[zeus] daemon health:', health.status, '| platform:', health.platform, '| endpoints:', (health.endpoints || []).length, '| tools:', tools.length, '| url:', activeUrl);
         if (health.status === 'ok') {
           const isLocal = _zeusIsLoopback(activeUrl);
-          new Notice(`Zeus: daemon ${health.platform || '?'} ${isLocal ? 'LOCAL ✓' : 'REMOTE (Tailscale) ⚠'} · ${(health.endpoints || []).length} endpoints`);
+          new Notice(`Zeus: daemon ${health.platform || '?'} ${isLocal ? 'LOCAL ✓' : 'local'} · ${(health.endpoints || []).length} endpoints`);
         } else {
           // v1.4.1 — Instruções per-platform: cada device tem infra Apple nativa para rodar seu daemon.
-          const macHint = 'macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent (~/Library/LaunchAgents/com.maiocchi.zeusdaemon.plist).';
-          const iosHint = 'iOS: abra o app Aegis no device para iniciar o AegisDaemon (HTTP NIO em 127.0.0.1:2223, paridade total com macOS).';
+          const macHint = 'macOS: o plugin auto-spawna bin/ZeusDaemonMac; se falhar, rode `bash daemon/scripts/install-mac-daemon.sh` (LaunchAgent).';
+          const iosHint = 'iOS: sem daemon on-device (esperado) — busca roda nas lanes JS sobre os índices computados no Mac e sincronizados via iCloud.';
           const platformHint = isMac() ? macHint : iosHint;
-          new Notice(`Zeus: daemon UNREACHABLE em ${activeUrl}.\n${platformHint}\nOu desative "Permitir fallback remoto" para forçar modo strict on-device.`, 15000);
+          new Notice(`Zeus: daemon local indisponível em ${activeUrl}.\n${platformHint}`, 15000);
         }
       } catch (e) {
         console.warn('[zeus] adaptive discovery skipped:', e.message);
@@ -4633,17 +4532,17 @@ class ZeusPlugin extends Plugin {
       },
     });
 
-    // v1.12 — embed iOS two-tier: relay status + install model stub
+    // v1.15 — embed status: daemon local (on-device) + transformers.js labs
     this.addCommand({
       id: 'zeus-ios-embed-status',
-      name: 'Zeus: status embed iOS (relay Mac + transformers.js)',
+      name: 'Zeus: status embed (daemon local + transformers.js)',
       callback: async () => {
         try {
-          const lines = ['Zeus iOS embed two-tier:'];
-          // Camada 1: relay status
-          if (this.embedRelay) {
-            const probe = await this.embedRelay.tryEmbed('zeus iOS embed probe');
-            lines.push(`  Camada 1 (relay daemon): ${probe.ok ? '✓ OK' : '✗ ' + probe.reason}`);
+          const lines = ['Zeus embed status:'];
+          // Camada 1: daemon local (loopback)
+          if (this.embedLocalDaemon) {
+            const probe = await this.embedLocalDaemon.tryEmbed('zeus embed probe');
+            lines.push(`  Camada 1 (daemon local Apple-nativo): ${probe.ok ? '✓ OK' : '✗ ' + probe.reason}`);
             if (probe.ok) lines.push(`    dim=${probe.dim} · model=${probe.model} · source=${probe.source}`);
           }
           // Camada 2: transformers.js
@@ -4668,26 +4567,22 @@ class ZeusPlugin extends Plugin {
           // v1.12 ENTREGA stub: copia instruções pro clipboard (mesmo padrão
           // MobileCLIP v1.9). Runtime transformers.js full em v1.13 ADR-011.
           const msg = [
-            'Embed iOS v1.12 — STUB labs. Runtime transformers.js full em v1.13 (ADR-011).',
+            'Embed iOS — arquitetura ON-DEVICE puro (v1.15).',
             '',
-            'Para v1.12, USE Camada 1 (relay Mac via Tailscale):',
-            '  1. Mac mini / MacBook deve ter ZeusDaemonMac rodando (default)',
-            '  2. iOS Capacitor + Tailscale instalado e mesh ativa',
-            '  3. Settings → Zeus → "Permitir fallback remoto via Tailscale" ON',
-            '  4. iosEmbedRelayEnabled: true (default)',
+            'O embedding 512-dim NLContextualEmbedding (Apple-native) é computado NO MAC',
+            '(ZeusDaemonMac, auto-spawn) e persistido em data/embeddings.jsonl. Esse índice',
+            'sincroniza via iCloud para o vault do iPhone/iPad.',
             '',
-            'iOS chama daemon Mac via http://<tailscale-ip>:2223/v1/embed',
-            '→ persiste em data/embeddings.jsonl 512-dim NLContextualEmbedding',
-            '→ qualidade Apple-native pt-BR otimizada (Mac-canônico).',
+            'No iOS o plugin NÃO roda daemon (sandbox não executa código nativo): ele LÊ o',
+            'embeddings.jsonl sincronizado e roda a busca nas lanes JS puras',
+            '(BM25/Leiden/multiplex/cosine) — 100% on-device, offline, sem relay.',
             '',
-            'Camada 2 (v1.13 labs): transformers.js + Xenova/multilingual-e5-small',
-            '  ~118MB INT8 ONNX cached via Browser Cache API.',
-            '  Quando indisponível Tailscale Mac, fallback local 384-dim.',
-            '  Schema versionado: embeddings-ios.jsonl separado.',
+            'Para reindexar: rode a indexação no Mac; o iOS recebe o índice atualizado',
+            'na próxima sincronização do iCloud.',
           ].join('\n');
           dbg('[zeus.embed-ios]', msg);
           try { await navigator.clipboard.writeText(msg); } catch {}
-          new Notice('Embed iOS install: instruções copiadas pro clipboard. v1.12 entrega relay Mac.', 12000);
+          new Notice('Embed iOS: índice é computado no Mac e sincronizado; iOS busca via JS lanes. Instruções no clipboard.', 12000);
         } catch (e) {
           new Notice('Embed iOS install falhou: ' + e.message.slice(0, 150));
         }

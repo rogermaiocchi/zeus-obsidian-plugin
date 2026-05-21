@@ -913,7 +913,6 @@ var require_zeus_http_client = __commonJS({
         this.healthCache = null;
         this.healthCheckedAt = 0;
         this.HEALTH_TTL_MS = 3e4;
-        this.authToken = null;
         this.metrics = {
           requests: 0,
           bytesIn: 0,
@@ -988,19 +987,8 @@ var require_zeus_http_client = __commonJS({
         this.baseUrl = (url || "http://127.0.0.1:2223").replace(/\/$/, "");
         this.healthCache = null;
       }
-      // v1.15 — define o token de auth para o daemon remoto (relay). Vazio/null = sem token.
-      setAuthToken(token) {
-        this.authToken = typeof token === "string" && token.trim() ? token.trim() : null;
-      }
       _isLoopbackBaseUrl() {
         return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(this.baseUrl || "");
-      }
-      // v1.15 — header de auth só para requests NÃO-loopback (o daemon trata loopback
-      // como confiável). Sem token configurado, não envia nada (daemon responderá 401
-      // e o usuário verá que precisa configurar o token do peer).
-      _authHeaders() {
-        if (this._isLoopbackBaseUrl() || !this.authToken) return {};
-        return { "X-Zeus-Token": this.authToken };
       }
       _isPrivatePath(path2, payload = {}) {
         if (typeof path2 === "string" && path2) {
@@ -1071,13 +1059,12 @@ var require_zeus_http_client = __commonJS({
           obsidian2 = null;
         }
         const pccHeaders = this._pccHeaders();
-        const authHeaders = this._authHeaders();
         if (obsidian2 && obsidian2.requestUrl) {
           const resp = await obsidian2.requestUrl({
             url,
             method,
             contentType,
-            headers: { "Content-Type": contentType, ...pccHeaders, ...authHeaders },
+            headers: { "Content-Type": contentType, ...pccHeaders },
             body: typeof body === "string" ? body : body ? JSON.stringify(body) : void 0,
             throw: throwOnError
           });
@@ -1087,7 +1074,7 @@ var require_zeus_http_client = __commonJS({
         if (typeof fetch === "function") {
           const resp = await fetch(url, {
             method,
-            headers: { "Content-Type": contentType, ...pccHeaders, ...authHeaders },
+            headers: { "Content-Type": contentType, ...pccHeaders },
             body: body ? typeof body === "string" ? body : JSON.stringify(body) : void 0,
             signal
           });
@@ -4423,12 +4410,12 @@ var require_embed_ios = __commonJS({
         throw new Error("embed-ios.embedText: runtime n\xE3o implementado em v1.12");
       }
     };
-    var EmbedRelay = class {
+    var LocalDaemonEmbed = class {
       constructor(plugin) {
         this.plugin = plugin;
       }
       /**
-       * Tenta embed via daemon HTTP (loopback Mac OU Tailscale relay iOS→Mac).
+       * Tenta embed via daemon HTTP LOCAL (loopback).
        * Sucesso → retorna {ok: true, vec, dim, model, source}
        * Falha → retorna {ok: false, reason}  (não lança — gracioso)
        */
@@ -4448,7 +4435,7 @@ var require_embed_ios = __commonJS({
             vec,
             dim: EMBED_MAC_DIM,
             model: r && r.model || EMBED_MAC_MODEL,
-            source: "daemon-relay"
+            source: "daemon-local"
           };
         } catch (e) {
           return { ok: false, reason: (e.message || String(e)).slice(0, 100) };
@@ -4456,7 +4443,7 @@ var require_embed_ios = __commonJS({
       }
     };
     module2.exports = EmbedIos;
-    module2.exports.EmbedRelay = EmbedRelay;
+    module2.exports.LocalDaemonEmbed = LocalDaemonEmbed;
     module2.exports.EMBED_IOS_DIM = EMBED_IOS_DIM;
     module2.exports.EMBED_IOS_MODEL = EMBED_IOS_MODEL;
     module2.exports.EMBED_MAC_DIM = EMBED_MAC_DIM;
@@ -5651,14 +5638,9 @@ var DEFAULT_SETTINGS = {
   // se true, runFullIndex produz multi-vectors.jsonl além de embeddings.jsonl
   // v0.6.0 — Aegis-pattern HTTP daemon (ADR-018)
   zeusDaemonUrl: "http://127.0.0.1:2223",
-  // local daemon loopback (neutro; mesh peers ficam em localStorage per-device)
+  // local daemon loopback (on-device puro; sem rota remota)
   daemonPreferredOverSpawn: true,
   // ADR-018 fase E++: HTTP-first em todos hot paths; spawn é fallback no Mac
-  // v1.4.1 — On-device-first: cada device Apple roda seu próprio daemon nativo
-  // (ZeusDaemonMac no macOS, AegisDaemon no iOS). Quando ON, discovery cai para
-  // Tailscale mesh apenas se o daemon local não responder. Quando OFF, Tailscale
-  // mesh nunca é tentado — modo strict on-device (melhor privacidade + latência).
-  allowRemoteDaemonFallback: false,
   // v0.7.0 — full Apple ecosystem coverage
   imagesIndexFeaturePrint: false,
   // se ON, comandos de indexação de imagens populam data/image-features.jsonl
@@ -5724,13 +5706,10 @@ var DEFAULT_SETTINGS = {
   // vault.adapter iOS) orquestrando todas as camadas (passport/base/spotlight/
   // multiplex/leiden) com debounce + cooldown.
   autoIndexEnabled: true,
-  // v1.12 — embed iOS two-tier (codex audit C+B aprovado)
-  // CAMADA 1 (default ON): relay HTTP daemon via Tailscale/loopback. iOS chama
-  //   daemon Mac, persiste em embeddings.jsonl 512-dim NLContextualEmbedding.
-  // CAMADA 2 (default OFF, labs): transformers.js + multilingual-e5-small ~118MB
-  //   fetch lazy primeiro use. Persiste embeddings-ios.jsonl 384-dim.
-  //   v1.12 ENTREGA stub apenas; runtime completo em v1.13 ADR-011 labs.
-  iosEmbedRelayEnabled: true,
+  // v1.15 — embed on-device puro. macOS: embed via daemon Apple-nativo LOCAL
+  //   (loopback, 512-dim NLContextualEmbedding). iOS: sem daemon → lê o
+  //   embeddings.jsonl computado no Mac e sincronizado via iCloud; busca nas
+  //   lanes JS. CAMADA 2 (labs, default OFF): transformers.js local 384-dim.
   iosEmbedTransformersEnabled: false,
   // v1.9 — Leiden communities (escopo enxuto: local move + connectivity split + agregação)
   // Vide docs/ADR-008-Leiden-Communities-JS-Port.md
@@ -5777,46 +5756,6 @@ async function tryDaemonOrSpawn(plugin, daemonMethod, daemonArgs) {
   const result = await plugin.httpClient[daemonMethod](...daemonArgs);
   return { source: "daemon", result };
 }
-var ZEUS_MESH_PEERS_KEY = "zeus.mesh.peers";
-function _zeusGetMeshPeers() {
-  try {
-    if (typeof window === "undefined" || !window.localStorage) return [];
-    const raw = window.localStorage.getItem(ZEUS_MESH_PEERS_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr.filter((u) => typeof u === "string" && /^https?:\/\//.test(u)) : [];
-  } catch (e) {
-    return [];
-  }
-}
-function _zeusSetMeshPeers(urls) {
-  try {
-    if (typeof window === "undefined" || !window.localStorage) return;
-    const clean = (Array.isArray(urls) ? urls : []).map((u) => String(u).trim()).filter((u) => /^https?:\/\//.test(u));
-    if (clean.length === 0) window.localStorage.removeItem(ZEUS_MESH_PEERS_KEY);
-    else window.localStorage.setItem(ZEUS_MESH_PEERS_KEY, JSON.stringify(clean));
-  } catch (e) {
-  }
-}
-var ZEUS_DAEMON_TOKEN_KEY = "zeus.daemon.token";
-function _zeusGetDaemonToken() {
-  try {
-    if (typeof window === "undefined" || !window.localStorage) return null;
-    const t = window.localStorage.getItem(ZEUS_DAEMON_TOKEN_KEY);
-    return t && t.trim() ? t.trim() : null;
-  } catch (e) {
-    return null;
-  }
-}
-function _zeusSetDaemonToken(token) {
-  try {
-    if (typeof window === "undefined" || !window.localStorage) return;
-    const t = typeof token === "string" ? token.trim() : "";
-    if (!t) window.localStorage.removeItem(ZEUS_DAEMON_TOKEN_KEY);
-    else window.localStorage.setItem(ZEUS_DAEMON_TOKEN_KEY, t);
-  } catch (e) {
-  }
-}
 var ZEUS_LOCAL_DAEMON_KEY = "zeus.daemon.url";
 var ZEUS_LOCAL_DAEMON_TS_KEY = "zeus.daemon.ts";
 var ZEUS_LOCAL_DAEMON_TTL_MS = 12 * 60 * 60 * 1e3;
@@ -5854,7 +5793,6 @@ function _zeusSetLocalDaemonUrl(url) {
   }
 }
 async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 1500) {
-  const allowRemote = plugin.settings.allowRemoteDaemonFallback === true;
   const ordered = [];
   const seen = /* @__PURE__ */ new Set();
   const push = (u) => {
@@ -5868,10 +5806,7 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
   } else {
     push("http://127.0.0.1:2223");
     push("http://localhost:2223");
-    push(plugin.settings.zeusDaemonUrl);
-    if (allowRemote) {
-      for (const u of _zeusGetMeshPeers()) push(u);
-    }
+    if (_zeusIsLoopback(plugin.settings.zeusDaemonUrl)) push(plugin.settings.zeusDaemonUrl);
   }
   const ZeusHttpClientLocal = require_zeus_http_client();
   const probes = ordered.map((url, idx) => (async () => {
@@ -5886,7 +5821,7 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
   const results = await Promise.allSettled(probes);
   const winners = results.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
   if (winners.length === 0) {
-    console.warn("[zeus] adaptive daemon discovery \u2192 NENHUM daemon respondeu (nem local nem mesh)");
+    console.warn("[zeus] adaptive daemon discovery \u2192 NENHUM daemon local respondeu");
     return plugin.settings.zeusDaemonUrl;
   }
   const loopback = winners.find((w) => w.loopback);
@@ -5894,7 +5829,7 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
   dbg(
     "[zeus] adaptive daemon discovery \u2192 using",
     chosen.url,
-    chosen.loopback ? "(LOCAL on-device daemon \u2713)" : "(REMOTE Tailscale fallback \u26A0)"
+    chosen.loopback ? "(LOCAL on-device daemon \u2713)" : "(local)"
   );
   _zeusSetLocalDaemonUrl(chosen.url);
   return chosen.url;
@@ -7525,7 +7460,7 @@ var ZeusSettingTab = class extends PluginSettingTab {
     desc.appendText(" para PDFs/imagens. Sem BM25 pr\xF3prio, sem tokenizer pr\xF3prio, sem bge-micro-v2.");
     const _lcStatus = this.plugin.daemonLifecycle && this.plugin.daemonLifecycle.lastStatus || null;
     const _lcLabel = _lcStatus ? `${_lcStatus.running ? "ALIVE" : "DEAD"} (${_lcStatus.source}) \u2014 ${this.plugin.daemonLifecycle.url}` : "aguardando primeira verifica\xE7\xE3o";
-    new Setting(containerEl).setName("Daemon HTTP (bin/ZeusDaemonMac)").setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 n\xE3o responde. iOS consome via Tailscale/iCloud read-only. Estado: ${_lcLabel}`);
+    new Setting(containerEl).setName("Daemon HTTP (bin/ZeusDaemonMac)").setDesc(`Auto-spawn no Mac quando 127.0.0.1:2223 n\xE3o responde. iOS l\xEA os \xEDndices sincronizados via iCloud (read-only) e busca nas lanes JS. Estado: ${_lcLabel}`);
     new Setting(containerEl).setName("Apple Vision multi-modal (av)").setHeading();
     new Setting(containerEl).setName("Image features extraction").setDesc("Para cada imagem indexada: aocr (texto) + av classify (categorias) + av landmarks (faces) + acs metadata (EXIF/GPS/data). Combinado \xE9 embeddado pelo afm.").addToggle((t) => t.setValue(this.plugin.settings.avImageFeatures).onChange(async (v) => {
       this.plugin.settings.avImageFeatures = v;
@@ -7540,32 +7475,18 @@ var ZeusSettingTab = class extends PluginSettingTab {
       await this.plugin.saveSettings();
     }));
     new Setting(containerEl).setName("Aegis-pattern HTTP daemon (v0.6, ADR-018)").setHeading();
-    new Setting(containerEl).setName("Zeus daemon URL (sincronizado via iCloud)").setDesc("Setting compartilhada. Mantenha em http://127.0.0.1:2223 \u2014 cada device Apple roda seu PR\xD3PRIO daemon nativo (ZeusDaemonMac no macOS, AegisDaemon no iOS) e o discovery sempre tenta o loopback primeiro. Mesh peers (configur\xE1veis abaixo, por device) ficam s\xF3 como fallback quando o daemon local n\xE3o est\xE1 rodando.").addText((t) => t.setValue(this.plugin.settings.zeusDaemonUrl).setPlaceholder("http://127.0.0.1:2223").onChange(async (v) => {
-      this.plugin.settings.zeusDaemonUrl = v;
+    new Setting(containerEl).setName("Zeus daemon URL (sincronizado via iCloud)").setDesc("URL do daemon LOCAL (loopback). Mantenha em http://127.0.0.1:2223 \u2014 o plugin \xE9 on-device puro: macOS auto-spawna o ZeusDaemonMac local; iOS l\xEA os \xEDndices sincronizados. Apenas URLs loopback (127.0.0.1/localhost/::1) s\xE3o aceitas; URL remota \xE9 rejeitada (sem relay).").addText((t) => t.setValue(this.plugin.settings.zeusDaemonUrl).setPlaceholder("http://127.0.0.1:2223").onChange(async (v) => {
+      if (v && !_zeusIsLoopback(v)) {
+        new Notice("Zeus: s\xF3 URLs loopback (127.0.0.1/localhost) s\xE3o aceitas \u2014 arquitetura on-device, sem relay.", 8e3);
+        t.setValue(this.plugin.settings.zeusDaemonUrl);
+        return;
+      }
+      this.plugin.settings.zeusDaemonUrl = v || "http://127.0.0.1:2223";
       await this.plugin.saveSettings();
-      this.plugin.httpClient.setBaseUrl(v);
+      this.plugin.httpClient.setBaseUrl(this.plugin.settings.zeusDaemonUrl);
       _zeusSetLocalDaemonUrl(null);
     }));
-    new Setting(containerEl).setName("Permitir fallback remoto para mesh peers").setDesc("Default OFF (strict on-device): nunca conecta a outro device \u2014 exige daemon Apple-nativo local funcionando. ON: se o daemon local 127.0.0.1:2223 n\xE3o responde, tenta os mesh peers configurados abaixo. Os peers ficam s\xF3 neste device (localStorage, n\xE3o sincroniza via iCloud).").addToggle((t) => t.setValue(this.plugin.settings.allowRemoteDaemonFallback === true).onChange(async (v) => {
-      this.plugin.settings.allowRemoteDaemonFallback = v;
-      await this.plugin.saveSettings();
-      _zeusSetLocalDaemonUrl(null);
-    }));
-    new Setting(containerEl).setName("Daemon mesh peers (local, n\xE3o sincronizado)").setDesc("URLs de daemons remotos para fallback, uma por linha (ex: http://host-ou-ip:2223). Guardado s\xF3 neste device (localStorage) \u2014 nunca vai para data.json sincronizado. Cada device escolhe seus pr\xF3prios peers; sem topologia hardcoded. Requer o toggle acima ligado e um token de auth v\xE1lido no daemon remoto.").addTextArea((t) => {
-      t.setValue(_zeusGetMeshPeers().join("\n")).setPlaceholder("http://192.168.1.50:2223\nhttp://meu-host.local:2223").onChange((v) => {
-        _zeusSetMeshPeers(String(v).split("\n").map((s) => s.trim()).filter(Boolean));
-        _zeusSetLocalDaemonUrl(null);
-      });
-      t.inputEl.rows = 3;
-    });
-    new Setting(containerEl).setName("Token do daemon remoto (local, n\xE3o sincronizado)").setDesc("Token de auth (X-Zeus-Token) enviado APENAS para peers remotos n\xE3o-loopback. Deve ser igual ao env ZEUS_DAEMON_TOKEN do daemon remoto (ex: ZeusDaemonMac no Mac via Tailscale). Guardado s\xF3 neste device (localStorage), nunca em data.json sincronizado. Loopback (daemon local) n\xE3o usa token.").addText((t) => {
-      t.setValue(_zeusGetDaemonToken() || "").setPlaceholder("cole o token do daemon remoto").onChange((v) => {
-        _zeusSetDaemonToken(v);
-        if (this.plugin.httpClient) this.plugin.httpClient.setAuthToken(_zeusGetDaemonToken());
-      });
-      t.inputEl.type = "password";
-    });
-    new Setting(containerEl).setName("For\xE7ar redescoberta de daemon agora").setDesc("Limpa cache localStorage e probe 127.0.0.1 + settings + mesh peers (local) em paralelo. Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use ap\xF3s instalar o daemon local ou mover entre redes.").addButton((b) => b.setButtonText("Redescobrir").setCta().onClick(async () => {
+    new Setting(containerEl).setName("For\xE7ar redescoberta de daemon agora").setDesc("Limpa cache localStorage e re-prova 127.0.0.1 + settings (on-device). Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use ap\xF3s instalar/subir o daemon local.").addButton((b) => b.setButtonText("Redescobrir").setCta().onClick(async () => {
       _zeusSetLocalDaemonUrl(null);
       const n = new Notice("Zeus: redescobrindo daemon\u2026", 0);
       try {
@@ -7575,7 +7496,7 @@ var ZeusSettingTab = class extends PluginSettingTab {
         n.hide();
         if (ok) {
           const isLocal = _zeusIsLoopback(url);
-          new Notice(`Zeus: daemon ${isLocal ? "LOCAL on-device \u2713" : "REMOTE (fallback Tailscale) \u26A0"} em ${url}`, 6e3);
+          new Notice(`Zeus: daemon ${isLocal ? "LOCAL on-device \u2713" : "local"} em ${url}`, 6e3);
         } else {
           const macHint = "macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent.";
           const iosHint = "iOS: abra o app Aegis para iniciar o AegisDaemon (porta 2223 embedada).";
@@ -7890,7 +7811,6 @@ var ZeusPlugin = class extends Plugin {
         dbg("[zeus] using per-device cached daemon URL:", _initialDaemonUrl, "(settings:", this.settings.zeusDaemonUrl, ")");
       }
       this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
-      this.httpClient.setAuthToken(_zeusGetDaemonToken());
       this.daemonLifecycle = new DaemonLifecycle(this);
       if (isMac()) {
         try {
@@ -7917,7 +7837,7 @@ var ZeusPlugin = class extends Plugin {
       this.ioQueue = new IoQueue(this);
       this.lexicalIos = new LexicalIosIndex(this);
       this.embedIos = new EmbedIosLib(this);
-      this.embedRelay = new EmbedIosLib.EmbedRelay(this);
+      this.embedLocalDaemon = new EmbedIosLib.LocalDaemonEmbed(this);
       if (this.settings.lexicalIosAutoBuild) {
         setTimeout(async () => {
           try {
@@ -8063,14 +7983,13 @@ var ZeusPlugin = class extends Plugin {
           dbg("[zeus] daemon health:", health.status, "| platform:", health.platform, "| endpoints:", (health.endpoints || []).length, "| tools:", tools.length, "| url:", activeUrl);
           if (health.status === "ok") {
             const isLocal = _zeusIsLoopback(activeUrl);
-            new Notice(`Zeus: daemon ${health.platform || "?"} ${isLocal ? "LOCAL \u2713" : "REMOTE (Tailscale) \u26A0"} \xB7 ${(health.endpoints || []).length} endpoints`);
+            new Notice(`Zeus: daemon ${health.platform || "?"} ${isLocal ? "LOCAL \u2713" : "local"} \xB7 ${(health.endpoints || []).length} endpoints`);
           } else {
-            const macHint = "macOS: rode `bash daemon/scripts/install-mac-daemon.sh` para subir o ZeusDaemonMac via LaunchAgent (~/Library/LaunchAgents/com.maiocchi.zeusdaemon.plist).";
-            const iosHint = "iOS: abra o app Aegis no device para iniciar o AegisDaemon (HTTP NIO em 127.0.0.1:2223, paridade total com macOS).";
+            const macHint = "macOS: o plugin auto-spawna bin/ZeusDaemonMac; se falhar, rode `bash daemon/scripts/install-mac-daemon.sh` (LaunchAgent).";
+            const iosHint = "iOS: sem daemon on-device (esperado) \u2014 busca roda nas lanes JS sobre os \xEDndices computados no Mac e sincronizados via iCloud.";
             const platformHint = isMac() ? macHint : iosHint;
-            new Notice(`Zeus: daemon UNREACHABLE em ${activeUrl}.
-${platformHint}
-Ou desative "Permitir fallback remoto" para for\xE7ar modo strict on-device.`, 15e3);
+            new Notice(`Zeus: daemon local indispon\xEDvel em ${activeUrl}.
+${platformHint}`, 15e3);
           }
         } catch (e) {
           console.warn("[zeus] adaptive discovery skipped:", e.message);
@@ -9489,13 +9408,13 @@ ${top3}`, 12e3);
       });
       this.addCommand({
         id: "zeus-ios-embed-status",
-        name: "Zeus: status embed iOS (relay Mac + transformers.js)",
+        name: "Zeus: status embed (daemon local + transformers.js)",
         callback: async () => {
           try {
-            const lines = ["Zeus iOS embed two-tier:"];
-            if (this.embedRelay) {
-              const probe = await this.embedRelay.tryEmbed("zeus iOS embed probe");
-              lines.push(`  Camada 1 (relay daemon): ${probe.ok ? "\u2713 OK" : "\u2717 " + probe.reason}`);
+            const lines = ["Zeus embed status:"];
+            if (this.embedLocalDaemon) {
+              const probe = await this.embedLocalDaemon.tryEmbed("zeus embed probe");
+              lines.push(`  Camada 1 (daemon local Apple-nativo): ${probe.ok ? "\u2713 OK" : "\u2717 " + probe.reason}`);
               if (probe.ok) lines.push(`    dim=${probe.dim} \xB7 model=${probe.model} \xB7 source=${probe.source}`);
             }
             if (this.embedIos) {
@@ -9516,29 +9435,25 @@ ${top3}`, 12e3);
         callback: async () => {
           try {
             const msg = [
-              "Embed iOS v1.12 \u2014 STUB labs. Runtime transformers.js full em v1.13 (ADR-011).",
+              "Embed iOS \u2014 arquitetura ON-DEVICE puro (v1.15).",
               "",
-              "Para v1.12, USE Camada 1 (relay Mac via Tailscale):",
-              "  1. Mac mini / MacBook deve ter ZeusDaemonMac rodando (default)",
-              "  2. iOS Capacitor + Tailscale instalado e mesh ativa",
-              '  3. Settings \u2192 Zeus \u2192 "Permitir fallback remoto via Tailscale" ON',
-              "  4. iosEmbedRelayEnabled: true (default)",
+              "O embedding 512-dim NLContextualEmbedding (Apple-native) \xE9 computado NO MAC",
+              "(ZeusDaemonMac, auto-spawn) e persistido em data/embeddings.jsonl. Esse \xEDndice",
+              "sincroniza via iCloud para o vault do iPhone/iPad.",
               "",
-              "iOS chama daemon Mac via http://<tailscale-ip>:2223/v1/embed",
-              "\u2192 persiste em data/embeddings.jsonl 512-dim NLContextualEmbedding",
-              "\u2192 qualidade Apple-native pt-BR otimizada (Mac-can\xF4nico).",
+              "No iOS o plugin N\xC3O roda daemon (sandbox n\xE3o executa c\xF3digo nativo): ele L\xCA o",
+              "embeddings.jsonl sincronizado e roda a busca nas lanes JS puras",
+              "(BM25/Leiden/multiplex/cosine) \u2014 100% on-device, offline, sem relay.",
               "",
-              "Camada 2 (v1.13 labs): transformers.js + Xenova/multilingual-e5-small",
-              "  ~118MB INT8 ONNX cached via Browser Cache API.",
-              "  Quando indispon\xEDvel Tailscale Mac, fallback local 384-dim.",
-              "  Schema versionado: embeddings-ios.jsonl separado."
+              "Para reindexar: rode a indexa\xE7\xE3o no Mac; o iOS recebe o \xEDndice atualizado",
+              "na pr\xF3xima sincroniza\xE7\xE3o do iCloud."
             ].join("\n");
             dbg("[zeus.embed-ios]", msg);
             try {
               await navigator.clipboard.writeText(msg);
             } catch (e) {
             }
-            new Notice("Embed iOS install: instru\xE7\xF5es copiadas pro clipboard. v1.12 entrega relay Mac.", 12e3);
+            new Notice("Embed iOS: \xEDndice \xE9 computado no Mac e sincronizado; iOS busca via JS lanes. Instru\xE7\xF5es no clipboard.", 12e3);
           } catch (e) {
             new Notice("Embed iOS install falhou: " + e.message.slice(0, 150));
           }

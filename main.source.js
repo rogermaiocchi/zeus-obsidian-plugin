@@ -1789,6 +1789,12 @@ class ZeusPassportFindModal extends obsidian.Modal {
           if (p.one_line_summary) {
             card.createEl('div', { cls: 'zeus-passport-card-summary', text: p.one_line_summary });
           }
+          // Cornell cues — perguntas-chave de recuperação
+          if (p.cornell_cue && p.cornell_cue.length) {
+            const cueEl = card.createEl('div', { cls: 'zeus-passport-card-cornell' });
+            cueEl.createEl('span', { cls: 'zeus-cornell-label', text: 'cues: ' });
+            cueEl.createEl('span', { text: p.cornell_cue.slice(0, 3).join(' · ') });
+          }
           const meta = card.createEl('div', { cls: 'zeus-passport-card-meta' });
           if (p.concepts && p.concepts.length) {
             meta.createEl('span', { text: 'concepts: ' + p.concepts.slice(0, 6).join(', ') });
@@ -1798,6 +1804,10 @@ class ZeusPassportFindModal extends obsidian.Modal {
           }
           if (p.difficulty != null) {
             meta.createEl('span', { text: ' | difficulty: ' + p.difficulty });
+          }
+          // Luhmann note type badge
+          if (p.note_type) {
+            meta.createEl('span', { text: ' | ' + p.note_type });
           }
         }
         if (!hits.length) {

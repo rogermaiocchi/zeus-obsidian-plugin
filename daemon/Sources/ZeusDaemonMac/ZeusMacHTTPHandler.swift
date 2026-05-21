@@ -232,16 +232,27 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             var headers = HTTPHeaders()
             headers.add(name: "Access-Control-Allow-Origin", value: "*")
             headers.add(name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS")
-            headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type")
+            headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type, X-Zeus-Allow-Pcc, X-Zeus-Token")
             self.writeRaw(context: context, status: .noContent, headers: headers, body: nil)
             return
         }
 
         // v1.14 — Auth gate (codex CRIT #2/#3). /v1/health aberto para discovery;
-        // todo o resto (incl. /v1/cmd) exige loopback OU X-Zeus-Token válido.
+        // todo o resto exige loopback OU X-Zeus-Token válido.
         if path != "/v1/health" && !Self.isAuthorized(remote: context.remoteAddress, head: head) {
             self.writeJSON(context: context, status: .unauthorized,
                            dict: ["error": "unauthorized: non-loopback request requires valid X-Zeus-Token"])
+            return
+        }
+
+        // v1.15 — codex round 5 (debate iOS): defesa em profundidade para /v1/cmd.
+        // O endpoint de shell é LOOPBACK-ONLY: recusado para qualquer peer remoto
+        // MESMO com token válido. Blast radius alto demais para expor no relay
+        // Tailscale; o relay iOS→Mac precisa só dos endpoints Apple-native, não de
+        // exec de comandos. Mantém a superfície remota = inferência, não shell.
+        if path == "/v1/cmd" && !Self.isLoopback(context.remoteAddress) {
+            self.writeJSON(context: context, status: .forbidden,
+                           dict: ["error": "forbidden: /v1/cmd is loopback-only (não exposto a peers remotos, mesmo com token)"])
             return
         }
 
@@ -3390,7 +3401,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
         headers.add(name: "Content-Type", value: "application/json; charset=utf-8")
         headers.add(name: "Access-Control-Allow-Origin", value: "*")
         headers.add(name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS")
-        headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type, X-Zeus-Allow-Pcc")
+        headers.add(name: "Access-Control-Allow-Headers", value: "Content-Type, X-Zeus-Allow-Pcc, X-Zeus-Token")
         headers.add(name: "Access-Control-Expose-Headers", value: "X-Zeus-Pcc-Possible")
         // v1.2 — PCC telemetry. v1.15 (codex #5): sinaliza que cloud routing era
         // POSSÍVEL para esta response (heurística por carga), não que foi usado —

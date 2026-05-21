@@ -913,6 +913,7 @@ var require_zeus_http_client = __commonJS({
         this.healthCache = null;
         this.healthCheckedAt = 0;
         this.HEALTH_TTL_MS = 3e4;
+        this.authToken = null;
         this.metrics = {
           requests: 0,
           bytesIn: 0,
@@ -987,8 +988,19 @@ var require_zeus_http_client = __commonJS({
         this.baseUrl = (url || "http://127.0.0.1:2223").replace(/\/$/, "");
         this.healthCache = null;
       }
+      // v1.15 — define o token de auth para o daemon remoto (relay). Vazio/null = sem token.
+      setAuthToken(token) {
+        this.authToken = typeof token === "string" && token.trim() ? token.trim() : null;
+      }
       _isLoopbackBaseUrl() {
         return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(this.baseUrl || "");
+      }
+      // v1.15 — header de auth só para requests NÃO-loopback (o daemon trata loopback
+      // como confiável). Sem token configurado, não envia nada (daemon responderá 401
+      // e o usuário verá que precisa configurar o token do peer).
+      _authHeaders() {
+        if (this._isLoopbackBaseUrl() || !this.authToken) return {};
+        return { "X-Zeus-Token": this.authToken };
       }
       _isPrivatePath(path2, payload = {}) {
         if (typeof path2 === "string" && path2) {
@@ -1059,12 +1071,13 @@ var require_zeus_http_client = __commonJS({
           obsidian2 = null;
         }
         const pccHeaders = this._pccHeaders();
+        const authHeaders = this._authHeaders();
         if (obsidian2 && obsidian2.requestUrl) {
           const resp = await obsidian2.requestUrl({
             url,
             method,
             contentType,
-            headers: { "Content-Type": contentType, ...pccHeaders },
+            headers: { "Content-Type": contentType, ...pccHeaders, ...authHeaders },
             body: typeof body === "string" ? body : body ? JSON.stringify(body) : void 0,
             throw: throwOnError
           });
@@ -1074,7 +1087,7 @@ var require_zeus_http_client = __commonJS({
         if (typeof fetch === "function") {
           const resp = await fetch(url, {
             method,
-            headers: { "Content-Type": contentType, ...pccHeaders },
+            headers: { "Content-Type": contentType, ...pccHeaders, ...authHeaders },
             body: body ? typeof body === "string" ? body : JSON.stringify(body) : void 0,
             signal
           });
@@ -5785,6 +5798,25 @@ function _zeusSetMeshPeers(urls) {
   } catch (e) {
   }
 }
+var ZEUS_DAEMON_TOKEN_KEY = "zeus.daemon.token";
+function _zeusGetDaemonToken() {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    const t = window.localStorage.getItem(ZEUS_DAEMON_TOKEN_KEY);
+    return t && t.trim() ? t.trim() : null;
+  } catch (e) {
+    return null;
+  }
+}
+function _zeusSetDaemonToken(token) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    const t = typeof token === "string" ? token.trim() : "";
+    if (!t) window.localStorage.removeItem(ZEUS_DAEMON_TOKEN_KEY);
+    else window.localStorage.setItem(ZEUS_DAEMON_TOKEN_KEY, t);
+  } catch (e) {
+  }
+}
 var ZEUS_LOCAL_DAEMON_KEY = "zeus.daemon.url";
 var ZEUS_LOCAL_DAEMON_TS_KEY = "zeus.daemon.ts";
 var ZEUS_LOCAL_DAEMON_TTL_MS = 12 * 60 * 60 * 1e3;
@@ -7526,6 +7558,13 @@ var ZeusSettingTab = class extends PluginSettingTab {
       });
       t.inputEl.rows = 3;
     });
+    new Setting(containerEl).setName("Token do daemon remoto (local, n\xE3o sincronizado)").setDesc("Token de auth (X-Zeus-Token) enviado APENAS para peers remotos n\xE3o-loopback. Deve ser igual ao env ZEUS_DAEMON_TOKEN do daemon remoto (ex: ZeusDaemonMac no Mac via Tailscale). Guardado s\xF3 neste device (localStorage), nunca em data.json sincronizado. Loopback (daemon local) n\xE3o usa token.").addText((t) => {
+      t.setValue(_zeusGetDaemonToken() || "").setPlaceholder("cole o token do daemon remoto").onChange((v) => {
+        _zeusSetDaemonToken(v);
+        if (this.plugin.httpClient) this.plugin.httpClient.setAuthToken(_zeusGetDaemonToken());
+      });
+      t.inputEl.type = "password";
+    });
     new Setting(containerEl).setName("For\xE7ar redescoberta de daemon agora").setDesc("Limpa cache localStorage e probe 127.0.0.1 + settings + mesh peers (local) em paralelo. Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use ap\xF3s instalar o daemon local ou mover entre redes.").addButton((b) => b.setButtonText("Redescobrir").setCta().onClick(async () => {
       _zeusSetLocalDaemonUrl(null);
       const n = new Notice("Zeus: redescobrindo daemon\u2026", 0);
@@ -7851,6 +7890,7 @@ var ZeusPlugin = class extends Plugin {
         dbg("[zeus] using per-device cached daemon URL:", _initialDaemonUrl, "(settings:", this.settings.zeusDaemonUrl, ")");
       }
       this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
+      this.httpClient.setAuthToken(_zeusGetDaemonToken());
       this.daemonLifecycle = new DaemonLifecycle(this);
       if (isMac()) {
         try {

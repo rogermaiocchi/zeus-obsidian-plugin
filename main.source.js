@@ -406,6 +406,28 @@ function _zeusSetMeshPeers(urls) {
   } catch {}
 }
 
+// v1.15 — token de auth do daemon remoto (relay Tailscale). Per-device em
+// localStorage, NUNCA em data.json (que sincroniza via iCloud) — evita vazar
+// segredo entre devices. Casa com env ZEUS_DAEMON_TOKEN do daemon remoto.
+const ZEUS_DAEMON_TOKEN_KEY = 'zeus.daemon.token';
+
+function _zeusGetDaemonToken() {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    const t = window.localStorage.getItem(ZEUS_DAEMON_TOKEN_KEY);
+    return (t && t.trim()) ? t.trim() : null;
+  } catch { return null; }
+}
+
+function _zeusSetDaemonToken(token) {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    const t = (typeof token === 'string') ? token.trim() : '';
+    if (!t) window.localStorage.removeItem(ZEUS_DAEMON_TOKEN_KEY);
+    else window.localStorage.setItem(ZEUS_DAEMON_TOKEN_KEY, t);
+  } catch {}
+}
+
 // v1.4.1 — Per-device cache: localStorage não é sincronizado via iCloud, então cada device
 // memoriza sua própria URL funcional. Evita re-discovery em todo startup.
 //
@@ -2450,6 +2472,19 @@ class ZeusSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName('Token do daemon remoto (local, não sincronizado)')
+      .setDesc('Token de auth (X-Zeus-Token) enviado APENAS para peers remotos não-loopback. Deve ser igual ao env ZEUS_DAEMON_TOKEN do daemon remoto (ex: ZeusDaemonMac no Mac via Tailscale). Guardado só neste device (localStorage), nunca em data.json sincronizado. Loopback (daemon local) não usa token.')
+      .addText(t => {
+        t.setValue(_zeusGetDaemonToken() || '')
+          .setPlaceholder('cole o token do daemon remoto')
+          .onChange(v => {
+            _zeusSetDaemonToken(v);
+            if (this.plugin.httpClient) this.plugin.httpClient.setAuthToken(_zeusGetDaemonToken());
+          });
+        t.inputEl.type = 'password';
+      });
+
+    new Setting(containerEl)
       .setName('Forçar redescoberta de daemon agora')
       .setDesc('Limpa cache localStorage e probe 127.0.0.1 + settings + mesh peers (local) em paralelo. Loopback (daemon local Apple-nativo) sempre ganha quando responde. Use após instalar o daemon local ou mover entre redes.')
       .addButton(b => b.setButtonText('Redescobrir').setCta().onClick(async () => {
@@ -2944,6 +2979,9 @@ class ZeusPlugin extends Plugin {
       dbg('[zeus] using per-device cached daemon URL:', _initialDaemonUrl, '(settings:', this.settings.zeusDaemonUrl, ')');
     }
     this.httpClient = new ZeusHttpClient(_initialDaemonUrl);
+    // v1.15 — token de auth para daemon remoto (relay Tailscale). Per-device
+    // (localStorage). Loopback ignora o token; só requests não-loopback o enviam.
+    this.httpClient.setAuthToken(_zeusGetDaemonToken());
 
     // v1.5 — Daemon lifecycle: se 127.0.0.1:2223 não responder, plugin sobe
     // bin/ZeusDaemonMac sozinho (autonomia "drop-in" sem launchctl manual).

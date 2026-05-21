@@ -907,9 +907,20 @@ var require_zeus_http_client = __commonJS({
   "lib/zeus-http-client.js"(exports2, module2) {
     "use strict";
     var universal2 = require_universal_fs();
+    var ZEUS_LOOPBACK_DEFAULT = "http://127.0.0.1:2223";
+    function _zeusCoerceLoopback(url) {
+      const u = (url || "").replace(/\/$/, "");
+      if (!u) return ZEUS_LOOPBACK_DEFAULT;
+      if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]|::1)(:\d+)?(\/|$)/i.test(u)) return u;
+      try {
+        console.warn("[zeus] URL n\xE3o-loopback recusada (on-device puro), usando loopback:", u);
+      } catch (_) {
+      }
+      return ZEUS_LOOPBACK_DEFAULT;
+    }
     var ZeusHttpClient2 = class {
       constructor(baseUrl) {
-        this.baseUrl = (baseUrl || "http://127.0.0.1:2223").replace(/\/$/, "");
+        this.baseUrl = _zeusCoerceLoopback(baseUrl);
         this.healthCache = null;
         this.healthCheckedAt = 0;
         this.HEALTH_TTL_MS = 3e4;
@@ -984,7 +995,7 @@ var require_zeus_http_client = __commonJS({
         row.bytesOut += bytesOut;
       }
       setBaseUrl(url) {
-        this.baseUrl = (url || "http://127.0.0.1:2223").replace(/\/$/, "");
+        this.baseUrl = _zeusCoerceLoopback(url);
         this.healthCache = null;
       }
       _isLoopbackBaseUrl() {
@@ -5822,7 +5833,7 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
   const winners = results.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
   if (winners.length === 0) {
     console.warn("[zeus] adaptive daemon discovery \u2192 NENHUM daemon local respondeu");
-    return plugin.settings.zeusDaemonUrl;
+    return _zeusIsLoopback(plugin.settings.zeusDaemonUrl) ? plugin.settings.zeusDaemonUrl : "http://127.0.0.1:2223";
   }
   const loopback = winners.find((w) => w.loopback);
   const chosen = loopback || winners.sort((a, b) => a.idx - b.idx)[0];

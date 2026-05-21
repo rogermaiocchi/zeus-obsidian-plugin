@@ -458,7 +458,8 @@ async function discoverDaemonUrl(plugin, candidates = null, probeTimeoutMs = 150
 
   if (winners.length === 0) {
     console.warn('[zeus] adaptive daemon discovery → NENHUM daemon local respondeu');
-    return plugin.settings.zeusDaemonUrl;  // mantém o default para tentar de novo depois
+    // on-device puro: volta ao loopback default (nunca uma URL remota legada).
+    return _zeusIsLoopback(plugin.settings.zeusDaemonUrl) ? plugin.settings.zeusDaemonUrl : 'http://127.0.0.1:2223';
   }
 
   // Prioriza loopback (on-device); loopback sempre vence (on-device puro).

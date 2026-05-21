@@ -987,6 +987,23 @@ var require_zeus_http_client = __commonJS({
         this.baseUrl = (url || "http://127.0.0.1:2223").replace(/\/$/, "");
         this.healthCache = null;
       }
+      _isLoopbackBaseUrl() {
+        return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(this.baseUrl || "");
+      }
+      _isPrivatePath(path2, payload = {}) {
+        if (!path2 || typeof path2 !== "string") return false;
+        if (/^Clientes\//i.test(path2.replace(/^\/+/, ""))) return true;
+        if (payload && payload.privacy && /sigiloso/i.test(String(payload.privacy))) return true;
+        return false;
+      }
+      _assertRawContentAllowed(endpoint, options = {}) {
+        const privacyPath = options._privacyPath || options.privacyPath || options.path || null;
+        if (!this._isLoopbackBaseUrl() && this._isPrivatePath(privacyPath, options)) {
+          throw new Error(
+            `privacy-gate: ${endpoint} recusou enviar conte\xFAdo sigiloso para daemon remoto (${this.baseUrl})`
+          );
+        }
+      }
       // Lazy health check — cached for HEALTH_TTL_MS
       // v1.4.1 — timeoutMs (default 1500ms): probes precisam falhar rápido em URLs mortas
       // para que discovery cross-device funcione sem travar Obsidian no startup.
@@ -1030,7 +1047,7 @@ var require_zeus_http_client = __commonJS({
         return used;
       }
       // Try to load Obsidian's requestUrl from the obsidian module; fallback to fetch on Node
-      async _requestUrl({ url, method = "GET", body, contentType = "application/json", throw: throwOnError = true }) {
+      async _requestUrl({ url, method = "GET", body, contentType = "application/json", throw: throwOnError = true, signal = null }) {
         let obsidian2;
         try {
           obsidian2 = require("obsidian");
@@ -1054,7 +1071,8 @@ var require_zeus_http_client = __commonJS({
           const resp = await fetch(url, {
             method,
             headers: { "Content-Type": contentType, ...pccHeaders },
-            body: body ? typeof body === "string" ? body : JSON.stringify(body) : void 0
+            body: body ? typeof body === "string" ? body : JSON.stringify(body) : void 0,
+            signal
           });
           this._readPccUsed(resp.headers);
           const text = await resp.text();
@@ -1075,15 +1093,26 @@ var require_zeus_http_client = __commonJS({
           abort() {
           }
         })();
-        const timer = setTimeout(() => ctrl.abort && ctrl.abort(), timeoutMs);
+        let timer = null;
         const bodyStr = typeof body === "string" ? body : body ? JSON.stringify(body) : "";
         const bytesOut = bodyStr ? universal2.byteLength(bodyStr) : 0;
         try {
-          const resp = await this._requestUrl({
+          const request = this._requestUrl({
             url: `${this.baseUrl}${endpoint}`,
             method: "POST",
-            body: bodyStr
+            body: bodyStr,
+            signal: ctrl.signal
           });
+          const timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              try {
+                if (ctrl.abort) ctrl.abort();
+              } catch (e) {
+              }
+              reject(new Error(`Daemon ${endpoint}: timeout ap\xF3s ${timeoutMs}ms`));
+            }, timeoutMs);
+          });
+          const resp = await Promise.race([request, timeout]);
           const respText = resp.text || (resp.json ? JSON.stringify(resp.json) : "");
           const bytesIn = respText ? universal2.byteLength(respText) : 0;
           this._recordMetric(endpoint, bytesOut, bytesIn);
@@ -1098,7 +1127,9 @@ var require_zeus_http_client = __commonJS({
       }
       // High-level API mirroring afm CLI subcommands
       async embed(text, options = {}) {
-        return await this._post("/v1/embed", { text, ...options });
+        const { _privacyPath, privacyPath, privacy, ...wireOptions } = options || {};
+        this._assertRawContentAllowed("/v1/embed", { _privacyPath, privacyPath, privacy });
+        return await this._post("/v1/embed", { text, ...wireOptions });
       }
       // v1.3.0 — afm refine (Writing Tools nativo)
       // mode: "proofread|rewrite|simplify"; tone para rewrite: "academic|professional|casual"
@@ -1221,16 +1252,30 @@ var require_zeus_http_client = __commonJS({
       // mode: 'spotlight' | 'stale' | 'unindexed' | 'mdfind-fallback' | 'error'
       // (padrão inspirado em maiocchi-ia/skills/tripla-fusao/scripts/bm25.py
       //  — fallback honesto declarado em vez de scores silenciosos vazios)
-      async spotlightQueryNative(query, scope = null, limit = 50) {
+      async spotlightQueryNative(query, scope = null, limit = 50, domainHint = null) {
+        let resolvedDomainHint = domainHint;
+        if (!resolvedDomainHint && scope) {
+          try {
+            const hex = await universal2.sha256Hex(scope);
+            resolvedDomainHint = "com.maiocchi.zeus." + hex.slice(0, 16);
+          } catch (e) {
+          }
+        }
+        const body = { query, scope, limit };
+        if (resolvedDomainHint) body.domain_hint = resolvedDomainHint;
         try {
-          const r = await this._post("/v1/spotlight/query", { query, scope, limit }, 15e3);
+          const r = await this._post("/v1/spotlight/query", body, 15e3);
           return { ...r, mode: "spotlight" };
         } catch (e) {
+          const nativeMessage = e.message || String(e);
+          if (/domain_hint obrigat[oó]rio|unsupported_on_aegis_daemon/i.test(nativeMessage)) {
+            return { mode: "error", error: nativeMessage, results: [] };
+          }
           try {
             const r = await this.spotlightSearch(query, scope, limit);
-            return { ...r, mode: "mdfind-fallback", native_error: e.message.slice(0, 200) };
+            return { ...r, mode: "mdfind-fallback", native_error: nativeMessage.slice(0, 200) };
           } catch (e2) {
-            return { mode: "error", error: e2.message, native_error: e.message, results: [] };
+            return { mode: "error", error: e2.message, native_error: nativeMessage, results: [] };
           }
         }
       }
@@ -4335,13 +4380,13 @@ var require_embed_ios = __commonJS({
        * Sucesso → retorna {ok: true, vec, dim, model, source}
        * Falha → retorna {ok: false, reason}  (não lança — gracioso)
        */
-      async tryEmbed(text) {
+      async tryEmbed(text, options = {}) {
         if (!this.plugin.httpClient) return { ok: false, reason: "no-httpClient" };
         if (!text || text.length < 2) return { ok: false, reason: "text-too-short" };
         try {
           const available = await this.plugin.httpClient.isAvailable(1500);
           if (!available) return { ok: false, reason: "daemon-unreachable" };
-          const r = await this.plugin.httpClient.embed(text);
+          const r = await this.plugin.httpClient.embed(text, options);
           const vec = r && r.vectors && r.vectors[0] || r && r.vector || null;
           if (!Array.isArray(vec) || vec.length !== EMBED_MAC_DIM) {
             return { ok: false, reason: `dim-mismatch: ${vec ? vec.length : "null"}` };
@@ -5549,7 +5594,7 @@ var DEFAULT_SETTINGS = {
   // (ZeusDaemonMac no macOS, AegisDaemon no iOS). Quando ON, discovery cai para
   // Tailscale mesh apenas se o daemon local não responder. Quando OFF, Tailscale
   // mesh nunca é tentado — modo strict on-device (melhor privacidade + latência).
-  allowRemoteDaemonFallback: true,
+  allowRemoteDaemonFallback: false,
   // v0.7.0 — full Apple ecosystem coverage
   imagesIndexFeaturePrint: false,
   // se ON, comandos de indexação de imagens populam data/image-features.jsonl
@@ -8272,7 +8317,8 @@ Ou desative "Permitir fallback remoto" para for\xE7ar modo strict on-device.`, 1
           if (!query || !query.trim()) return;
           const n = new Notice("Spotlight searching\u2026", 0);
           try {
-            const r = await this.httpClient.spotlightQueryNative(query, this.vaultRoot, 50);
+            const domainHint = this._deriveSpotlightDomain ? await this._deriveSpotlightDomain() : null;
+            const r = await this.httpClient.spotlightQueryNative(query, this.vaultRoot, 50, domainHint);
             n.hide();
             const results = r && (r.results || r.matches || r.hits) || [];
             if (r && r.mode === "mdfind-fallback") {
@@ -8594,7 +8640,12 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
             const content = await this.app.vault.read(file);
             const reachable = await this.httpClient.isAvailable();
             if (!reachable) return;
-            const resp = await this.httpClient.embed(content.slice(0, 4e3));
+            const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+            if (remote && IoQueue.isPrivatePath(rel)) {
+              console.warn("[zeus] real-time embed blocked by privacy gate:", rel, this.httpClient.baseUrl);
+              return;
+            }
+            const resp = await this.httpClient.embed(content.slice(0, 4e3), { _privacyPath: rel });
             if (resp && resp.vectors && resp.vectors[0]) {
               const sha = await universal.sha256Hex(content);
               const entry = { path: rel, sha, mtime: Date.now(), title: file.basename, vec: resp.vectors[0] };
@@ -8647,7 +8698,12 @@ Claims ativos: ${c.total || 0} (${c.expired || 0} expired) \xB7 device ${c.thisD
               );
               return;
             }
-            const resp = await this.httpClient.embed(tr.text.slice(0, 4e3));
+            const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+            if (remote && IoQueue.isPrivatePath(rel)) {
+              console.warn("[zeus] audio embed blocked by privacy gate:", rel, this.httpClient.baseUrl);
+              return;
+            }
+            const resp = await this.httpClient.embed(tr.text.slice(0, 4e3), { _privacyPath: rel });
             if (resp && resp.vectors && resp.vectors[0]) {
               const sha = await universal.sha256Hex(tr.text);
               const entry = {

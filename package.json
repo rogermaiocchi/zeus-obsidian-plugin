@@ -8,6 +8,7 @@
     "build:release": "node scripts/build-release.mjs",
     "check": "node scripts/check-project.mjs",
     "doctor": "node scripts/zeus-doctor.mjs",
+    "package:release": "node scripts/package-release.mjs",
     "smoke": "node scripts/zeus-smoke.mjs"
   },
   "devDependencies": {

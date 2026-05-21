@@ -22,7 +22,7 @@ public enum AegisFMCaptureMiddleware {
     #if os(macOS)
     private static let queue = DispatchQueue(label: "org.maiocchi.aegis.fm-capture",
                                              qos: .utility, attributes: [])
-    private static var bufferURL: URL = {
+    private static let bufferURL: URL = {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let dir = home.appendingPathComponent("Datasets/apple-twin", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -46,24 +46,25 @@ public enum AegisFMCaptureMiddleware {
         guard FileManager.default.fileExists(atPath: enabledFlagURL.path) else {
             return  // captura só roda se o flag-file existir (opt-in explícito)
         }
+        let record: [String: Any] = [
+            "id": UUID().uuidString,
+            "task": task,
+            "input": input,
+            "output": output,
+            "provider": provider,
+            "model_source": model,
+            "captured_at": ISO8601DateFormatter().string(from: Date()),
+            "origin": "fm-capture-middleware"
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: record,
+                                                      options: [.fragmentsAllowed, .sortedKeys]) else { return }
+        let targetURL = bufferURL
         queue.async {
-            let record: [String: Any] = [
-                "id": UUID().uuidString,
-                "task": task,
-                "input": input,
-                "output": output,
-                "provider": provider,
-                "model_source": model,
-                "captured_at": ISO8601DateFormatter().string(from: Date()),
-                "origin": "fm-capture-middleware"
-            ]
-            guard let data = try? JSONSerialization.data(withJSONObject: record,
-                                                          options: [.fragmentsAllowed, .sortedKeys]) else { return }
             do {
-                if !FileManager.default.fileExists(atPath: bufferURL.path) {
-                    FileManager.default.createFile(atPath: bufferURL.path, contents: nil)
+                if !FileManager.default.fileExists(atPath: targetURL.path) {
+                    FileManager.default.createFile(atPath: targetURL.path, contents: nil)
                 }
-                let fh = try FileHandle(forWritingTo: bufferURL)
+                let fh = try FileHandle(forWritingTo: targetURL)
                 defer { try? fh.close() }
                 try fh.seekToEnd()
                 fh.write(data)

@@ -101,7 +101,7 @@ fflush(stdout)
 // MARK: - Signal handling for graceful shutdown
 
 let shutdownLock = NSLock()
-var didShutdown = false
+nonisolated(unsafe) var didShutdown = false
 
 func gracefulShutdown(reason: String) {
     shutdownLock.lock()

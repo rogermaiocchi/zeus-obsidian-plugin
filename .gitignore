@@ -15,6 +15,9 @@ data/
 # Swift daemon build artifacts
 daemon/.build/
 
+# Release archives are generated/published artifacts, not source of truth
+dist/
+
 # Dependencias de build JS (esbuild)
 node_modules/
 

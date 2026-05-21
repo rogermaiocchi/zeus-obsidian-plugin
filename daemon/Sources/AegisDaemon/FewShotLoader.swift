@@ -130,7 +130,7 @@ public enum FewShotTask: String, CaseIterable, Sendable {
 public enum FewShotLoader {
 
     /// Cache em memória — carrega lazy uma vez por task.
-    private static var cache: [FewShotTask: FewShotPack] = [:]
+    nonisolated(unsafe) private static var cache: [FewShotTask: FewShotPack] = [:]
     private static let lock = NSLock()
 
     public static func load(_ task: FewShotTask) -> FewShotPack? {

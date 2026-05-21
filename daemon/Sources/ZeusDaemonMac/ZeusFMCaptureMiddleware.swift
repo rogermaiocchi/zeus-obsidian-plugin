@@ -37,24 +37,25 @@ public enum ZeusFMCaptureMiddleware {
                                output: Any,
                                model: String) {
         guard FileManager.default.fileExists(atPath: enabledFlagURL.path) else { return }
+        let record: [String: Any] = [
+            "id": UUID().uuidString,
+            "task": task,
+            "input": input,
+            "output": output,
+            "provider": "apple-intelligence",
+            "model_source": model,
+            "captured_at": ISO8601DateFormatter().string(from: Date()),
+            "origin": "zeus-fm-capture-middleware"
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: record,
+                                                      options: [.fragmentsAllowed, .sortedKeys]) else { return }
+        let targetURL = bufferURL
         queue.async {
-            let record: [String: Any] = [
-                "id": UUID().uuidString,
-                "task": task,
-                "input": input,
-                "output": output,
-                "provider": "apple-intelligence",
-                "model_source": model,
-                "captured_at": ISO8601DateFormatter().string(from: Date()),
-                "origin": "zeus-fm-capture-middleware"
-            ]
-            guard let data = try? JSONSerialization.data(withJSONObject: record,
-                                                          options: [.fragmentsAllowed, .sortedKeys]) else { return }
             do {
-                if !FileManager.default.fileExists(atPath: bufferURL.path) {
-                    FileManager.default.createFile(atPath: bufferURL.path, contents: nil)
+                if !FileManager.default.fileExists(atPath: targetURL.path) {
+                    FileManager.default.createFile(atPath: targetURL.path, contents: nil)
                 }
-                let fh = try FileHandle(forWritingTo: bufferURL)
+                let fh = try FileHandle(forWritingTo: targetURL)
                 defer { try? fh.close() }
                 try fh.seekToEnd()
                 fh.write(data)

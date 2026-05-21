@@ -61,7 +61,7 @@ public protocol MLXAppleTwinProviding {
 
 public enum MLXAppleTwinProvider {
     /// Provider concreto wired no startup do daemon iOS. `nil` no macOS (Apple Intelligence cobre).
-    public static var shared: MLXAppleTwinProviding?
+    nonisolated(unsafe) public static var shared: MLXAppleTwinProviding?
 }
 
 public enum MLXAppleTwinError: LocalizedError {

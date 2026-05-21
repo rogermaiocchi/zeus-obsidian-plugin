@@ -248,7 +248,7 @@ const DEFAULT_SETTINGS = {
   // (ZeusDaemonMac no macOS, AegisDaemon no iOS). Quando ON, discovery cai para
   // Tailscale mesh apenas se o daemon local não responder. Quando OFF, Tailscale
   // mesh nunca é tentado — modo strict on-device (melhor privacidade + latência).
-  allowRemoteDaemonFallback: true,
+  allowRemoteDaemonFallback: false,
   // v0.7.0 — full Apple ecosystem coverage
   imagesIndexFeaturePrint: false,           // se ON, comandos de indexação de imagens populam data/image-features.jsonl
   autoLanguageDetectOnSave: false,          // detecta língua na nota ativa ao salvar e adiciona ao frontmatter (`lang:`)
@@ -3456,7 +3456,8 @@ class ZeusPlugin extends Plugin {
         try {
           // codex MED B/E: nome do comando diz CSSearchQuery — usa endpoint
           // nativo com fallback gracioso, declara mode.
-          const r = await this.httpClient.spotlightQueryNative(query, this.vaultRoot, 50);
+          const domainHint = this._deriveSpotlightDomain ? await this._deriveSpotlightDomain() : null;
+          const r = await this.httpClient.spotlightQueryNative(query, this.vaultRoot, 50, domainHint);
           n.hide();
           const results = (r && (r.results || r.matches || r.hits)) || [];
           if (r && r.mode === 'mdfind-fallback') {
@@ -3792,7 +3793,12 @@ class ZeusPlugin extends Plugin {
           const content = await this.app.vault.read(file);
           const reachable = await this.httpClient.isAvailable();
           if (!reachable) return;
-          const resp = await this.httpClient.embed(content.slice(0, 4000));
+          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+          if (remote && IoQueue.isPrivatePath(rel)) {
+            console.warn('[zeus] real-time embed blocked by privacy gate:', rel, this.httpClient.baseUrl);
+            return;
+          }
+          const resp = await this.httpClient.embed(content.slice(0, 4000), { _privacyPath: rel });
           if (resp && resp.vectors && resp.vectors[0]) {
             // Update in-memory + on-disk
             const sha = await universal.sha256Hex(content);
@@ -3850,7 +3856,12 @@ class ZeusPlugin extends Plugin {
           }
 
           // Embed transcript
-          const resp = await this.httpClient.embed(tr.text.slice(0, 4000));
+          const remote = !_zeusIsLoopback(this.httpClient.baseUrl);
+          if (remote && IoQueue.isPrivatePath(rel)) {
+            console.warn('[zeus] audio embed blocked by privacy gate:', rel, this.httpClient.baseUrl);
+            return;
+          }
+          const resp = await this.httpClient.embed(tr.text.slice(0, 4000), { _privacyPath: rel });
           if (resp && resp.vectors && resp.vectors[0]) {
             const sha = await universal.sha256Hex(tr.text);
             const entry = {

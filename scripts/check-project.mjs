@@ -103,8 +103,9 @@ function main() {
     throw new Error(`bin/ZeusDaemonMac suspeito (${stat.size}B) — esperado >1MB`);
   }
 
-  run('swift', ['build', '-c', 'debug', '--product', 'ZeusDaemonMac'], { cwd: join(root, 'daemon') });
-  run('swift', ['build', '-c', 'debug', '--target', 'AegisDaemon'], { cwd: join(root, 'daemon') });
+  const strictConcurrency = ['-Xswiftc', '-strict-concurrency=complete', '-Xswiftc', '-warnings-as-errors'];
+  run('swift', ['build', '-c', 'debug', '--product', 'ZeusDaemonMac', ...strictConcurrency], { cwd: join(root, 'daemon') });
+  run('swift', ['build', '-c', 'debug', '--target', 'AegisDaemon', ...strictConcurrency], { cwd: join(root, 'daemon') });
 
   console.log('[check-project] OK');
 }

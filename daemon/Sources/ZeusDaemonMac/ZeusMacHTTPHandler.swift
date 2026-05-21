@@ -14,8 +14,8 @@
 // retornam 503 com mensagem clara.
 
 import Foundation
-import NIOCore
-import NIOHTTP1
+@preconcurrency import NIOCore
+@preconcurrency import NIOHTTP1
 import NaturalLanguage
 #if canImport(Vision)
 import Vision
@@ -78,7 +78,85 @@ fileprivate final class SpotlightItemsBox: @unchecked Sendable {
     }
 }
 
-final class ZeusMacHTTPHandler: ChannelInboundHandler {
+private final class OneShotFlagBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var used = false
+
+    func take() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if used { return false }
+        used = true
+        return true
+    }
+
+    var isUsed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return used
+    }
+}
+
+private final class DoubleBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Double
+
+    init(_ value: Double) {
+        self.value = value
+    }
+
+    func set(_ newValue: Double) {
+        lock.lock(); defer { lock.unlock() }
+        value = newValue
+    }
+
+    func get() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
+private final class StringBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    init(_ value: String? = nil) {
+        self.value = value
+    }
+
+    func set(_ newValue: String?) {
+        lock.lock(); defer { lock.unlock() }
+        value = newValue
+    }
+
+    func get() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
+private final class ErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Error?
+
+    func set(_ newValue: Error?) {
+        lock.lock(); defer { lock.unlock() }
+        value = newValue
+    }
+
+    func get() -> Error? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
+private final class ChannelContextBox: @unchecked Sendable {
+    let context: ChannelHandlerContext
+
+    init(_ context: ChannelHandlerContext) {
+        self.context = context
+    }
+}
+
+final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
@@ -141,20 +219,20 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let pccPermission = PccPermission.fromHeader(pccHeaderValue)
 
         // Off the event loop: NL / Vision / FoundationModels podem bloquear.
-        let capturedContext = context
+        let capturedContext = ChannelContextBox(context)
         let capturedSelf = self
         Thread.detachNewThread {
             let result = capturedSelf.route(method: method, path: path, body: bodyString, pcc: pccPermission)
-            capturedContext.eventLoop.execute {
-                guard capturedContext.channel.isActive else { return }
-                capturedSelf.writeJSON(context: capturedContext, status: result.status, dict: result.payload, pccUsed: result.pccUsed)
+            capturedContext.context.eventLoop.execute {
+                guard capturedContext.context.channel.isActive else { return }
+                capturedSelf.writeJSON(context: capturedContext.context, status: result.status, dict: result.payload, pccUsed: result.pccUsed)
             }
         }
     }
 
     // MARK: - Routing
 
-    private struct Response {
+    private struct Response: @unchecked Sendable {
         let status: HTTPResponseStatus
         let payload: [String: Any]
         // v1.2 — Apple Cloud Private (PCC) telemetry
@@ -822,25 +900,25 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     options = GenerationOptions(maximumResponseTokens: maxTokens)
                 }
                 let sem = DispatchSemaphore(value: 0)
-                var resultText: String = ""
-                var resultError: Error? = nil
+                let resultText = StringBox("")
+                let resultError = ErrorBox()
                 Task {
                     do {
                         let resp = try await session.respond(to: instruction, options: options)
-                        resultText = resp.content
+                        resultText.set(resp.content)
                     } catch {
-                        resultError = error
+                        resultError.set(error)
                     }
                     sem.signal()
                 }
                 _ = sem.wait(timeout: .now() + .seconds(120))
-                if let err = resultError {
+                if let err = resultError.get() {
                     return Response(status: .internalServerError, payload: [
                         "error": "FoundationModels falhou: \(err)"
                     ])
                 }
                 return Response(status: .ok, payload: [
-                    "output": resultText,
+                    "output": resultText.get() ?? "",
                     "model": "apple-foundationmodels-systemlanguagemodel",
                     "deterministic": deterministic,
                     "max_tokens": maxTokens,
@@ -1027,24 +1105,24 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         }
 
         let sem = DispatchSemaphore(value: 0)
-        var resultText = ""
-        var resultError: String? = nil
+        let resultText = StringBox("")
+        let resultError = StringBox(nil)
         let onDeviceUsed = recognizer.supportsOnDeviceRecognition
 
         let task = recognizer.recognitionTask(with: request) { (result, error) in
             if let err = error as NSError? {
                 // SFSpeechErrorCode 1700 = "No speech detected" — não é erro real
                 if err.domain == "kAFAssistantErrorDomain" && err.code == 1700 {
-                    resultText = ""
+                    resultText.set("")
                 } else {
-                    resultError = "SFSpeechRecognizer falhou: \(err.localizedDescription) [\(err.domain) \(err.code)]"
+                    resultError.set("SFSpeechRecognizer falhou: \(err.localizedDescription) [\(err.domain) \(err.code)]")
                 }
                 sem.signal()
                 return
             }
             guard let result = result else { return }
             if result.isFinal {
-                resultText = result.bestTranscription.formattedString
+                resultText.set(result.bestTranscription.formattedString)
                 sem.signal()
             }
         }
@@ -1059,11 +1137,11 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
             ])
         }
 
-        if let err = resultError {
+        if let err = resultError.get() {
             return Response(status: .internalServerError, payload: ["error": err])
         }
         return Response(status: .ok, payload: [
-            "text": resultText,
+            "text": resultText.get() ?? "",
             "duration_seconds": durationSeconds,
             "locale": localeID,
             "on_device": onDeviceUsed,
@@ -1088,9 +1166,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         durationSeconds: Double
     ) -> Response? {
         let sem = DispatchSemaphore(value: 0)
-        var resultText = ""
-        var resultError: String? = nil
-        var assetInstalled = false
+        let resultText = StringBox("")
+        let resultError = StringBox(nil)
+        let assetInstalled = OneShotFlagBox()
 
         Task {
             do {
@@ -1098,14 +1176,14 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 let bcp47 = locale.identifier(.bcp47)
 
                 guard SpeechTranscriber.isAvailable else {
-                    resultError = "SpeechTranscriber.isAvailable=false"
+                    resultError.set("SpeechTranscriber.isAvailable=false")
                     sem.signal()
                     return
                 }
 
                 let supportedLocales = await SpeechTranscriber.supportedLocales
                 guard supportedLocales.contains(where: { $0.identifier(.bcp47) == bcp47 }) else {
-                    resultError = "locale \(bcp47) não suportado por SpeechTranscriber"
+                    resultError.set("locale \(bcp47) não suportado por SpeechTranscriber")
                     sem.signal()
                     return
                 }
@@ -1125,9 +1203,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 if needsInstall {
                     if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
                         try await request.downloadAndInstall()
-                        assetInstalled = true
+                        _ = assetInstalled.take()
                     } else {
-                        resultError = "asset não disponível para download (\(bcp47))"
+                        resultError.set("asset não disponível para download (\(bcp47))")
                         sem.signal()
                         return
                     }
@@ -1161,7 +1239,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 // sample-rate change; callback chunked tem race conditions).
                 let totalFrames = AVAudioFrameCount(audioFile.length)
                 guard let fullInput = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: totalFrames) else {
-                    resultError = "falha alocando AVAudioPCMBuffer (\(totalFrames) frames)"
+                    resultError.set("falha alocando AVAudioPCMBuffer (\(totalFrames) frames)")
                     sem.signal()
                     return
                 }
@@ -1172,19 +1250,18 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
                     let outFrames = AVAudioFrameCount(Double(fullInput.frameLength) * ratio) + 4096
                     guard let fullOutput = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else {
-                        resultError = "falha alocando output PCM buffer"
+                        resultError.set("falha alocando output PCM buffer")
                         sem.signal()
                         return
                     }
                     // Callback fornece o input uma vez, depois sinaliza fim de stream.
-                    var fed = false
+                    let fed = OneShotFlagBox()
                     var convErr: NSError?
                     converter.convert(to: fullOutput, error: &convErr) { _, statusPtr in
-                        if fed {
+                        if !fed.take() {
                             statusPtr.pointee = .endOfStream
                             return nil
                         }
-                        fed = true
                         statusPtr.pointee = .haveData
                         return fullInput
                     }
@@ -1203,9 +1280,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 try await analyzer.finalizeAndFinishThroughEndOfInput()
 
                 // Coleta transcript do reader.
-                resultText = try await reader.value
+                resultText.set(try await reader.value)
             } catch {
-                resultError = "SpeechAnalyzer falhou: \(error)"
+                resultError.set("SpeechAnalyzer falhou: \(error)")
             }
             sem.signal()
         }
@@ -1218,18 +1295,18 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 "error": "SpeechAnalyzer timeout (\(Int(timeoutSec))s — possível asset download em curso)"
             ])
         }
-        if resultError != nil {
+        if let err = resultError.get() {
             // Sinaliza ao caller que SA falhou — caller decide fallback.
-            FileHandle.standardError.write(Data("[ZeusDaemonMac] SA fallback: \(resultError ?? "")\n".utf8))
+            FileHandle.standardError.write(Data("[ZeusDaemonMac] SA fallback: \(err)\n".utf8))
             return nil
         }
         return Response(status: .ok, payload: [
-            "text": resultText,
+            "text": resultText.get() ?? "",
             "duration_seconds": durationSeconds,
             "locale": localeID,
             "on_device": true,
             "engine_used": "sa",
-            "asset_just_installed": assetInstalled,
+            "asset_just_installed": assetInstalled.isUsed,
             "model": "apple-speechanalyzer-speechtranscriber",
             "task": "asp_transcribe"
         ])
@@ -1850,7 +1927,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let difficulty = self.computeDifficulty(text: truncated)
 
         // 3 + 4) Summary and domain via FoundationModels
-        var oneLineSummary = ""
+        let oneLineSummary = StringBox("")
         var domain: [String] = []
 
         #if canImport(FoundationModels)
@@ -1864,7 +1941,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 let sumSem = DispatchSemaphore(value: 0)
                 Task {
                     if let resp = try? await sumSession.respond(to: truncated, options: sumOptions) {
-                        oneLineSummary = resp.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                        oneLineSummary.set(resp.content.trimmingCharacters(in: .whitespacesAndNewlines))
                     }
                     sumSem.signal()
                 }
@@ -1882,19 +1959,20 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                     let clsSession = LanguageModelSession(instructions: clsInstructions)
                     let clsOptions = GenerationOptions(temperature: 0.0, maximumResponseTokens: 120)
                     let clsSem = DispatchSemaphore(value: 0)
-                    var clsRaw = ""
+                    let clsRaw = StringBox("")
                     Task {
                         if let resp = try? await clsSession.respond(to: truncated, options: clsOptions) {
-                            clsRaw = resp.content
+                            clsRaw.set(resp.content)
                         }
                         clsSem.signal()
                     }
                     _ = clsSem.wait(timeout: .now() + .seconds(30))
 
                     // Parse array
-                    if let start = clsRaw.firstIndex(of: "["),
-                       let end = clsRaw.lastIndex(of: "]"), start < end {
-                        let candidate = String(clsRaw[start...end])
+                    let clsRawValue = clsRaw.get() ?? ""
+                    if let start = clsRawValue.firstIndex(of: "["),
+                       let end = clsRawValue.lastIndex(of: "]"), start < end {
+                        let candidate = String(clsRawValue[start...end])
                         if let data = candidate.data(using: .utf8),
                            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String] {
                             // Filter to only allowed options (case-insensitive match)
@@ -1925,7 +2003,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         let result = PassportResult(
             path: path,
             concepts: concepts,
-            oneLineSummary: oneLineSummary,
+            oneLineSummary: oneLineSummary.get() ?? "",
             domain: domain,
             difficulty: difficulty,
             extractedAt: extractedAt,
@@ -2472,25 +2550,25 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 let session = LanguageModelSession(instructions: instructions)
                 let options = GenerationOptions(maximumResponseTokens: maxTokens)
                 let sem = DispatchSemaphore(value: 0)
-                var resultText: String = ""
-                var resultError: Error? = nil
+                let resultText = StringBox("")
+                let resultError = ErrorBox()
                 Task {
                     do {
                         let resp = try await session.respond(to: prompt, options: options)
-                        resultText = resp.content
+                        resultText.set(resp.content)
                     } catch {
-                        resultError = error
+                        resultError.set(error)
                     }
                     sem.signal()
                 }
                 _ = sem.wait(timeout: .now() + .seconds(120))
-                if let err = resultError {
+                if let err = resultError.get() {
                     return Response(status: .internalServerError, payload: [
                         "error": "FoundationModels falhou: \(err)"
                     ])
                 }
                 var payload: [String: Any] = [
-                    "text": resultText,
+                    "text": resultText.get() ?? "",
                     "model": "apple-foundationmodels-systemlanguagemodel",
                     "provider": "apple-intelligence",
                     "pcc_permission": "\(pcc)",
@@ -2502,7 +2580,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
                 ZeusFMCaptureMiddleware.capture(
                     task: taskName,
                     input: ["instructions": instructions, "prompt": prompt, "max_tokens": maxTokens],
-                    output: resultText,
+                    output: resultText.get() ?? "",
                     model: "apple-foundationmodels-systemlanguagemodel"
                 )
                 return Response(status: .ok, payload: payload, pccUsed: pccUsed)
@@ -2556,28 +2634,28 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         #if canImport(Translation)
         if #available(macOS 26.0, *) {
             let sem = DispatchSemaphore(value: 0)
-            var translated: String = ""
-            var errMsg: String? = nil
+            let translated = StringBox("")
+            let errMsg = StringBox(nil)
             Task {
                 do {
                     let session = TranslationSession(installedSource: Locale.Language(identifier: sourceLang),
                                                      target: Locale.Language(identifier: targetLang))
                     let resp = try await session.translate(text)
-                    translated = resp.targetText
+                    translated.set(resp.targetText)
                 } catch {
-                    errMsg = "\(error)"
+                    errMsg.set("\(error)")
                 }
                 sem.signal()
             }
             _ = sem.wait(timeout: .now() + .seconds(30))
-            if let err = errMsg {
+            if let err = errMsg.get() {
                 return Response(status: .internalServerError, payload: [
                     "error": "Translation falhou: \(err)",
                     "note": "TranslationSession headless pode exigir modelos pré-baixados via Settings → Languages & Region → Translation"
                 ])
             }
             return Response(status: .ok, payload: [
-                "translated_text": translated,
+                "translated_text": translated.get() ?? "",
                 "source_lang": sourceLang,
                 "target_lang": targetLang,
                 "model": "apple-translation-framework"
@@ -3111,9 +3189,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         // codex MED A: CSSearchableIndex(name:) isolado — query precisa rodar
         // no mesmo índice em que foi indexado.
         let index = CSSearchableIndex(name: domainHint)
-        let csQuery = CSSearchQuery(queryString: predicate, attributes: [
-            "title", "contentDescription", "keywords", "identifier"
-        ])
+        let queryContext = CSSearchQueryContext()
+        queryContext.fetchAttributes = ["title", "contentDescription", "keywords", "identifier"]
+        let csQuery = CSSearchQuery(queryString: predicate, queryContext: queryContext)
         // CSSearchQuery não aceita `index` diretamente — `default()` é o root.
         // CSSearchableIndex(name:) cria um índice nomeado que populamos, mas a
         // query sempre roda sobre o root. A separação por nome só vale para
@@ -3243,15 +3321,15 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
 
     private static func durationSeconds(for asset: AVURLAsset) -> Double {
         let sem = DispatchSemaphore(value: 0)
-        var seconds = Double.nan
+        let seconds = DoubleBox(Double.nan)
         Task {
             if let duration = try? await asset.load(.duration) {
-                seconds = CMTimeGetSeconds(duration)
+                seconds.set(CMTimeGetSeconds(duration))
             }
             sem.signal()
         }
         _ = sem.wait(timeout: .now() + .seconds(5))
-        return seconds
+        return seconds.get()
     }
 
     private func writeJSON(context: ChannelHandlerContext, status: HTTPResponseStatus, dict: [String: Any], pccUsed: Bool = false) {
@@ -3286,8 +3364,9 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler {
         if let body = body {
             context.write(self.wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
         }
+        let capturedContext = ChannelContextBox(context)
         context.writeAndFlush(self.wrapOutboundOut(.end(nil))).whenComplete { _ in
-            context.close(promise: nil)
+            capturedContext.context.close(promise: nil)
         }
     }
 

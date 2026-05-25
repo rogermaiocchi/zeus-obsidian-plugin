@@ -590,6 +590,11 @@ class AppleVisionIntelligence {
         30000
       ).then(r => {
         if (r.source === 'daemon') {
+          // v1.16.1 conformidade C1: o daemon ecoa o absPath /Users/... em
+          // r.result.path; o cache av-cache é keyed por sha, então path é
+          // redundante e não-portável (quebra cross-device via iCloud). Remove
+          // antes de cachear. O sintetizador só lê classifications.
+          if (r.result && typeof r.result === 'object') { try { delete r.result.path; } catch {} }
           // Normalize to same JSON-string shape the synthesizer expects
           return { avClassify: JSON.stringify(r.result) };
         }

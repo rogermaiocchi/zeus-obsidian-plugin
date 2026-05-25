@@ -2226,6 +2226,7 @@ var require_passport_index = __commonJS({
         if (!passport || !passport.path) {
           throw new Error(`PassportIndex.buildOne: resposta inv\xE1lida para ${filePath}`);
         }
+        passport.path = this._vaultRelative(passport.path);
         if (currentSha) passport.sha = currentSha;
         if (this.plugin.coordinator && this.plugin.coordinator.deviceId) {
           passport.extracted_by = this.plugin.coordinator.deviceId;
@@ -2305,11 +2306,12 @@ var require_passport_index = __commonJS({
         if (!this.plugin.indexer || typeof this.plugin.indexer.loadManifest !== "function") return;
         const m = await this.plugin.indexer.loadManifest();
         if (!m.files || typeof m.files !== "object") m.files = {};
-        const entry = m.files[passport.path] || {};
+        const key = this._vaultRelative(passport.path);
+        const entry = m.files[key] || {};
         entry.passport_sha = passport.sha || null;
         entry.passport_extracted_by = passport.extracted_by || null;
         entry.passport_extracted_at = passport.extracted_at || null;
-        m.files[passport.path] = entry;
+        m.files[key] = entry;
         await this.plugin.indexer.saveManifest(m);
       }
       /**
@@ -2340,6 +2342,7 @@ var require_passport_index = __commonJS({
             const items = resp && resp.passports || (Array.isArray(resp) ? resp : []);
             for (const p of items) {
               if (p && p.path) {
+                p.path = this._vaultRelative(p.path);
                 map.set(p.path, p);
                 succeeded++;
               } else {
@@ -6474,6 +6477,12 @@ var AppleVisionIntelligence = class {
         3e4
       ).then((r) => {
         if (r.source === "daemon") {
+          if (r.result && typeof r.result === "object") {
+            try {
+              delete r.result.path;
+            } catch (e) {
+            }
+          }
           return { avClassify: JSON.stringify(r.result) };
         }
         return { avClassify: String(r.result || "").trim() };

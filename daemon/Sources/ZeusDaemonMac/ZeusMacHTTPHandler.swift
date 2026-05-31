@@ -362,6 +362,10 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             return self.handleSpotlightQueryNative(bodyJSON: body)
         case (.POST, "/v1/spotlight/purge"):
             return self.handleSpotlightPurge(bodyJSON: body)
+        // v1.17 — Caminho 4+2 (julgamento Opus 4.8 debate 2026-05-31).
+        // BM25 in-memory + FileManager direct read (sem TCC FDA).
+        case (.POST, "/v1/smart_search"):
+            return self.handleSmartSearch(bodyJSON: body)
         // v1.9 — MobileCLIP stub opt-in (ADR-010). 501 quando modelo ausente.
         case (.POST, "/v1/mobileclip/embed-image"):
             return self.handleMobileCLIPEmbedImage(bodyJSON: body)
@@ -408,6 +412,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
                     "POST /v1/data-detect", "POST /v1/spotlight/search",
                     "POST /v1/spotlight/index", "POST /v1/spotlight/query", "POST /v1/spotlight/purge",
+                    "POST /v1/smart_search",
                     "POST /v1/mobileclip/embed-image", "POST /v1/mobileclip/embed-text",
                     "GET /v1/mobileclip/status",
                     "POST /v1/afm/refine",
@@ -459,6 +464,7 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             "POST /v1/nl/tag", "POST /v1/nl/sentiment", "POST /v1/nl/language-detect",
             "POST /v1/data-detect", "POST /v1/spotlight/search",
                     "POST /v1/spotlight/index", "POST /v1/spotlight/query", "POST /v1/spotlight/purge",
+                    "POST /v1/smart_search",
             "POST /v1/mobileclip/embed-image", "POST /v1/mobileclip/embed-text",
             "GET /v1/mobileclip/status",
             "POST /v1/afm/refine",
@@ -3493,6 +3499,101 @@ final class ZeusMacHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             "error": "MobileCLIP runtime ainda não implementado",
             "phase": "stub v1.9 — runtime CoreML pendente",
             "next": "v2.0 entregará text→image zero-shot search via cosine similarity"
+        ])
+    }
+
+    // MARK: - /v1/smart_search (v1.17 — BM25 in-memory + FileManager direto)
+    //
+    // Caminho 4+2 do julgamento Opus 4.8 (debate 2026-05-31 4 vozes).
+    // Lê vaults iCloud diretamente via FileManager (Agy caught: sem TCC FDA).
+    // BM25 in-memory ~5ms para 200 docs.
+    //
+    // Privacy boundaries (privacy-auditor pré-condições):
+    //   (a) Cache 100% in-memory (sem disco, sem iCloud sync).
+    //   (b) Audit log limpo — nenhum campo de conteúdo de nota em logs.
+    //   (c) Compat backward — endpoints existentes intactos.
+    //
+    // Body:
+    //   {"query": "...",
+    //    "vault_paths": ["~/brain", "..."],  // optional, default env ZEUS_VAULT_PATHS
+    //    "limit": 20,
+    //    "force_reindex": false}
+    //
+    // Returns:
+    //   {hits: [{path, title, bm25_score}], total_indexed, query, model}
+    private static let smartSearchEngine = BM25Engine()
+    private static var smartSearchIndexedPaths: Set<String> = []
+    private static let smartSearchLock = NSLock()
+
+    private func handleSmartSearch(bodyJSON: String) -> Response {
+        guard let json = Self.parseJSON(bodyJSON),
+              let query = json["query"] as? String, !query.isEmpty else {
+            return Response(status: .badRequest, payload: [
+                "error": "body inválido: requer {\"query\": \"...\", \"limit\": 20}",
+                "version": "v1.17"
+            ])
+        }
+        let limit = (json["limit"] as? Int) ?? 20
+        let forceReindex = (json["force_reindex"] as? Bool) ?? false
+
+        // Vault paths (env override + body override)
+        var vaultPaths: [String] = []
+        if let paths = json["vault_paths"] as? [String] {
+            vaultPaths = paths
+        } else if let env = ProcessInfo.processInfo.environment["ZEUS_VAULT_PATHS"] {
+            vaultPaths = env.split(separator: ":").map { String($0) }
+        } else {
+            // Default seguro: vault brain knowledge-base/notas + memory
+            let home = NSHomeDirectory()
+            vaultPaths = [
+                "\(home)/brain/knowledge-base/notas",
+                "\(home)/brain/knowledge-base/memory"
+            ]
+        }
+        // Expand ~
+        vaultPaths = vaultPaths.map {
+            $0.hasPrefix("~/") ? "\(NSHomeDirectory())/\($0.dropFirst(2))" : $0
+        }
+
+        // Index lazy ou force_reindex
+        Self.smartSearchLock.lock()
+        defer { Self.smartSearchLock.unlock() }
+
+        if forceReindex {
+            Self.smartSearchEngine.clear()
+            Self.smartSearchIndexedPaths.removeAll()
+        }
+
+        let pathsToIndex = vaultPaths.filter { !Self.smartSearchIndexedPaths.contains($0) }
+        var newlyIndexed = 0
+        for path in pathsToIndex {
+            let notes = VaultLoader.loadMarkdownNotes(root: path)
+            for (notePath, content) in notes {
+                Self.smartSearchEngine.indexDocument(path: notePath, content: content)
+                newlyIndexed += 1
+            }
+            Self.smartSearchIndexedPaths.insert(path)
+        }
+
+        // BM25 search
+        let results = Self.smartSearchEngine.search(query, limit: limit)
+        let hits: [[String: Any]] = results.map { (path, title, score) in
+            [
+                "path": path,
+                "title": title,
+                "bm25_score": score
+            ]
+        }
+
+        return Response(status: .ok, payload: [
+            "query": query,
+            "hits": hits,
+            "count": hits.count,
+            "total_indexed": Self.smartSearchEngine.count,
+            "newly_indexed_this_request": newlyIndexed,
+            "vault_paths": vaultPaths,
+            "model": "BM25 in-memory + NLTokenizer + FileManager direct (v1.17)",
+            "fusion": "single-source (bm25 only — embed/spotlight fusion TBD)"
         ])
     }
 }
